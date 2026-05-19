@@ -3,9 +3,9 @@ main = "_worker.js"
 compatibility_date = "2026-05-19"
 keep_vars = true
 
-#[[kv_namespaces]]
-#binding = "KV"								#KV绑定名默认不可修改
-#id = "40ff47946cdd4ade8856158cec511e3f"	#KV数据库id
+[[kv_namespaces]]
+binding = "KV"								#KV绑定名默认不可修改
+id = "40ff47946cdd4ade8856158cec511e3f"	#KV数据库id
 
 [observability]
 enabled = false			# 顶层 Observability 配置。当前配置不通过顶层开关一次性启用，下面单独开启 logs、关闭 traces。
