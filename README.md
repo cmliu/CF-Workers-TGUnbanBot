@@ -94,7 +94,68 @@ id = "你的 KV namespace id"
 
 如果不绑定 KV，自助解封和 GKY 封禁查询仍可运行，但本地黑名单相关命令会提示未绑定 KV。
 
-### 3. 设置环境变量
+### 3. 可选：配置 Observability 日志
+
+Cloudflare Worker 后台可能会提示你在 `wrangler.toml` 中添加 Observability 配置，用来控制 Worker 日志、调用记录和链路追踪。这个配置不是机器人运行的必需项，但强烈建议至少开启 `logs`，因为本项目会通过 `console.log()` 输出 Telegram 更新、权限检查、API 返回等调试信息。
+
+示例配置：
+
+```toml
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+```
+
+各参数含义：
+
+| 配置项 | 说明 |
+| --- | --- |
+| `[observability]` | 顶层 Observability 配置。Cloudflare 后台生成的细分配置中，可以在这里保留全局默认值，再分别用 `logs` 和 `traces` 控制具体功能。 |
+| `enabled` | 是否启用对应层级的可观测性功能。`[observability.logs] enabled = true` 表示启用日志；`[observability.traces] enabled = false` 表示关闭链路追踪。 |
+| `head_sampling_rate` | 采样率，范围是 `0` 到 `1`。`1` 表示 100% 请求都采集，`0.1` 表示采集 10%，`0.01` 表示采集 1%。 |
+| `[observability.logs]` | Workers Logs 配置，用于在 Cloudflare 后台查看请求日志、`console.log()`、错误和异常。 |
+| `persist` | 是否把日志或追踪数据保存到 Cloudflare 后台。`true` 方便后续查询；`false` 通常用于只导出到第三方日志平台的场景。 |
+| `invocation_logs` | 是否记录每次 Worker 调用的基础日志，例如请求方式、URL、响应状态、耗时等。关闭后通常还能看到代码中主动输出的日志，但少了每次调用的基础记录。 |
+| `[observability.traces]` | 链路追踪配置，用于分析一次请求内部的调用链和耗时。本项目通常不需要开启，排查复杂性能问题时再打开即可。 |
+
+采样率建议：
+
+- 个人或低流量使用：`head_sampling_rate = 1`，所有请求都记录，排查问题最方便。
+- 中等流量：可以设为 `0.1`，只记录约 10% 请求。
+- 高流量或担心日志额度/费用：可以设为 `0.01` 或更低。
+- 如果正在排查线上问题，可以临时调高到 `1`，处理完再降回去。
+
+如果你只想看机器人日志，推荐保持：
+
+```toml
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+```
+
+修改后需要重新部署：
+
+```bash
+wrangler deploy
+```
+
+### 4. 设置环境变量
 
 ```bash
 wrangler secret put TOKEN
@@ -104,7 +165,7 @@ wrangler secret put GROUP_ID
 
 也可以在 Cloudflare Dashboard 的 Worker 设置页中添加同名变量。
 
-### 4. 部署 Worker
+### 5. 部署 Worker
 
 ```bash
 wrangler deploy
@@ -116,7 +177,7 @@ wrangler deploy
 https://tg-unban-bot.example.workers.dev
 ```
 
-### 5. 初始化 Webhook
+### 6. 初始化 Webhook
 
 访问下面的地址：
 

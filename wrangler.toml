@@ -4,5 +4,20 @@ compatibility_date = "2026-05-19"
 keep_vars = true
 
 #[[kv_namespaces]]
-#binding = "KV"			                    #KV绑定名默认不可修改
+#binding = "KV"								#KV绑定名默认不可修改
 #id = "40ff47946cdd4ade8856158cec511e3f"	#KV数据库id
+
+[observability]
+enabled = false			# 顶层 Observability 配置。当前配置不通过顶层开关一次性启用，下面单独开启 logs、关闭 traces。
+head_sampling_rate = 1	# 顶层采样率，范围 0~1；1 表示 100% 采样，0.1 表示 10% 采样。
+
+[observability.logs]
+enabled = true			# 启用 Workers Logs，可在 Cloudflare 后台查看 console.log、错误和调用日志。
+head_sampling_rate = 1	# 日志采样率，范围 0~1；低流量可用 1，高流量建议按需改成 0.1 或 0.01。
+persist = true			# 是否把日志保存到 Cloudflare 后台，便于后续查询。
+invocation_logs = true	# 是否记录每次 Worker 调用的基础日志，例如请求、响应状态和耗时。
+
+[observability.traces]
+enabled = false			# 是否启用链路追踪。本项目通常不需要，排查复杂性能问题时再改为 true。
+persist = true			# 若启用 traces，是否把追踪数据保存到 Cloudflare 后台。
+head_sampling_rate = 1	# traces 采样率；enabled = false 时不生效。
