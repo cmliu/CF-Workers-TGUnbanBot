@@ -795,7 +795,13 @@ async function handleMessage(message, env) {
 				responseMessage += `\n✅ 已在群内禁言用户 <a href="tg://user?id=${targetUserId}">${targetUserId}</a>`;
 			} catch (error) {
 				console.error('群内禁言失败:', error);
-				responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
+				if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
+					responseMessage = result.success
+						? '✅ 已将用户加入黑名单\nℹ️ 该用户当前不在群内，未执行禁言'
+						: `${responseMessage}\nℹ️ 该用户当前不在群内，未执行禁言`;
+				} else {
+					responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
+				}
 			}
 		}
 
