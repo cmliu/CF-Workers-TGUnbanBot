@@ -334,6 +334,16 @@ function getCommandTargetUserId(command, message) {
 	return repliedUserId ? repliedUserId.toString() : '';
 }
 
+async function getManagedGroupUser(userId) {
+	try {
+		const statusResult = await checkUserStatus(userId);
+		return statusResult.result?.user || null;
+	} catch (error) {
+		console.error('获取群成员用户信息失败:', error);
+		return null;
+	}
+}
+
 async function restoreUserInManagedGroup(userId) {
 	let status = null;
 	let isMember = null;
@@ -706,8 +716,15 @@ async function handleMessage(message, env) {
 		}
 
 		await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
+		let targetUser = null;
+		if (!checkCommand.firstArg && repliedUser?.id?.toString() === tgidToCheck) {
+			targetUser = repliedUser;
+		} else {
+			targetUser = await getManagedGroupUser(tgidToCheck);
+		}
+
 		const response = await buildBanlistCheckResponse(tgidToCheck, {
-			targetUser: checkCommand.firstArg ? null : repliedUser,
+			targetUser,
 			includeReviewAction: true,
 			actionInCurrentChat: isManagedGroupMessage(message)
 		});
