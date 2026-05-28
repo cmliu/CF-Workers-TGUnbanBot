@@ -134,7 +134,7 @@ async function handleInitialization(request) {
 				{ command: "unban", description: "开始自助解封" },
 				{ command: "ban", description: "添加用户到黑名单 (管理员)" },
 				{ command: "spam", description: "回复消息添加用户到黑名单 (管理员)" },
-				{ command: "check", description: "回复消息查询封禁状态 (管理员)" }
+				{ command: "check", description: "查询用户封禁状态 (管理员)" }
 			]
 		};
 
@@ -235,7 +235,7 @@ async function addToBlacklist(userId, env) {
 		
 		// 检查是否已在黑名单中
 		if (blacklist.includes(userIdStr) || blacklist.includes(userId)) {
-			return { success: false, message: '⚠️ 该用户已在黑名单中' };
+			return { success: false, alreadyExists: true, message: '⚠️ 该用户已在黑名单中' };
 		}
 
 		// 添加到黑名单
@@ -272,7 +272,7 @@ async function removeFromBlacklist(userId, env) {
 
 		// 检查是否有移除
 		if (blacklist.length === originalLength) {
-			return { success: false, message: '⚠️ 该用户不在黑名单中' };
+			return { success: false, notFound: true, message: '⚠️ 该用户不在黑名单中' };
 		}
 
 		// 保存更新后的黑名单
@@ -295,13 +295,133 @@ function isSpamCommand(text) {
 	return /^\/spam(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
 }
 
-function isCheckCommand(text) {
+function parseCommand(text, command) {
 	if (!text) {
-		return false;
+		return null;
 	}
 
 	const trimmedText = text.trim();
-	return /^\/check(?:@[^\s]+)?(?:\s|$)/i.test(trimmedText);
+	const match = trimmedText.match(new RegExp(`^\\/${command}(?:@[^\\s]+)?(?:\\s+([\\s\\S]*))?$`, 'i'));
+	if (!match) {
+		return null;
+	}
+
+	const args = (match[1] || '').trim();
+	return {
+		args,
+		firstArg: args.split(/\s+/)[0] || ''
+	};
+}
+
+function isManagedGroupMessage(message) {
+	return message.chat.id.toString() === GROUP_ID.toString();
+}
+
+function isPrivateOrManagedGroup(message) {
+	return message.chat.type === 'private' || isManagedGroupMessage(message);
+}
+
+function getCommandTargetUserId(command, message) {
+	if (command.firstArg) {
+		return command.firstArg;
+	}
+
+	if (!isManagedGroupMessage(message)) {
+		return '';
+	}
+
+	const repliedUserId = message.reply_to_message?.from?.id;
+	return repliedUserId ? repliedUserId.toString() : '';
+}
+
+async function restoreUserInManagedGroup(userId) {
+	let status = null;
+	let isMember = null;
+	const actions = [];
+	const failures = [];
+
+	try {
+		const statusResult = await checkUserStatus(userId);
+		status = statusResult.result?.status || null;
+		isMember = statusResult.result?.is_member;
+	} catch (error) {
+		console.error('查询群内状态失败:', error);
+	}
+
+	if (status === 'kicked' || !status) {
+		try {
+			await unbanUser(userId);
+			actions.push(`已解除群封禁`);
+		} catch (error) {
+			console.error('群内解除封禁失败:', error);
+			failures.push(`解除封禁失败: ${escapeHtml(error.message)}`);
+		}
+	}
+
+	if (status === 'restricted' && isMember !== false) {
+		try {
+			await restrictUser(userId);
+			actions.push(`已恢复发言权限`);
+		} catch (error) {
+			console.error('群内恢复权限失败:', error);
+			failures.push(`恢复发言权限失败: ${escapeHtml(error.message)}`);
+		}
+	}
+
+	if (status === 'left') {
+		actions.push(`用户当前不在群内，且未处于封禁状态`);
+	}
+
+	if (status === 'member') {
+		actions.push(`用户当前未被封禁或禁言`);
+	}
+
+	if (status === 'administrator' || status === 'creator') {
+		actions.push(`用户是群管理员，未调整群权限`);
+	}
+
+	if (status === 'restricted' && isMember === false) {
+		try {
+			await unbanUser(userId);
+			actions.push(`已解除群封禁`);
+		} catch (error) {
+			console.error('群内解除封禁失败:', error);
+			failures.push(`解除封禁失败: ${escapeHtml(error.message)}`);
+		}
+	}
+
+	if (!status) {
+		try {
+			await restrictUser(userId);
+			actions.push(`已尝试恢复发言权限`);
+		} catch (error) {
+			console.error('群内恢复权限失败:', error);
+			failures.push(`恢复发言权限失败: ${escapeHtml(error.message)}`);
+		}
+	}
+
+	if (actions.length === 0 && failures.length === 0) {
+		actions.push(`已确认群权限无需调整`);
+	}
+
+	if (failures.length > 0 && actions.length === 0) {
+		return {
+			success: false,
+			message: `⚠️ 群内解封禁失败：${failures.join('；')}`
+		};
+	}
+
+	if (failures.length > 0) {
+		return {
+			success: false,
+			message: `⚠️ ${actions.join('，')}；但${failures.join('；')}`
+		};
+	}
+
+	return {
+		success: true,
+		message: `✅ ${actions.join('，')}：<a href="tg://user?id=${userId}">${userId}</a>`
+	};
 }
 
 function escapeHtml(value) {
@@ -561,9 +681,10 @@ async function handleMessage(message, env) {
 		return;
 	}
 
-	// 处理 GROUP_ID 群组内管理员回复 /check - 查询被回复用户封禁状态
-	if (isCheckCommand(text)) {
-		if (chatId.toString() !== GROUP_ID.toString()) {
+	const checkCommand = parseCommand(text, 'check');
+	// 处理管理员 /check - 支持回复用户或直接传入用户ID查询封禁状态
+	if (checkCommand) {
+		if (!isPrivateOrManagedGroup(message)) {
 			return;
 		}
 
@@ -573,19 +694,24 @@ async function handleMessage(message, env) {
 		}
 
 		const repliedUser = message.reply_to_message?.from;
-		if (!repliedUser?.id) {
-			await sendTelegramMessage(chatId, '❌ 请回复要查询封禁状态的用户消息后再发送 <code>/check</code>');
+		const tgidToCheck = getCommandTargetUserId(checkCommand, message);
+		if (!tgidToCheck) {
+			await sendTelegramMessage(chatId, '❌ 使用方法: <code>/check 用户ID</code>，或在群内回复用户消息发送 <code>/check</code>');
 			return;
 		}
 
-		const tgidToCheck = repliedUser.id.toString();
+		if (!/^\d+$/.test(tgidToCheck)) {
+			await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
+			return;
+		}
+
 		await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
 		const response = await buildBanlistCheckResponse(tgidToCheck, {
-			targetUser: repliedUser,
+			targetUser: checkCommand.firstArg ? null : repliedUser,
 			includeReviewAction: true,
-			actionInCurrentChat: true
+			actionInCurrentChat: isManagedGroupMessage(message)
 		});
-		await sendTelegramMessage(GROUP_ID, response.text, response.replyMarkup);
+		await sendTelegramMessage(chatId, response.text, response.replyMarkup);
 		return;
 	}
 
@@ -615,11 +741,12 @@ async function handleMessage(message, env) {
 		// 普通的 /start 命令，显示欢迎消息
 	}
 
+	const banCommand = parseCommand(text, 'ban');
 	// 处理 /ban 命令 - 添加用户到黑名单
-	if (text && text.startsWith('/ban ')) {
-		// 检查是否是私聊
-		if (message.chat.type !== 'private') {
-			return; // 非私聊不予回复
+	if (banCommand) {
+		// 仅允许私聊或被管理的 GROUP_ID 群组内使用
+		if (!isPrivateOrManagedGroup(message)) {
+			return;
 		}
 
 		// 检查是否是群组管理员
@@ -630,13 +757,12 @@ async function handleMessage(message, env) {
 		}
 
 		// 提取要封禁的用户ID
-		const parts = text.split(' ');
-		if (parts.length < 2) {
-			await sendTelegramMessage(chatId, '❌ 使用方法: <code>/ban 用户ID</code>');
+		const targetUserId = getCommandTargetUserId(banCommand, message);
+		if (!targetUserId) {
+			await sendTelegramMessage(chatId, '❌ 使用方法: <code>/ban 用户ID</code>，或在群内回复用户消息发送 <code>/ban</code>');
 			return;
 		}
 
-		const targetUserId = parts[1].trim();
 		if (!/^\d+$/.test(targetUserId)) {
 			await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
 			return;
@@ -644,19 +770,33 @@ async function handleMessage(message, env) {
 
 		// 添加到黑名单
 		const result = await addToBlacklist(targetUserId, env);
-		await sendTelegramMessage(chatId, result.message);
+		let responseMessage = result.message;
+
+		if (isManagedGroupMessage(message) && (result.success || result.alreadyExists)) {
+			try {
+				await muteChatMember(chatId, targetUserId);
+				responseMessage += `\n✅ 已在群内禁言用户 <a href="tg://user?id=${targetUserId}">${targetUserId}</a>`;
+			} catch (error) {
+				console.error('群内禁言失败:', error);
+				responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
+			}
+		}
+
+		await sendTelegramMessage(chatId, responseMessage);
 		return;
 	}
 
+	const unbanCommand = parseCommand(text, 'unban');
 	// 处理 /unban 命令 - 从黑名单移除或显示欢迎消息
-	if (text && text.startsWith('/unban')) {
-		const parts = text.split(' ');
-		
-		// 如果有参数，处理黑名单移除
-		if (parts.length > 1 && parts[1].trim()) {
-			// 检查是否是私聊
-			if (message.chat.type !== 'private') {
-				return; // 非私聊不予回复
+	if (unbanCommand) {
+		const targetUserId = getCommandTargetUserId(unbanCommand, message);
+		const shouldHandleAdminUnban = Boolean(targetUserId) || isManagedGroupMessage(message);
+
+		// 有参数或群内回复用户时，处理黑名单移除。
+		if (shouldHandleAdminUnban) {
+			// 仅允许私聊或被管理的 GROUP_ID 群组内使用
+			if (!isPrivateOrManagedGroup(message)) {
+				return;
 			}
 
 			// 检查是否是群组管理员
@@ -666,7 +806,11 @@ async function handleMessage(message, env) {
 				return;
 			}
 
-			const targetUserId = parts[1].trim();
+			if (!targetUserId) {
+				await sendTelegramMessage(chatId, '❌ 使用方法: <code>/unban 用户ID</code>，或在群内回复用户消息发送 <code>/unban</code>');
+				return;
+			}
+
 			if (!/^\d+$/.test(targetUserId)) {
 				await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
 				return;
@@ -674,7 +818,14 @@ async function handleMessage(message, env) {
 
 			// 从黑名单移除
 			const result = await removeFromBlacklist(targetUserId, env);
-			await sendTelegramMessage(chatId, result.message);
+			let responseMessage = result.message;
+
+			if (result.success || result.notFound) {
+				const restoreResult = await restoreUserInManagedGroup(targetUserId);
+				responseMessage += `\n${restoreResult.message}`;
+			}
+
+			await sendTelegramMessage(chatId, responseMessage);
 			return;
 		}
 	}
@@ -872,7 +1023,8 @@ async function unbanUser(userId) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`;
 	const body = {
 		chat_id: GROUP_ID,
-		user_id: userId
+		user_id: userId,
+		only_if_banned: true
 	};
 
 	const response = await fetch(url, {
@@ -899,9 +1051,15 @@ async function restrictUser(userId) {
 	const body = {
 		chat_id: GROUP_ID,
 		user_id: userId,
+		use_independent_chat_permissions: true,
 		permissions: {
 			can_send_messages: true,
-			can_send_media_messages: true,
+			can_send_audios: true,
+			can_send_documents: true,
+			can_send_photos: true,
+			can_send_videos: true,
+			can_send_video_notes: true,
+			can_send_voice_notes: true,
 			can_send_polls: true,
 			can_send_other_messages: true,
 			can_add_web_page_previews: true,
