@@ -452,68 +452,109 @@ function formatUserMention(user) {
 }
 
 async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
-	const banlistResult = await handleBanlist(tgidToCheck);
-	const banlistData = JSON.parse(banlistResult);
-
-	if (!banlistData.success) {
-		return {
-			text: `❌ <b>查询失败</b>\n\n${escapeHtml(banlistData.error || '未知错误')}`
-		};
+	// 1. 查询 gkybot
+	let banlistData = { success: false, banned: false, error: '未执行查询' };
+	try {
+		const banlistResult = await handleBanlist(tgidToCheck);
+		banlistData = JSON.parse(banlistResult);
+	} catch (error) {
+		banlistData = { success: false, error: error.message };
 	}
 
-	if (!banlistData.banned) {
-		let responseMessage = `✅ <b>查询结果</b>\n\nTGID <code>${escapeHtml(tgidToCheck)}</code> 没有封禁记录。`;
-		if (options.targetUser) {
-			responseMessage = `✅ <b>查询结果</b>\n\n用户 ${formatUserMention(options.targetUser) || `<code>${escapeHtml(tgidToCheck)}</code>`} 没有封禁记录。\nTGID: <code>${escapeHtml(tgidToCheck)}</code>`;
-		}
-
-		return { text: responseMessage };
+	// 2. 查询本地 KV
+	let isLocalBlacklisted = false;
+	if (options.env) {
+		const blacklistCheck = await checkBlacklist(tgidToCheck, options.env);
+		isLocalBlacklisted = blacklistCheck.isBlacklisted;
 	}
 
-	let responseMessage = `🔍 <b>封禁查询结果</b>\n\n`;
+	const isBannedAnywhere = (banlistData.success && banlistData.banned) || isLocalBlacklisted;
+
+	let responseMessage = '';
+	if (isBannedAnywhere) {
+		responseMessage += `🔍 <b>封禁查询结果</b>\n\n`;
+	} else {
+		responseMessage += `✅ <b>查询结果</b>\n\n`;
+	}
+
 	if (options.targetUser) {
 		responseMessage += `👤 <b>用户:</b> ${formatUserMention(options.targetUser) || `<code>${escapeHtml(tgidToCheck)}</code>`}\n`;
 	}
-	responseMessage += `📋 <b>TGID:</b> <a href="tg://user?id=${escapeHtml(tgidToCheck)}">${escapeHtml(tgidToCheck)}</a>\n`;
+	responseMessage += `📋 <b>TGID:</b> <a href="tg://user?id=${escapeHtml(tgidToCheck)}">${escapeHtml(tgidToCheck)}</a>\n\n`;
 
-	if (banlistData.chatId) {
-		const chatInfo = await getChatInfoFromId(banlistData.chatId);
-		responseMessage += `💬 <b>ChatID:</b> <code>${escapeHtml(banlistData.chatId)}</code>`;
-		if (chatInfo && chatInfo.title) {
-			if (chatInfo.link) {
-				responseMessage += `(<a href="${escapeHtml(chatInfo.link)}">${escapeHtml(chatInfo.title)}</a>)`;
-			} else {
-				responseMessage += `(${escapeHtml(chatInfo.title)})`;
-			}
+	// GKYbot 数据库状态
+	if (banlistData.success) {
+		if (banlistData.banned) {
+			responseMessage += `🌐 <b>GKYbot 库:</b> 🚫 <b>已封禁</b>\n`;
+		} else {
+			responseMessage += `🌐 <b>GKYbot 库:</b> ✅ 正常\n`;
 		}
-		responseMessage += `\n`;
+	} else {
+		responseMessage += `🌐 <b>GKYbot 库:</b> ⚠️ 查询失败 (${escapeHtml(banlistData.error || '未知错误')})\n`;
 	}
 
-	if (banlistData.msgId) responseMessage += `📨 <b>MsgID:</b> <code>${escapeHtml(banlistData.msgId)}</code>\n`;
-	if (banlistData.recordedDate) responseMessage += `📅 <b>封禁日期:</b> ${escapeHtml(banlistData.recordedDate)}\n`;
-	if (banlistData.reason) responseMessage += `⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}\n`;
-	if (banlistData.info) responseMessage += `\n📝 <b>封禁内容:</b>\n<tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>\n`;
+	// 本地 KV 状态
+	if (options.env) {
+		if (isLocalBlacklisted) {
+			responseMessage += `💾 <b>本地黑名单:</b> 🚫 <b>已封禁</b>\n`;
+		} else {
+			responseMessage += `💾 <b>本地黑名单:</b> ✅ 正常\n`;
+		}
+	} else {
+		responseMessage += `💾 <b>本地黑名单:</b> ⚠️ 未检查 (未配置KV空间)\n`;
+	}
+
+	// 3. 输出 GKYbot 详细封禁信息
+	if (banlistData.success && banlistData.banned) {
+		responseMessage += `\n--- <b>GKYbot 详细封禁信息</b> ---\n`;
+		if (banlistData.chatId) {
+			const chatInfo = await getChatInfoFromId(banlistData.chatId);
+			responseMessage += `💬 <b>ChatID:</b> <code>${escapeHtml(banlistData.chatId)}</code>`;
+			if (chatInfo && chatInfo.title) {
+				if (chatInfo.link) {
+					responseMessage += ` (<a href="${escapeHtml(chatInfo.link)}">${escapeHtml(chatInfo.title)}</a>)`;
+				} else {
+					responseMessage += ` (${escapeHtml(chatInfo.title)})`;
+				}
+			}
+			responseMessage += `\n`;
+		}
+		if (banlistData.msgId) responseMessage += `📨 <b>MsgID:</b> <code>${escapeHtml(banlistData.msgId)}</code>\n`;
+		if (banlistData.recordedDate) responseMessage += `📅 <b>封禁日期:</b> ${escapeHtml(banlistData.recordedDate)}\n`;
+		if (banlistData.reason) responseMessage += `⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}\n`;
+		if (banlistData.info) responseMessage += `📝 <b>封禁内容:</b>\n<tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>\n`;
+	}
 
 	if (!options.includeReviewAction) {
 		return { text: responseMessage };
 	}
 
-	const 黑白名单 = banlistData.chatId == GROUP_ID ? '移出黑名单' : '添加白名单';
-	const copyText = `GKYbotSave\n${banlistData.tgid}`;
-	if (options.actionInCurrentChat) {
-		responseMessage += `\n若同意 <b>${黑白名单}</b> 请在本群发送以下代码 👇`;
-	} else {
-		const groupInfo = await getGroupInfo();
-		responseMessage += `\n若同意 <b>${黑白名单}</b> 请返回 ${escapeHtml(groupInfo.username)} 群组发送以下代码 👇`;
+	const inlineKeyboard = [];
+
+	// GKYbot 解封操作
+	if (banlistData.success && banlistData.banned) {
+		const 黑白名单 = banlistData.chatId == GROUP_ID ? '移出黑名单' : '添加白名单';
+		const copyText = `GKYbotSave\n${banlistData.tgid}`;
+		if (options.actionInCurrentChat) {
+			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请在本群发送下方复制的代码。`;
+		} else {
+			const groupInfo = await getGroupInfo();
+			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请返回 ${escapeHtml(groupInfo.username)} 群组发送下方复制的代码。`;
+		}
+		inlineKeyboard.push([{ text: `📋 点击复制 ${黑白名单} 代码`, copy_text: { text: copyText } }]);
 	}
+
+	// 本地 KV 解封操作
+	if (isLocalBlacklisted) {
+		responseMessage += `\n👉 若同意 <b>解除本地黑名单</b>，请发送下方复制的解封命令。`;
+		inlineKeyboard.push([{ text: `📋 点击复制 本地解封 命令`, copy_text: { text: `/unban ${tgidToCheck}` } }]);
+	}
+
+	const replyMarkup = inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined;
 
 	return {
 		text: responseMessage,
-		replyMarkup: {
-			inline_keyboard: [[
-				{ text: `📋 点击复制 ${黑白名单} 代码`, copy_text: { text: copyText } }
-			]]
-		}
+		replyMarkup
 	};
 }
 
@@ -726,7 +767,8 @@ async function handleMessage(message, env) {
 		const response = await buildBanlistCheckResponse(tgidToCheck, {
 			targetUser,
 			includeReviewAction: true,
-			actionInCurrentChat: isManagedGroupMessage(message)
+			actionInCurrentChat: isManagedGroupMessage(message),
+			env
 		});
 		await sendTelegramMessage(chatId, response.text, response.replyMarkup);
 		return;
@@ -749,7 +791,7 @@ async function handleMessage(message, env) {
 			// 提取 TGID
 			const tgidToCheck = parts[1].replace('check_', '');
 			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
-			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true });
+			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true, env });
 			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
 
 			return;
