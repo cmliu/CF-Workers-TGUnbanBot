@@ -458,7 +458,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		const banlistResult = await handleBanlist(tgidToCheck);
 		banlistData = JSON.parse(banlistResult);
 	} catch (error) {
-		banlistData = { success: false, error: error.message };
+		banlistData = { success: false, banned: false, error: error.message };
 	}
 
 	// 2. 查询本地 KV
