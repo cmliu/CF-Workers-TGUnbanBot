@@ -15,7 +15,7 @@ let GROUP_USERNAME = null;
 // 概要:
 // - 管理员在 GROUP_ID 群内回复消息(或带参数)发送 /ad,发起一次隐藏的举报投票。
 // - 阈值 6 票(AD_VOTE_THRESHOLD),赞成或反对先到 6 票即结束。
-// - 投票状态持久化到 env.KV: key = ad_vote:<message_id>, TTL 7 天。
+// - 投票状态持久化到 env.KV: key = ad_vote:<vote_token>, TTL 7 天。
 // - 结束时调用 editMessageText 移除按钮,若赞成胜出则触发封禁(写入 KV 黑名单 + 群内禁言)。
 // - /ad 不出现在 setMyCommands 命令菜单中(保持隐藏)。
 // - 非管理员触发 /ad 完全静默,不发任何提示。
@@ -1280,6 +1280,30 @@ async function unbanUser(userId) {
 	return result;
 }
 
+// 永久封禁用户(踢出群组并禁止重新加入)
+async function banUserPermanently(chatId, userId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`;
+	const body = {
+		chat_id: chatId,
+		user_id: userId
+	};
+
+	const response = await fetch(url, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+
+	const result = await response.json();
+
+	if (!response.ok || !result.ok) {
+		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
+	}
+
+	console.log(`执行 banUserPermanently，chat=${chatId} user=${userId}, 响应: ${JSON.stringify(result)}`);
+	return result;
+}
+
 // 解除用户禁言（恢复发言权限）
 async function restrictUser(userId) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/restrictChatMember`;
@@ -1992,14 +2016,17 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 	const tail = data.slice(AD_VOTE_BUTTON_PREFIX.length);
 	const parts = tail.split(':');
 	if (parts.length < 2) {
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
 		return;
 	}
 	const action = parts[0];
 	const voteToken = parts.slice(1).join(':'); // token 可能含额外冒号,防御性拼接
 	if (action !== 'A' && action !== 'R') {
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
 		return;
 	}
 	if (!voteToken || voteToken.length < 2) {
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
 		return;
 	}
 
@@ -2120,11 +2147,26 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 		} catch (error) {
 			console.error('[/ad] finalize 写入黑名单失败:', error.message);
 		}
+		// 检查用户群内状态:在群则禁言,不在群则永久封禁
 		try {
-			await muteChatMember(chatId, state.targetUserId);
-			console.log(`[/ad] 已在群 ${chatId} 内禁言 ${state.targetUserId}`);
+			const statusResult = await checkUserStatus(state.targetUserId);
+			const userStatus = statusResult?.result?.status;
+			const inGroup = userStatus === 'member' || userStatus === 'restricted' || userStatus === 'administrator' || userStatus === 'creator';
+			if (inGroup) {
+				await muteChatMember(chatId, state.targetUserId);
+				console.log(`[/ad] 已在群 ${chatId} 内禁言 ${state.targetUserId}`);
+			} else {
+				await banUserPermanently(chatId, state.targetUserId);
+				console.log(`[/ad] 用户 ${state.targetUserId} 不在群内(${userStatus}),已永久封禁`);
+			}
 		} catch (error) {
-			console.error('[/ad] finalize 群内禁言失败:', error.message);
+			// 状态查询失败→用户大概率不在群,直接永久封禁
+			console.error('[/ad] 查询用户状态失败,执行永久封禁:', error.message);
+			try {
+				await banUserPermanently(chatId, state.targetUserId);
+			} catch (banError) {
+				console.error('[/ad] finalize 永久封禁也失败:', banError.message);
+			}
 		}
 		// 回复场景:删除被举报的广告消息
 		if (state.reportedMessageId) {
