@@ -1926,6 +1926,18 @@ async function handleAdCommand(message, env) {
 		return;
 	}
 
+	// 直接传 tgid 的场景:尝试从群内查询用户信息用于显示
+	if (!targetUserSnapshot) {
+		try {
+			const statusResult = await checkUserStatus(targetUserId);
+			if (statusResult?.result?.user) {
+				targetUserSnapshot = snapshotTelegramUser(statusResult.result.user);
+			}
+		} catch (error) {
+			console.error('[/ad] 查询目标用户信息失败:', error.message);
+		}
+	}
+
 	// 不能对自己发起
 	if (targetUserId.toString() === userId.toString()) {
 		await sendTelegramMessage(chatId, '⚠️ 不能对自己发起举报投票');
