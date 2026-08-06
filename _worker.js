@@ -1045,7 +1045,7 @@ async function handleMessage(message, env) {
 }
 
 // 发送 Telegram 消息
-async function sendTelegramMessage(chatId, text, replyMarkup) {
+async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
 	const body = {
 		chat_id: chatId,
@@ -1056,6 +1056,9 @@ async function sendTelegramMessage(chatId, text, replyMarkup) {
 
 	if (replyMarkup) {
 		body.reply_markup = replyMarkup;
+	}
+	if (replyToMessageId) {
+		body.reply_to_message_id = replyToMessageId;
 	}
 
 	const response = await fetch(url, {
@@ -1714,17 +1717,19 @@ function buildAdVoteMessageText(state) {
 		}
 	}
 
+	let vetoLine = '';
+	if (state.vetoedBy) {
+		const vetoerText = formatUserMention(snapshotToTelegramUser(state.vetoedBy))
+			|| `<code>${escapeHtml(state.vetoedBy.id)}</code>`;
+		vetoLine = `⚡ 管理员 ${vetoerText} 一票${isApproved ? '通过' : '否决'}\n`;
+	}
+
 	const statusLine = state.finalized ? '<i>已结束。</i>' : '<i>进行中...</i>';
 
 	const targetText = formatUserMention(snapshotToTelegramUser(state.targetUserSnapshot))
 		|| `<code>${escapeHtml(state.targetUserId)}</code>`;
 	const creatorText = formatUserMention(snapshotToTelegramUser(state.creatorUserSnapshot))
 		|| `<code>${escapeHtml(state.creatorUserId)}</code>`;
-
-	const previewRaw = (state.messagePreview || '').trim();
-	const previewBlock = previewRaw
-		? `<blockquote>${escapeHtml(previewRaw)}</blockquote>\n`
-		: '<blockquote>被举报消息</blockquote>\n';
 
 	let actionLine = '';
 	if (state.finalized && isApproved) {
@@ -1734,8 +1739,7 @@ function buildAdVoteMessageText(state) {
 	}
 
 	return `⚠️ <b>广告举报</b>
-${previewBlock}
-${resultLine}<b>被举报人:</b> ${targetText}
+${resultLine}${vetoLine}<b>被举报人:</b> ${targetText}
 <b>发起人:</b> ${creatorText}
 
 <b>截止时间:</b> <code>${escapeHtml(deadlineStr)}</code>
@@ -1814,19 +1818,17 @@ async function handleAdCommand(message, env) {
 
 	const creatorUserSnapshot = snapshotTelegramUser(message.from);
 
-	// 4. 提取被举报消息预览(截取前 50 字符)
-	let messagePreview = '';
+	// 4. 被举报消息:仅回复场景记录预览,直接传 tgid 无回复时不显示
 	const replyMsg = message.reply_to_message;
+	const replyToMessageId = replyMsg?.message_id;
+	let messagePreview = '';
 	if (replyMsg) {
 		if (typeof replyMsg.text === 'string' && replyMsg.text.length > 0) {
-			messagePreview = replyMsg.text;
+			messagePreview = replyMsg.text.slice(0, 50);
 		} else if (typeof replyMsg.caption === 'string' && replyMsg.caption.length > 0) {
-			messagePreview = replyMsg.caption;
-		} else {
-			messagePreview = '<媒体消息>';
+			messagePreview = replyMsg.caption.slice(0, 50);
 		}
 	}
-	messagePreview = messagePreview.slice(0, 50);
 
 	const now = Math.floor(Date.now() / 1000);
 	const voteToken = Math.random().toString(36).slice(2, 10); // 8字符随机 token
@@ -1856,7 +1858,7 @@ async function handleAdCommand(message, env) {
 	await saveAdVoteState(env, state);
 
 	const initialMarkup = buildAdVoteInlineKeyboard(voteToken, state);
-	const sentMessage = await sendTelegramMessage(chatId, initialText, initialMarkup);
+	const sentMessage = await sendTelegramMessage(chatId, initialText, initialMarkup, replyToMessageId);
 	if (!sentMessage || !sentMessage.ok || !sentMessage.result?.message_id) {
 		console.error('[/ad] 发送投票消息失败:', JSON.stringify(sentMessage));
 		return;
@@ -1924,6 +1926,21 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 			await answerCallbackQuery(callbackQuery.id, '投票已结束', true);
 		} catch (error) {
 			console.error('[/ad] answerCallbackQuery (已结束) 失败:', error.message);
+		}
+		return;
+	}
+
+	// 群管理员一票否决:管理员点"赞成"或"反对"立即结束
+	const voterIsAdmin = await checkIfUserIsAdmin(voterId);
+	if (voterIsAdmin) {
+		const adminResult = action === 'A' ? 'approved' : 'rejected';
+		state.vetoedBy = snapshotTelegramUser(callbackQuery.from);
+		console.log(`[/ad] 管理员 ${voterId} 行使一票否决: ${adminResult}`);
+		await finalizeAdVote(env, state, chatId, messageId, adminResult);
+		try {
+			await answerCallbackQuery(callbackQuery.id, action === 'A' ? '管理员赞成，一票通过' : '管理员反对，一票否决');
+		} catch (error) {
+			console.error('[/ad] answerCallbackQuery (管理员否决) 失败:', error.message);
 		}
 		return;
 	}
