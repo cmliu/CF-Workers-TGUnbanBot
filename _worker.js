@@ -9,6 +9,23 @@ let BOT_ID = null;
 let GROUP_TITLE = null;
 let GROUP_USERNAME = null;
 
+// ========================================================
+// 隐藏 /ad 举报投票功能
+// ========================================================
+// 概要:
+// - 管理员在 GROUP_ID 群内回复消息(或带参数)发送 /ad,发起一次隐藏的举报投票。
+// - 阈值 6 票(AD_VOTE_THRESHOLD),赞成或反对先到 6 票即结束。
+// - 投票状态持久化到 env.KV: key = ad_vote:<vote_token>, TTL 7 天。
+// - 结束时调用 editMessageText 移除按钮,若赞成胜出则触发封禁(写入 KV 黑名单 + 群内禁言)。
+// - /ad 不出现在 setMyCommands 命令菜单中(保持隐藏)。
+// - 非管理员触发 /ad 完全静默,不发任何提示。
+// ========================================================
+
+const AD_VOTE_THRESHOLD = 6;
+const AD_VOTE_TTL_SECONDS = 7 * 24 * 60 * 60;
+const AD_VOTE_DURATION_HOURS = 1; // 仅用于显示截止时间,非强制过期
+const AD_VOTE_BUTTON_PREFIX = 'adv:'; // callback_data 前缀
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
@@ -51,8 +68,10 @@ export default {
 				// 处理消息
 				if (update.message) {
 					await handleMessage(update.message, env);
+				} else if (update.callback_query) {
+					await handleAdCallbackQuery(update.callback_query, env);
 				} else {
-					console.log('[Telegram更新] 跳过：update.message 为空，当前代码只处理普通消息。');
+					console.log('[Telegram更新] 跳过：update.message 和 update.callback_query 都为空，当前代码只处理普通消息和投票回调。');
 				}
 
 				return new Response('OK');
@@ -104,7 +123,7 @@ async function handleInitialization(request) {
 		const setWebhookUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`;
 		const setWebhookBody = {
 			url: webhookUrl.toString(),
-			allowed_updates: ['message']
+			allowed_updates: ['message', 'callback_query']
 		};
 
 		const response = await fetch(setWebhookUrl, {
@@ -732,6 +751,70 @@ async function handleMessage(message, env) {
 		return;
 	}
 
+	// 处理 GROUP_ID 群内管理员 /ad - 发起隐藏的举报投票
+	if (isAdCommand(text)) {
+		if (chatId.toString() !== GROUP_ID.toString()) {
+			return;
+		}
+		const isAdmin = await checkIfUserIsAdmin(userId);
+		if (!isAdmin) {
+			// 非管理员→检查助推者 / 白名单
+			const isBoosted = await checkIfUserBoosted(userId);
+			const isAllowed = await isAdAllowlisted(env, userId);
+			if (!isBoosted && !isAllowed) {
+				// 既非管理员/助推者/白名单→完全静默
+				return;
+			}
+		}
+		await handleAdCommand(message, env);
+		return;
+	}
+
+	// 管理员私聊: /add_ad_admin <tgid> — 添加热心群友白名单
+	const addAdAdminCmd = parseCommand(text, 'add_ad_admin');
+	if (addAdAdminCmd) {
+		if (message.chat.type !== 'private') return;
+		const isAdmin = await checkIfUserIsAdmin(userId);
+		if (!isAdmin) return;
+		const tgid = addAdAdminCmd.firstArg;
+		if (!tgid || !/^\d+$/.test(tgid)) {
+			await sendTelegramMessage(chatId, '❌ 使用方法: <code>/add_ad_admin &lt;用户ID&gt;</code>');
+			return;
+		}
+		const list = await getAdAdminList(env);
+		if (list.some((id) => String(id) === tgid)) {
+			await sendTelegramMessage(chatId, `⚠️ TGID <code>${escapeHtml(tgid)}</code> 已在白名单中`);
+			return;
+		}
+		list.push(tgid);
+		await saveAdAdminList(env, list);
+		await sendTelegramMessage(chatId, `✅ 已将 <code>${escapeHtml(tgid)}</code> 加入 /ad 发起白名单`);
+		return;
+	}
+
+	// 管理员私聊: /del_ad_admin <tgid> — 移除热心群友白名单
+	const delAdAdminCmd = parseCommand(text, 'del_ad_admin');
+	if (delAdAdminCmd) {
+		if (message.chat.type !== 'private') return;
+		const isAdmin = await checkIfUserIsAdmin(userId);
+		if (!isAdmin) return;
+		const tgid = delAdAdminCmd.firstArg;
+		if (!tgid || !/^\d+$/.test(tgid)) {
+			await sendTelegramMessage(chatId, '❌ 使用方法: <code>/del_ad_admin &lt;用户ID&gt;</code>');
+			return;
+		}
+		const list = await getAdAdminList(env);
+		const idx = list.findIndex((id) => String(id) === tgid);
+		if (idx === -1) {
+			await sendTelegramMessage(chatId, `⚠️ TGID <code>${escapeHtml(tgid)}</code> 不在白名单中`);
+			return;
+		}
+		list.splice(idx, 1);
+		await saveAdAdminList(env, list);
+		await sendTelegramMessage(chatId, `✅ 已将 <code>${escapeHtml(tgid)}</code> 从 /ad 发起白名单中移除`);
+		return;
+	}
+
 	const checkCommand = parseCommand(text, 'check');
 	// 处理管理员 /check - 支持回复用户或直接传入用户ID查询封禁状态
 	if (checkCommand) {
@@ -1008,7 +1091,7 @@ async function handleMessage(message, env) {
 }
 
 // 发送 Telegram 消息
-async function sendTelegramMessage(chatId, text, replyMarkup) {
+async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
 	const body = {
 		chat_id: chatId,
@@ -1019,6 +1102,9 @@ async function sendTelegramMessage(chatId, text, replyMarkup) {
 
 	if (replyMarkup) {
 		body.reply_markup = replyMarkup;
+	}
+	if (replyToMessageId) {
+		body.reply_to_message_id = replyToMessageId;
 	}
 
 	const response = await fetch(url, {
@@ -1033,6 +1119,90 @@ async function sendTelegramMessage(chatId, text, replyMarkup) {
 	console.log(`发送消息到 Telegram，状态: ${response.status}, 响应: ${JSON.stringify(result)}`);
 
 	return result;
+}
+
+// 应答 inline 按钮的回调,避免按钮一直转圈
+async function answerCallbackQuery(callbackQueryId, text, showAlert = false) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`;
+	const body = {
+		callback_query_id: callbackQueryId
+	};
+	if (text) {
+		body.text = text;
+	}
+	if (showAlert) {
+		body.show_alert = true;
+	}
+
+	try {
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok) {
+			console.error('answerCallbackQuery 返回失败:', JSON.stringify(result));
+		}
+		return result;
+	} catch (error) {
+		console.error('answerCallbackQuery 调用失败:', error.message);
+		return null;
+	}
+}
+
+// 编辑已发送的消息文本与按钮(用于 /ad 投票刷新与结束)
+async function editMessageText(chatId, messageId, text, replyMarkup) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`;
+	const body = {
+		chat_id: chatId,
+		message_id: messageId,
+		text,
+		parse_mode: 'HTML',
+		disable_web_page_preview: true
+	};
+	if (replyMarkup !== undefined) {
+		body.reply_markup = replyMarkup;
+	}
+
+	try {
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok) {
+			console.error('editMessageText 返回失败:', JSON.stringify(result));
+		}
+		return result;
+	} catch (error) {
+		console.error('editMessageText 调用失败:', error.message);
+		return null;
+	}
+}
+
+// 删除消息(用于 /ad 通过后清理被举报广告)
+async function deleteMessage(chatId, messageId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`;
+	const body = { chat_id: chatId, message_id: messageId };
+	try {
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok) {
+			console.error('deleteMessage 失败:', JSON.stringify(result));
+			return false;
+		}
+		console.log(`[/ad] 已删除被举报消息 ${messageId}`);
+		return true;
+	} catch (error) {
+		console.error('deleteMessage 调用失败:', error.message);
+		return false;
+	}
 }
 
 // Telegram moderation helpers
@@ -1107,6 +1277,30 @@ async function unbanUser(userId) {
 	// 添加调试日志
 	console.log(`执行 unbanUser，状态: ${response.status}, 响应: ${JSON.stringify(result)}`);
 
+	return result;
+}
+
+// 永久封禁用户(踢出群组并禁止重新加入)
+async function banUserPermanently(chatId, userId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`;
+	const body = {
+		chat_id: chatId,
+		user_id: userId
+	};
+
+	const response = await fetch(url, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+
+	const result = await response.json();
+
+	if (!response.ok || !result.ok) {
+		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
+	}
+
+	console.log(`执行 banUserPermanently，chat=${chatId} user=${userId}, 响应: ${JSON.stringify(result)}`);
 	return result;
 }
 
@@ -1207,6 +1401,40 @@ async function checkIfUserIsAdmin(userId) {
 		return isAdmin;
 	} catch (error) {
 		console.error('检查管理员权限时出错:', error);
+		return false;
+	}
+}
+
+// 检查用户是否助推过 GROUP_ID 群组(getUserChatBoosts 需要机器人是管理员)
+async function checkIfUserBoosted(userId) {
+	try {
+		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUserChatBoosts`;
+		const body = {
+			chat_id: GROUP_ID,
+			user_id: userId
+		};
+
+		console.log(`[/ad] getUserChatBoosts 请求: chat_id=${GROUP_ID}, user_id=${userId}`);
+
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+
+		const result = await response.json();
+		console.log(`[/ad] getUserChatBoosts 响应: HTTP=${response.status}, ok=${result.ok}, result=${JSON.stringify(result.result)}`);
+
+		if (!response.ok || !result.ok) {
+			console.error('[/ad] getUserChatBoosts 失败:', JSON.stringify(result));
+			return false;
+		}
+
+		const boostCount = Array.isArray(result.result?.boosts) ? result.result.boosts.length : 0;
+		console.log(`[/ad] 用户 ${userId} 当前有效助推数: ${boostCount}`);
+		return boostCount > 0;
+	} catch (error) {
+		console.error('[/ad] 检查用户助推状态时出错:', error.message, error.stack);
 		return false;
 	}
 }
@@ -1459,5 +1687,508 @@ async function getChatInfoFromId(chatId) {
 	} catch (error) {
 		console.error('获取群组信息时出错:', error);
 		return null;
+	}
+}
+
+// ========================================================
+// /ad 举报投票 - 实现函数
+// ========================================================
+
+function isAdCommand(text) {
+	if (!text) {
+		return false;
+	}
+	const trimmed = text.trim();
+	// 接受 /ad 和 /ad@任意机器人用户名,与 /spam 解析规则保持一致
+	return /^\/ad(?:@[^\s]+)?(?:\s|$)/i.test(trimmed);
+}
+
+function parseAdCommand(text) {
+	if (!text) {
+		return null;
+	}
+	const trimmed = text.trim();
+	const match = trimmed.match(/^\/ad(?:@[^\s]+)?(?:\s+([\s\S]*))?$/i);
+	if (!match) {
+		return null;
+	}
+	const args = (match[1] || '').trim();
+	return {
+		args,
+		firstArg: args.split(/\s+/)[0] || ''
+	};
+}
+
+// 快照化一个 Telegram user 对象,便于 KV 持久化与跨会话显示
+function snapshotTelegramUser(user) {
+	if (!user || user.id === undefined || user.id === null) {
+		return null;
+	}
+	return {
+		id: user.id,
+		firstName: user.first_name || '',
+		lastName: user.last_name || '',
+		username: user.username || '',
+		isBot: Boolean(user.is_bot)
+	};
+}
+
+// 把 snapshot 转回 Telegram user 形状,以便复用 formatUserMention
+function snapshotToTelegramUser(snap) {
+	if (!snap || snap.id === undefined || snap.id === null) {
+		return null;
+	}
+	return {
+		id: snap.id,
+		first_name: snap.firstName || '',
+		last_name: snap.lastName || '',
+		username: snap.username || '',
+		is_bot: Boolean(snap.isBot)
+	};
+}
+
+// 渲染一条投票人列表(逗号分隔的可点击 mention),空列表显示"无"
+function formatVoterList(voters) {
+	if (!Array.isArray(voters) || voters.length === 0) {
+		return '无';
+	}
+	const mentions = voters
+		.map((snap) => formatUserMention(snapshotToTelegramUser(snap)))
+		.filter(Boolean);
+	if (mentions.length === 0) {
+		return '无';
+	}
+	return mentions.join(', ');
+}
+
+async function getAdVoteState(env, voteToken) {
+	if (!env.KV) {
+		return null;
+	}
+	try {
+		const raw = await env.KV.get(`ad_vote:${voteToken}`, { type: 'json' });
+		return raw;
+	} catch (error) {
+		console.error('[/ad] 读取投票状态失败:', error.message);
+		return null;
+	}
+}
+
+async function saveAdVoteState(env, state) {
+	if (!env.KV) {
+		return false;
+	}
+	const key = state.voteToken || `msg_${state.messageId}`;
+	try {
+		await env.KV.put(`ad_vote:${key}`, JSON.stringify(state), {
+			expiration_ttl: AD_VOTE_TTL_SECONDS
+		});
+		return true;
+	} catch (error) {
+		console.error('[/ad] 保存投票状态失败:', error.message);
+		return false;
+	}
+}
+
+// ---- /add_ad_admin /del_ad_admin 热心群友白名单 ----
+
+async function getAdAdminList(env) {
+	if (!env.KV) return [];
+	try {
+		const list = await env.KV.get('ad_admin_list', { type: 'json' });
+		return Array.isArray(list) ? list : [];
+	} catch (error) {
+		console.error('[/ad] 读取 ad_admin_list 失败:', error.message);
+		return [];
+	}
+}
+
+async function saveAdAdminList(env, list) {
+	if (!env.KV) return false;
+	try {
+		await env.KV.put('ad_admin_list', JSON.stringify(list));
+		return true;
+	} catch (error) {
+		console.error('[/ad] 保存 ad_admin_list 失败:', error.message);
+		return false;
+	}
+}
+
+async function isAdAllowlisted(env, userId) {
+	const list = await getAdAdminList(env);
+	return list.some((id) => String(id) === String(userId));
+}
+
+function buildAdVoteMessageText(state) {
+	const isApproved = state.result === 'approved';
+	const isRejected = state.result === 'rejected';
+
+	const approverCount = state.approvers.length;
+	const rejecterCount = state.rejecters.length;
+
+	const deadlineDate = new Date(state.deadlineAt * 1000 + 8 * 3600 * 1000); // 北京时间
+	const pad = (n) => String(n).padStart(2, '0');
+	const deadlineStr = `${deadlineDate.getUTCFullYear()}-${pad(deadlineDate.getUTCMonth() + 1)}-${pad(deadlineDate.getUTCDate())} ${pad(deadlineDate.getUTCHours())}:${pad(deadlineDate.getUTCMinutes())}:${pad(deadlineDate.getUTCSeconds())}`;
+
+	let resultLine = '';
+	if (state.finalized) {
+		if (isApproved) {
+			resultLine = '💀 <b>举报通过</b>\n';
+		} else if (isRejected) {
+			resultLine = '❎ <b>已被否决</b>\n';
+		}
+	}
+
+	let vetoLine = '';
+	if (state.vetoedBy) {
+		const vetoerText = formatUserMention(snapshotToTelegramUser(state.vetoedBy))
+			|| `<code>${escapeHtml(state.vetoedBy.id)}</code>`;
+		vetoLine = `⚡ 管理员 ${vetoerText} 一票${isApproved ? '通过' : '否决'}\n`;
+	}
+
+	const statusLine = state.finalized ? '<i>已结束。</i>' : '<i>进行中...</i>';
+
+	const targetText = formatUserMention(snapshotToTelegramUser(state.targetUserSnapshot))
+		|| `<code>${escapeHtml(state.targetUserId)}</code>`;
+	const creatorText = formatUserMention(snapshotToTelegramUser(state.creatorUserSnapshot))
+		|| `<code>${escapeHtml(state.creatorUserId)}</code>`;
+
+	let actionLine = '';
+	if (state.finalized && isApproved) {
+		actionLine = `\n✅ <b>已封禁:</b> ${targetText}\n`;
+	} else if (state.finalized && isRejected) {
+		actionLine = `\n❎ <i>举报未通过，未处理</i>\n`;
+	}
+
+	return `⚠️ <b>广告举报</b>
+${resultLine}${vetoLine}<b>被举报人:</b> ${targetText}
+<b>发起人:</b> ${creatorText}
+
+<b>截止时间:</b> <code>${escapeHtml(deadlineStr)}</code>
+
+<b>赞成:</b> ${approverCount}/${AD_VOTE_THRESHOLD}
+<b>反对:</b> ${rejecterCount}/${AD_VOTE_THRESHOLD}
+
+<b>赞成:</b> ${formatVoterList(state.approvers)}
+<b>反对:</b> ${formatVoterList(state.rejecters)}
+${actionLine}
+${statusLine}`;
+}
+
+function buildAdVoteInlineKeyboard(voteToken, state) {
+	return {
+		inline_keyboard: [[
+			{
+				text: `赞成 ${state.approvers.length}/${AD_VOTE_THRESHOLD}`,
+				callback_data: `${AD_VOTE_BUTTON_PREFIX}A:${voteToken}`
+			},
+			{
+				text: `反对 ${state.rejecters.length}/${AD_VOTE_THRESHOLD}`,
+				callback_data: `${AD_VOTE_BUTTON_PREFIX}R:${voteToken}`
+			}
+		]]
+	};
+}
+
+async function handleAdCommand(message, env) {
+	const chatId = message.chat.id;
+	const userId = message.from.id;
+
+	// 1. 必须在 GROUP_ID 群内
+	if (chatId.toString() !== GROUP_ID.toString()) {
+		return;
+	}
+
+	// 权限已在外层 handleMessage 中校验(管理员或助推者),此处不重复检查
+
+	// 2. 解析目标用户
+	const adCommand = parseAdCommand(message.text);
+	let targetUserId = '';
+	let targetUserSnapshot = null;
+	const repliedUser = message.reply_to_message?.from;
+	if (repliedUser && repliedUser.id !== undefined && repliedUser.id !== null) {
+		targetUserId = repliedUser.id.toString();
+		targetUserSnapshot = snapshotTelegramUser(repliedUser);
+	} else if (adCommand && adCommand.firstArg) {
+		targetUserId = adCommand.firstArg;
+		targetUserSnapshot = null;
+	} else {
+		// 管理员触发但参数错误,可以提示
+		await sendTelegramMessage(
+			chatId,
+			'❌ 使用方法: 回复用户消息发送 <code>/ad</code>，或 <code>/ad &lt;用户ID&gt;</code>'
+		);
+		return;
+	}
+
+	if (!/^\d+$/.test(targetUserId)) {
+		await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
+		return;
+	}
+
+	// 直接传 tgid 的场景:尝试从群内查询用户信息用于显示
+	if (!targetUserSnapshot) {
+		try {
+			const statusResult = await checkUserStatus(targetUserId);
+			if (statusResult?.result?.user) {
+				targetUserSnapshot = snapshotTelegramUser(statusResult.result.user);
+			}
+		} catch (error) {
+			console.error('[/ad] 查询目标用户信息失败:', error.message);
+		}
+	}
+
+	// 不能对自己发起
+	if (targetUserId.toString() === userId.toString()) {
+		await sendTelegramMessage(chatId, '⚠️ 不能对自己发起举报投票');
+		return;
+	}
+
+	// 不能对机器人发起(回复场景通过 User 对象检测,直接传 tgid 场景无 User 对象,信任管理员判断)
+	if (repliedUser?.is_bot || targetUserSnapshot?.isBot) {
+		await sendTelegramMessage(chatId, '⚠️ 不能对机器人发起举报投票');
+		return;
+	}
+
+	const creatorUserSnapshot = snapshotTelegramUser(message.from);
+
+	// 4. 被举报消息:仅回复场景记录预览,直接传 tgid 无回复时不显示
+	const replyMsg = message.reply_to_message;
+	const replyToMessageId = replyMsg?.message_id;
+	let messagePreview = '';
+	if (replyMsg) {
+		if (typeof replyMsg.text === 'string' && replyMsg.text.length > 0) {
+			messagePreview = replyMsg.text.slice(0, 50);
+		} else if (typeof replyMsg.caption === 'string' && replyMsg.caption.length > 0) {
+			messagePreview = replyMsg.caption.slice(0, 50);
+		}
+	}
+
+	const now = Math.floor(Date.now() / 1000);
+	const voteToken = Math.random().toString(36).slice(2, 10); // 8字符随机 token
+
+	// 5. 构造初始投票状态,发起人自动算 1 票赞成
+	const state = {
+		voteToken,
+		messageId: null,
+		reportedMessageId: replyToMessageId || null, // 回复场景:被举报消息ID,通过后删除
+		chatId: chatId.toString(),
+		targetUserId,
+		creatorUserId: userId.toString(),
+		targetUserSnapshot,
+		creatorUserSnapshot,
+		messagePreview,
+		approvers: creatorUserSnapshot ? [creatorUserSnapshot] : [],
+		rejecters: [],
+		threshold: AD_VOTE_THRESHOLD,
+		createdAt: now,
+		deadlineAt: now + AD_VOTE_DURATION_HOURS * 3600,
+		finalized: false,
+		result: null
+	};
+
+	const initialText = buildAdVoteMessageText(state);
+
+	// 先用 token 存 KV(确保按钮点击时 state 已存在),再发消息
+	await saveAdVoteState(env, state);
+
+	const initialMarkup = buildAdVoteInlineKeyboard(voteToken, state);
+	const sentMessage = await sendTelegramMessage(chatId, initialText, initialMarkup, replyToMessageId);
+	if (!sentMessage || !sentMessage.ok || !sentMessage.result?.message_id) {
+		console.error('[/ad] 发送投票消息失败:', JSON.stringify(sentMessage));
+		return;
+	}
+
+	// 回填 messageId,用于后续 editMessageText
+	state.messageId = sentMessage.result.message_id;
+	await saveAdVoteState(env, state);
+}
+
+async function handleAdCallbackQuery(callbackQuery, env) {
+	const data = callbackQuery.data || '';
+	if (!data.startsWith(AD_VOTE_BUTTON_PREFIX)) {
+		return;
+	}
+
+	const voterId = callbackQuery.from.id;
+	const chatId = callbackQuery.message?.chat?.id;
+
+	if (!chatId) {
+		return;
+	}
+
+	// 群外投票直接忽略(按钮只能在消息所在群里点)
+	if (chatId.toString() !== GROUP_ID.toString()) {
+		return;
+	}
+
+	// 任何群成员都可以投票(只校验在 GROUP_ID 群内,已在上方检查)
+
+	// 解析 callback_data: adv:A:<voteToken> 或 adv:R:<voteToken>
+	const tail = data.slice(AD_VOTE_BUTTON_PREFIX.length);
+	const parts = tail.split(':');
+	if (parts.length < 2) {
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
+		return;
+	}
+	const action = parts[0];
+	const voteToken = parts.slice(1).join(':'); // token 可能含额外冒号,防御性拼接
+	if (action !== 'A' && action !== 'R') {
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
+		return;
+	}
+	if (!voteToken || voteToken.length < 2) {
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
+		return;
+	}
+
+	const state = await getAdVoteState(env, voteToken);
+	if (!state) {
+		try {
+			await answerCallbackQuery(callbackQuery.id, '投票不存在或已过期', true);
+		} catch (error) {
+			console.error('[/ad] answerCallbackQuery (无投票状态) 失败:', error.message);
+		}
+		return;
+	}
+
+	const messageId = state.messageId;
+	if (!messageId || messageId <= 0) {
+		// messageId 尚未回填(极端竞态:点击发生在回填前),静默应答稍后重试
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
+		return;
+	}
+
+	if (state.finalized) {
+		try {
+			await answerCallbackQuery(callbackQuery.id, '投票已结束', true);
+		} catch (error) {
+			console.error('[/ad] answerCallbackQuery (已结束) 失败:', error.message);
+		}
+		return;
+	}
+
+	// 被禁言的用户不允许投票
+	try {
+		const voterStatus = await checkUserStatus(voterId);
+		if (voterStatus?.result?.status === 'restricted') {
+			await answerCallbackQuery(callbackQuery.id, '你已被禁言，无法投票', true);
+			return;
+		}
+	} catch (error) {
+		console.error('[/ad] 检查禁言状态失败:', error.message);
+	}
+
+	// 群管理员一票否决:管理员点"赞成"或"反对"立即结束
+	const voterIsAdmin = await checkIfUserIsAdmin(voterId);
+	if (voterIsAdmin) {
+		const adminResult = action === 'A' ? 'approved' : 'rejected';
+		state.vetoedBy = snapshotTelegramUser(callbackQuery.from);
+		console.log(`[/ad] 管理员 ${voterId} 行使一票否决: ${adminResult}`);
+		await finalizeAdVote(env, state, chatId, messageId, adminResult);
+		try {
+			await answerCallbackQuery(callbackQuery.id, action === 'A' ? '管理员赞成，一票通过' : '管理员反对，一票否决');
+		} catch (error) {
+			console.error('[/ad] answerCallbackQuery (管理员否决) 失败:', error.message);
+		}
+		return;
+	}
+
+	// 更新投票人列表(去重 + 支持改投)
+	const voterSnapshot = snapshotTelegramUser(callbackQuery.from);
+	state.approvers = state.approvers.filter((v) => v.id.toString() !== voterId.toString());
+	state.rejecters = state.rejecters.filter((v) => v.id.toString() !== voterId.toString());
+
+	if (action === 'A' && voterSnapshot) {
+		state.approvers.push(voterSnapshot);
+	} else if (action === 'R' && voterSnapshot) {
+		state.rejecters.push(voterSnapshot);
+	}
+
+	// 判定阈值,任意一边达 6 即结束
+	if (state.approvers.length >= state.threshold) {
+		await finalizeAdVote(env, state, chatId, messageId, 'approved');
+		// 已结束:弹窗提示投票人本次投票生效
+		try {
+			await answerCallbackQuery(callbackQuery.id, '投票已通过');
+		} catch (error) {
+			console.error('[/ad] answerCallbackQuery (已通过) 失败:', error.message);
+		}
+		return;
+	}
+	if (state.rejecters.length >= state.threshold) {
+		await finalizeAdVote(env, state, chatId, messageId, 'rejected');
+		try {
+			await answerCallbackQuery(callbackQuery.id, '投票已被否决');
+		} catch (error) {
+			console.error('[/ad] answerCallbackQuery (已被否决) 失败:', error.message);
+		}
+		return;
+	}
+
+	// 未结束:刷新消息文本 + 按钮
+	await saveAdVoteState(env, state);
+	const newText = buildAdVoteMessageText(state);
+	const newMarkup = buildAdVoteInlineKeyboard(state.voteToken, state);
+	await editMessageText(chatId, messageId, newText, newMarkup);
+
+	// 静默应答,清除按钮的 loading 状态
+	try {
+		await answerCallbackQuery(callbackQuery.id);
+	} catch (error) {
+		console.error('[/ad] answerCallbackQuery (成功) 失败:', error.message);
+	}
+}
+
+async function finalizeAdVote(env, state, chatId, messageId, result) {
+	state.finalized = true;
+	state.result = result;
+
+	await saveAdVoteState(env, state);
+
+	const finalText = buildAdVoteMessageText(state);
+
+	// 先移除按钮,再异步执行封禁动作(失败不影响投票结论)
+	const removeButtonsMarkup = { inline_keyboard: [] };
+	await editMessageText(chatId, messageId, finalText, removeButtonsMarkup);
+
+	if (result === 'approved') {
+		try {
+			await addToBlacklist(state.targetUserId, env);
+			console.log(`[/ad] 已将用户 ${state.targetUserId} 加入黑名单`);
+		} catch (error) {
+			console.error('[/ad] finalize 写入黑名单失败:', error.message);
+		}
+		// 检查用户群内状态:在群则禁言,不在群则永久封禁
+		try {
+			const statusResult = await checkUserStatus(state.targetUserId);
+			const userStatus = statusResult?.result?.status;
+			const inGroup = userStatus === 'member' || userStatus === 'restricted' || userStatus === 'administrator' || userStatus === 'creator';
+			if (inGroup) {
+				await muteChatMember(chatId, state.targetUserId);
+				console.log(`[/ad] 已在群 ${chatId} 内禁言 ${state.targetUserId}`);
+			} else {
+				await banUserPermanently(chatId, state.targetUserId);
+				console.log(`[/ad] 用户 ${state.targetUserId} 不在群内(${userStatus}),已永久封禁`);
+			}
+		} catch (error) {
+			// 状态查询失败→用户大概率不在群,直接永久封禁
+			console.error('[/ad] 查询用户状态失败,执行永久封禁:', error.message);
+			try {
+				await banUserPermanently(chatId, state.targetUserId);
+			} catch (banError) {
+				console.error('[/ad] finalize 永久封禁也失败:', banError.message);
+			}
+		}
+		// 回复场景:删除被举报的广告消息
+		if (state.reportedMessageId) {
+			try {
+				await deleteMessage(chatId, state.reportedMessageId);
+			} catch (error) {
+				console.error('[/ad] finalize 删除被举报消息失败:', error.message);
+			}
+		}
+	} else {
+		console.log(`[/ad] 投票 ${messageId} 被否决,目标用户 ${state.targetUserId} 不处理`);
 	}
 }
