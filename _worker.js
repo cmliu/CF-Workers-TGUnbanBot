@@ -758,8 +758,12 @@ async function handleMessage(message, env) {
 		}
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
-			// 非管理员触发 /ad 完全静默
-			return;
+			// 非管理员→检查是否是群组助推者(Premium booster)
+			const isBoosted = await checkIfUserBoosted(userId);
+			if (!isBoosted) {
+				// 既非管理员也非助推者→完全静默
+				return;
+			}
 		}
 		await handleAdCommand(message, env);
 		return;
@@ -1305,6 +1309,40 @@ async function checkIfUserIsAdmin(userId) {
 	}
 }
 
+// 检查用户是否助推过 GROUP_ID 群组(getUserChatBoosts 需要机器人是管理员)
+async function checkIfUserBoosted(userId) {
+	try {
+		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUserChatBoosts`;
+		const body = {
+			chat_id: GROUP_ID,
+			user_id: userId
+		};
+
+		console.log(`[/ad] getUserChatBoosts 请求: chat_id=${GROUP_ID}, user_id=${userId}`);
+
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+
+		const result = await response.json();
+		console.log(`[/ad] getUserChatBoosts 响应: HTTP=${response.status}, ok=${result.ok}, result=${JSON.stringify(result.result)}`);
+
+		if (!response.ok || !result.ok) {
+			console.error('[/ad] getUserChatBoosts 失败:', JSON.stringify(result));
+			return false;
+		}
+
+		const boostCount = Array.isArray(result.result?.boosts) ? result.result.boosts.length : 0;
+		console.log(`[/ad] 用户 ${userId} 当前有效助推数: ${boostCount}`);
+		return boostCount > 0;
+	} catch (error) {
+		console.error('[/ad] 检查用户助推状态时出错:', error.message, error.stack);
+		return false;
+	}
+}
+
 // 获取机器人用户名
 async function getBotId() {
 	if (BOT_ID) {
@@ -1735,13 +1773,9 @@ async function handleAdCommand(message, env) {
 		return;
 	}
 
-	// 2. 调用者必须是群管理员(非管理员已在外层静默 return,这里冗余防御)
-	const isAdmin = await checkIfUserIsAdmin(userId);
-	if (!isAdmin) {
-		return;
-	}
+	// 权限已在外层 handleMessage 中校验(管理员或助推者),此处不重复检查
 
-	// 3. 解析目标用户
+	// 2. 解析目标用户
 	const adCommand = parseAdCommand(message.text);
 	let targetUserId = '';
 	let targetUserSnapshot = null;
