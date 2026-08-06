@@ -1930,6 +1930,17 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 		return;
 	}
 
+	// 被禁言的用户不允许投票
+	try {
+		const voterStatus = await checkUserStatus(voterId);
+		if (voterStatus?.result?.status === 'restricted') {
+			await answerCallbackQuery(callbackQuery.id, '你已被禁言，无法投票', true);
+			return;
+		}
+	} catch (error) {
+		console.error('[/ad] 检查禁言状态失败:', error.message);
+	}
+
 	// 群管理员一票否决:管理员点"赞成"或"反对"立即结束
 	const voterIsAdmin = await checkIfUserIsAdmin(voterId);
 	if (voterIsAdmin) {
