@@ -758,14 +758,60 @@ async function handleMessage(message, env) {
 		}
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
-			// 非管理员→检查是否是群组助推者(Premium booster)
+			// 非管理员→检查助推者 / 白名单
 			const isBoosted = await checkIfUserBoosted(userId);
-			if (!isBoosted) {
-				// 既非管理员也非助推者→完全静默
+			const isAllowed = await isAdAllowlisted(env, userId);
+			if (!isBoosted && !isAllowed) {
+				// 既非管理员/助推者/白名单→完全静默
 				return;
 			}
 		}
 		await handleAdCommand(message, env);
+		return;
+	}
+
+	// 管理员私聊: /add_ad_admin <tgid> — 添加热心群友白名单
+	const addAdAdminCmd = parseCommand(text, 'add_ad_admin');
+	if (addAdAdminCmd) {
+		if (message.chat.type !== 'private') return;
+		const isAdmin = await checkIfUserIsAdmin(userId);
+		if (!isAdmin) return;
+		const tgid = addAdAdminCmd.firstArg;
+		if (!tgid || !/^\d+$/.test(tgid)) {
+			await sendTelegramMessage(chatId, '❌ 使用方法: <code>/add_ad_admin &lt;用户ID&gt;</code>');
+			return;
+		}
+		const list = await getAdAdminList(env);
+		if (list.some((id) => String(id) === tgid)) {
+			await sendTelegramMessage(chatId, `⚠️ TGID <code>${escapeHtml(tgid)}</code> 已在白名单中`);
+			return;
+		}
+		list.push(tgid);
+		await saveAdAdminList(env, list);
+		await sendTelegramMessage(chatId, `✅ 已将 <code>${escapeHtml(tgid)}</code> 加入 /ad 发起白名单`);
+		return;
+	}
+
+	// 管理员私聊: /del_ad_admin <tgid> — 移除热心群友白名单
+	const delAdAdminCmd = parseCommand(text, 'del_ad_admin');
+	if (delAdAdminCmd) {
+		if (message.chat.type !== 'private') return;
+		const isAdmin = await checkIfUserIsAdmin(userId);
+		if (!isAdmin) return;
+		const tgid = delAdAdminCmd.firstArg;
+		if (!tgid || !/^\d+$/.test(tgid)) {
+			await sendTelegramMessage(chatId, '❌ 使用方法: <code>/del_ad_admin &lt;用户ID&gt;</code>');
+			return;
+		}
+		const list = await getAdAdminList(env);
+		const idx = list.findIndex((id) => String(id) === tgid);
+		if (idx === -1) {
+			await sendTelegramMessage(chatId, `⚠️ TGID <code>${escapeHtml(tgid)}</code> 不在白名单中`);
+			return;
+		}
+		list.splice(idx, 1);
+		await saveAdAdminList(env, list);
+		await sendTelegramMessage(chatId, `✅ 已将 <code>${escapeHtml(tgid)}</code> 从 /ad 发起白名单中移除`);
 		return;
 	}
 
@@ -1133,6 +1179,29 @@ async function editMessageText(chatId, messageId, text, replyMarkup) {
 	} catch (error) {
 		console.error('editMessageText 调用失败:', error.message);
 		return null;
+	}
+}
+
+// 删除消息(用于 /ad 通过后清理被举报广告)
+async function deleteMessage(chatId, messageId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`;
+	const body = { chat_id: chatId, message_id: messageId };
+	try {
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok) {
+			console.error('deleteMessage 失败:', JSON.stringify(result));
+			return false;
+		}
+		console.log(`[/ad] 已删除被举报消息 ${messageId}`);
+		return true;
+	} catch (error) {
+		console.error('deleteMessage 调用失败:', error.message);
+		return false;
 	}
 }
 
@@ -1697,6 +1766,35 @@ async function saveAdVoteState(env, state) {
 	}
 }
 
+// ---- /add_ad_admin /del_ad_admin 热心群友白名单 ----
+
+async function getAdAdminList(env) {
+	if (!env.KV) return [];
+	try {
+		const list = await env.KV.get('ad_admin_list', { type: 'json' });
+		return Array.isArray(list) ? list : [];
+	} catch (error) {
+		console.error('[/ad] 读取 ad_admin_list 失败:', error.message);
+		return [];
+	}
+}
+
+async function saveAdAdminList(env, list) {
+	if (!env.KV) return false;
+	try {
+		await env.KV.put('ad_admin_list', JSON.stringify(list));
+		return true;
+	} catch (error) {
+		console.error('[/ad] 保存 ad_admin_list 失败:', error.message);
+		return false;
+	}
+}
+
+async function isAdAllowlisted(env, userId) {
+	const list = await getAdAdminList(env);
+	return list.some((id) => String(id) === String(userId));
+}
+
 function buildAdVoteMessageText(state) {
 	const isApproved = state.result === 'approved';
 	const isRejected = state.result === 'rejected';
@@ -1837,6 +1935,7 @@ async function handleAdCommand(message, env) {
 	const state = {
 		voteToken,
 		messageId: null,
+		reportedMessageId: replyToMessageId || null, // 回复场景:被举报消息ID,通过后删除
 		chatId: chatId.toString(),
 		targetUserId,
 		creatorUserId: userId.toString(),
@@ -2026,6 +2125,14 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 			console.log(`[/ad] 已在群 ${chatId} 内禁言 ${state.targetUserId}`);
 		} catch (error) {
 			console.error('[/ad] finalize 群内禁言失败:', error.message);
+		}
+		// 回复场景:删除被举报的广告消息
+		if (state.reportedMessageId) {
+			try {
+				await deleteMessage(chatId, state.reportedMessageId);
+			} catch (error) {
+				console.error('[/ad] finalize 删除被举报消息失败:', error.message);
+			}
 		}
 	} else {
 		console.log(`[/ad] 投票 ${messageId} 被否决,目标用户 ${state.targetUserId} 不处理`);
