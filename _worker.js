@@ -1861,8 +1861,10 @@ function buildAdVoteMessageText(state) {
 		actionLine = `\n❎ <i>举报未通过，未处理</i>\n`;
 	}
 
-	return `⚠️ <b>#广告举报</b> #${escapeHtml(state.targetUserId)}
-${resultLine}${vetoLine}<b>被举报人:</b> ${targetText}
+	return `⚠️ <b>#广告举报</b>
+${resultLine}${vetoLine}
+<b>被举报人:</b> ${targetText}
+<b>被举报ID:</b> #${escapeHtml(state.targetUserId)}
 <b>发起人:</b> ${creatorText}
 
 <b>截止时间:</b> <code>${escapeHtml(deadlineStr)}</code>
