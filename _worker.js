@@ -1864,7 +1864,7 @@ function buildAdVoteMessageText(state) {
 	return `⚠️ <b>#广告举报</b>
 ${resultLine}${vetoLine}
 <b>被举报人:</b> ${targetText}
-<b>被举报ID:</b> #${escapeHtml(state.targetUserId)}
+<b>被举报ID:</b> <code>${escapeHtml(state.targetUserId)}</code>
 <b>发起人:</b> ${creatorText}
 
 <b>截止时间:</b> <code>${escapeHtml(deadlineStr)}</code>
