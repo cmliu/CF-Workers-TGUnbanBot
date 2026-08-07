@@ -21,7 +21,7 @@ let GROUP_USERNAME = null;
 // - 非管理员触发 /ad 完全静默,不发任何提示。
 // ========================================================
 
-const AD_VOTE_THRESHOLD = 6;
+let AD_VOTE_THRESHOLD = 6;
 const AD_VOTE_TTL_SECONDS = 7 * 24 * 60 * 60;
 const AD_VOTE_DURATION_HOURS = 1; // 仅用于显示截止时间,非强制过期
 const AD_VOTE_BUTTON_PREFIX = 'adv:'; // callback_data 前缀
@@ -29,6 +29,7 @@ const AD_VOTE_BUTTON_PREFIX = 'adv:'; // callback_data 前缀
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
+		AD_VOTE_THRESHOLD = parseInt(env.AD_VOTE_THRESHOLD) || AD_VOTE_THRESHOLD;
 		const path = url.pathname.slice(1); // 移除开头的斜杠
 		let TOKEN;
 
@@ -1860,7 +1861,7 @@ function buildAdVoteMessageText(state) {
 		actionLine = `\n❎ <i>举报未通过，未处理</i>\n`;
 	}
 
-	return `⚠️ <b>广告举报</b>
+	return `⚠️ <b>#广告举报</b> #${escapeHtml(state.targetUserId)}
 ${resultLine}${vetoLine}<b>被举报人:</b> ${targetText}
 <b>发起人:</b> ${creatorText}
 
@@ -2068,16 +2069,50 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 		return;
 	}
 
-	// 被禁言的用户不允许投票
+	// 投票资格检查:仅"被禁言"或"不在群里"的用户不允许投票
+	let voterStatus = null;
+	let voterStatusError = null;
 	try {
-		const voterStatus = await checkUserStatus(voterId);
-		if (voterStatus?.result?.status === 'restricted') {
-			await answerCallbackQuery(callbackQuery.id, '你已被禁言，无法投票', true);
-			return;
-		}
+		voterStatus = await checkUserStatus(voterId);
 	} catch (error) {
-		console.error('[/ad] 检查禁言状态失败:', error.message);
+		// getChatMember 对不在群里的用户(从未入群/被移除/主动退群)会返回 400,
+		// 这里把异常也视为"不在群里",拒绝投票(而不是放行)
+		voterStatusError = error;
 	}
+
+	const voterStatusValue = voterStatus?.result?.status;
+	if (voterStatusError || !voterStatus?.ok || !voterStatusValue) {
+		// 状态获取失败或状态缺失,一律视为"不在群里",拒绝投票
+		if (voterStatusError) {
+			console.error('[/ad] 检查投票资格失败:', voterStatusError.message);
+		}
+		try {
+			await answerCallbackQuery(callbackQuery.id, '你不在群里，无法投票', true);
+		} catch (error) {
+			console.error('[/ad] answerCallbackQuery (资格检查失败) 失败:', error.message);
+		}
+		return;
+	}
+
+	if (voterStatusValue === 'restricted') {
+		// 被禁言:拒绝投票
+		try {
+			await answerCallbackQuery(callbackQuery.id, '你已被禁言，无法投票', true);
+		} catch (error) {
+			console.error('[/ad] answerCallbackQuery (禁言) 失败:', error.message);
+		}
+		return;
+	}
+	if (voterStatusValue === 'kicked' || voterStatusValue === 'left') {
+		// 被踢出群 / 主动退群:不在群里,拒绝投票
+		try {
+			await answerCallbackQuery(callbackQuery.id, '你不在群里，无法投票', true);
+		} catch (error) {
+			console.error('[/ad] answerCallbackQuery (不在群里) 失败:', error.message);
+		}
+		return;
+	}
+	// 其余状态(member / administrator / creator)允许投票
 
 	// 群管理员一票否决:管理员点"赞成"或"反对"立即结束
 	const voterIsAdmin = await checkIfUserIsAdmin(voterId);
