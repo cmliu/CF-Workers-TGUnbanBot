@@ -2434,6 +2434,17 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 	}
 
 	if (state.finalized) {
+		// 自我修复:state.finalized=true 但消息可能因 finalize 时 editMessageText 失败
+		// (网络抖动 / TG API 临时错误) 而未更新;这里用最新 state 强制重编一次,
+		// 移除按钮 + 刷新为"已结束"文本,保证 UI 与实际状态最终一致
+		try {
+			const finalText = buildAdVoteMessageText(state);
+			const removeButtonsMarkup = { inline_keyboard: [] };
+			await editMessageText(chatId, messageId, finalText, removeButtonsMarkup);
+			console.log(`[/ad] 自我修复: 强制刷新已结束消息 messageId=${messageId}`);
+		} catch (refetchErr) {
+			console.error('[/ad] 自我刷新已结束消息失败:', refetchErr.message);
+		}
 		try {
 			await answerCallbackQuery(callbackQuery.id, '投票已结束', true);
 		} catch (error) {
@@ -2454,6 +2465,10 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 	}
 
 	const voterStatusValue = voterStatus?.result?.status;
+	// can_send_messages 为 getChatMember 返回的直挂属性(result.can_send_messages):
+	// true 表示能发消息(未被禁言), false 才是真禁言;
+	// undefined 会出现在 kicked/left 等状态,按"不在群里"处理而非误判为禁言
+	const canSendMessages = voterStatus?.result?.can_send_messages;
 	if (voterStatusError || !voterStatus?.ok || !voterStatusValue) {
 		// 状态获取失败或状态缺失,一律视为"不在群里",拒绝投票
 		if (voterStatusError) {
@@ -2467,14 +2482,21 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 		return;
 	}
 
+	// 详细日志:打印 status 与 can_send_messages,方便后续排查资格判断问题
+	console.log(`[/ad] 投票资格检查 voterId=${voterId} status=${voterStatusValue} can_send_messages=${canSendMessages}`);
+
 	if (voterStatusValue === 'restricted') {
-		// 被禁言:拒绝投票
-		try {
-			await answerCallbackQuery(callbackQuery.id, '你已被禁言，无法投票', true);
-		} catch (error) {
-			console.error('[/ad] answerCallbackQuery (禁言) 失败:', error.message);
+		// restricted 不等于禁言:只有当 can_send_messages === false 才是真禁言;
+		// 受限但仍能发消息(如仅被禁发图片/链接)时允许投票
+		if (canSendMessages === false) {
+			try {
+				await answerCallbackQuery(callbackQuery.id, '你已被禁言，无法投票', true);
+			} catch (error) {
+				console.error('[/ad] answerCallbackQuery (禁言) 失败:', error.message);
+			}
+			return;
 		}
-		return;
+		// can_send_messages === true 或 undefined 均放行
 	}
 	if (voterStatusValue === 'kicked' || voterStatusValue === 'left') {
 		// 被踢出群 / 主动退群:不在群里,拒绝投票
@@ -2485,7 +2507,7 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 		}
 		return;
 	}
-	// 其余状态(member / administrator / creator)允许投票
+	// 其余状态(member / administrator / creator)以及"受限但能发消息"的 restricted 允许投票
 
 	// 群管理员一票否决:管理员点"赞成"或"反对"立即结束
 	const voterIsAdmin = await checkIfUserIsAdmin(voterId);
@@ -2560,7 +2582,11 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 
 	// 先移除按钮,再异步执行封禁动作(失败不影响投票结论)
 	const removeButtonsMarkup = { inline_keyboard: [] };
-	await editMessageText(chatId, messageId, finalText, removeButtonsMarkup);
+	try {
+		await editMessageText(chatId, messageId, finalText, removeButtonsMarkup);
+	} catch (editErr) {
+		console.error('[/ad] finalize 阶段更新消息失败(将由 callback 自我修复兜底):', editErr.message);
+	}
 
 	if (result === 'approved') {
 		try {
