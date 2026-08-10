@@ -17,7 +17,7 @@ let GROUP_USERNAME = null;
 // - 回复场景:把被举报内容发给 Workers AI(模型由 AD_AI_MODEL 配置,默认 @cf/openai/gpt-oss-20b),
 //   由 AI 按群规判断威胁评级(0~100 分),评级决定本次投票的生效阈值:
 //     🔴A 高危 = 2 票  🟡B 危险 = 4 票  🟢C 可疑 = 6 票  🔵D 未知 = 8 票
-//   AI 同时给出简短判断理由,展示在投票消息中(威胁评级/判断理由两行)。
+//   AI 同时给出简短理由说明,仅记录在 Workers 日志中,不展示在投票消息里。
 // - 直接 /ad <tgid>(无回复内容)/ 无文字内容 / AI 基础设施失败(未绑定/超时/异常)→ 回退 🟢C 可疑(6 票)。
 // - AI 有响应但无法识别/拒绝答复(空响应、格式不对、可能触发安全策略拒答)→ 按 🟡B 危险(4 票)处理。
 // - 群规由 AD_GROUP_RULES 变量规定(env 可覆盖),默认"禁止讨论涉及涉政、NSFW、引战、嘲讽引战、广告推销、邪教"。
@@ -1938,7 +1938,6 @@ function buildAdVoteMessageText(state) {
 	// 威胁评级与生效阈值(兼容旧 KV 状态:无评级字段时按 C 可疑 / 存储阈值兜底)
 	const rating = AD_THREAT_RATINGS[state.threatLevel] || AD_THREAT_RATINGS.C;
 	const threatLabel = state.threatLabel || rating.label;
-	const threatReason = state.threatReason || '未提供理由';
 	const threshold = state.threshold || AD_VOTE_THRESHOLD;
 	const rejectThreshold = state.rejectThreshold || threshold; // 反对阈值,旧状态缺省=赞成阈值
 
@@ -1949,7 +1948,6 @@ ${resultLine}${vetoLine}
 <b>发起人:</b> ${creatorText}
 
 <b>威胁评级:</b> <b>${escapeHtml(threatLabel)}</b>
-<b>判断理由:</b> ${escapeHtml(threatReason)}
 <b>截止时间:</b> <code>${escapeHtml(deadlineStr)}</code>
 
 <b>赞成:</b> ${approverCount}/${threshold}
