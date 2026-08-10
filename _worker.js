@@ -2278,8 +2278,8 @@ async function handleAdCommand(message, env) {
 	const aiContent = aiContentParts.join('\n\n');
 
 	// 5. AI 威胁评级:有可判断内容(消息或用户资料)→ 调用 Workers AI 判断;
-	//    完全无可判断内容(纯 tgid 且未取到资料)、AI 基础设施失败 → 回退 C 可疑(AD_VOTE_THRESHOLD 票);
-	//    AI 有响应但无法识别/拒绝答复(可能触发安全策略)→ 按 🟡B 危险 4 票
+	//    完全无可判断内容(纯 tgid 且未取到资料)→ 回退 C 可疑(AD_VOTE_THRESHOLD 票);
+	//    AI 基础设施失败(未绑定/超时/异常)、有响应但无法识别/拒绝答复 → 按 🟡B 危险 4 票
 	let threatAssessment = null;
 	if (aiContent) {
 		threatAssessment = await assessThreatWithAI(env, aiContent, AD_GROUP_RULES);
@@ -2296,15 +2296,22 @@ async function handleAdCommand(message, env) {
 			reason: 'AI 无法识别或拒绝答复，按 B 危险处理',
 			threshold: AD_THREAT_RATINGS.B.votes
 		};
+	} else if (aiContent) {
+		// 有可判断内容但 AI 调用失败(未绑定/超时/异常)→ 保守按 B 危险处理
+		threat = {
+			level: 'B',
+			label: AD_THREAT_RATINGS.B.label,
+			score: null,
+			reason: 'AI 调用失败，按 B 危险处理',
+			threshold: AD_THREAT_RATINGS.B.votes
+		};
 	} else {
-		const fallbackReason = !aiContent
-			? '无消息内容且未获取到用户资料，默认按 C 可疑处理'
-			: 'AI 调用失败，默认按 C 可疑处理';
+		// 完全无可判断内容 → 中性 C 可疑
 		threat = {
 			level: 'C',
 			label: AD_THREAT_RATINGS.C.label,
 			score: null,
-			reason: fallbackReason,
+			reason: '无消息内容且未获取到用户资料，默认按 C 可疑处理',
 			threshold: AD_VOTE_THRESHOLD
 		};
 	}
@@ -2316,7 +2323,7 @@ async function handleAdCommand(message, env) {
 			? 'ai-success'
 			: threatAssessment?.code === 'unrecognized'
 				? 'ai-unrecognized→B'
-				: 'ai-null→C';
+				: 'ai-null→B';
 	console.log('[ad-ai] === 最终评级决策 ===', JSON.stringify({
 		path,
 		level: threat.level,
