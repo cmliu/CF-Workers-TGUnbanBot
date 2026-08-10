@@ -2434,6 +2434,17 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 	}
 
 	if (state.finalized) {
+		// 自我修复:state.finalized=true 但消息可能因 finalize 时 editMessageText 失败
+		// (网络抖动 / TG API 临时错误) 而未更新;这里用最新 state 强制重编一次,
+		// 移除按钮 + 刷新为"已结束"文本,保证 UI 与实际状态最终一致
+		try {
+			const finalText = buildAdVoteMessageText(state);
+			const removeButtonsMarkup = { inline_keyboard: [] };
+			await editMessageText(chatId, messageId, finalText, removeButtonsMarkup);
+			console.log(`[/ad] 自我修复: 强制刷新已结束消息 messageId=${messageId}`);
+		} catch (refetchErr) {
+			console.error('[/ad] 自我刷新已结束消息失败:', refetchErr.message);
+		}
 		try {
 			await answerCallbackQuery(callbackQuery.id, '投票已结束', true);
 		} catch (error) {
@@ -2571,7 +2582,11 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 
 	// 先移除按钮,再异步执行封禁动作(失败不影响投票结论)
 	const removeButtonsMarkup = { inline_keyboard: [] };
-	await editMessageText(chatId, messageId, finalText, removeButtonsMarkup);
+	try {
+		await editMessageText(chatId, messageId, finalText, removeButtonsMarkup);
+	} catch (editErr) {
+		console.error('[/ad] finalize 阶段更新消息失败(将由 callback 自我修复兜底):', editErr.message);
+	}
 
 	if (result === 'approved') {
 		try {
