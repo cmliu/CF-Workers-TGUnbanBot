@@ -1894,6 +1894,41 @@ async function isAdAllowlisted(env, userId) {
 	return list.some((id) => String(id) === String(userId));
 }
 
+// 脱敏显示名:只保留首字符和尾字符,中间固定用 *** 替代。
+// 必须用 Array.from 按 Unicode 码点拆分,否则 emoji / 生僻字(如"𠮷")会被截断成乱码。
+function maskDisplayName(name) {
+	if (name === undefined || name === null) {
+		return '';
+	}
+	const chars = Array.from(String(name));
+	if (chars.length === 0) {
+		return '';
+	}
+	if (chars.length === 1) {
+		return '***'; // 单字符无"首尾"之分,整体隐藏最安全
+	}
+	return chars[0] + '***' + chars[chars.length - 1];
+}
+
+// 构造被举报人显示文本。
+// mask=false:显示完整名称(投票进行中/被否决时,群成员需看到完整名称再投票);
+// mask=true :投票通过确认其为广告号后,名称本身很可能含广告内容,需脱敏显示,防止广告二次传播。
+function buildAdTargetText(state, mask) {
+	if (!mask) {
+		return formatUserMention(snapshotToTelegramUser(state.targetUserSnapshot))
+			|| `<code>${escapeHtml(state.targetUserId)}</code>`;
+	}
+	const snap = state.targetUserSnapshot;
+	const displayName = [snap?.firstName, snap?.lastName].filter(Boolean).join(' ')
+		|| snap?.username || '';
+	if (!displayName) {
+		// 无显示名称时回退为 TGID,TGID 本身无广告内容,不脱敏
+		return `<code>${escapeHtml(state.targetUserId)}</code>`;
+	}
+	// 脱敏后仍保留可点击链接,方便管理员核对
+	return `<a href="tg://user?id=${escapeHtml(state.targetUserId)}">${escapeHtml(maskDisplayName(displayName))}</a>`;
+}
+
 function buildAdVoteMessageText(state) {
 	const isApproved = state.result === 'approved';
 	const isRejected = state.result === 'rejected';
@@ -1923,8 +1958,9 @@ function buildAdVoteMessageText(state) {
 
 	const statusLine = state.finalized ? '<i>已结束。</i>' : '<i>进行中...</i>';
 
-	const targetText = formatUserMention(snapshotToTelegramUser(state.targetUserSnapshot))
-		|| `<code>${escapeHtml(state.targetUserId)}</code>`;
+	// 投票通过确认其为广告号后,名称本身很可能含广告内容,需脱敏显示,防止广告二次传播
+	const mask = state.finalized && isApproved;
+	const targetText = buildAdTargetText(state, mask);
 	const creatorText = formatUserMention(snapshotToTelegramUser(state.creatorUserSnapshot))
 		|| `<code>${escapeHtml(state.creatorUserId)}</code>`;
 
