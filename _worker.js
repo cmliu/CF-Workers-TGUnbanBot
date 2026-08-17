@@ -2222,6 +2222,35 @@ async function assessThreatWithAI(env, content, groupRules) {
 	}
 }
 
+// 预检目标用户在本群(GROUP_ID)是否已被禁言或被 ban(mutedOrBanned)且已存在于本地 KV 黑名单(isBlacklisted)。
+// 仅当两者同时成立时判定为"重复操作"(shouldSkip=true),由调用方跳过本次举报投票。
+// 注意:checkUserStatus 调用 Telegram getChatMember,当用户不在群里(被踢/退群/从未入群)或网络异常时会抛异常;
+// 异常时按 mutedOrBanned=false 处理(fail-open 放行,不阻断正常举报)。checkBlacklist 内部已兜底"未绑定 KV / 读取异常"两种情况。
+async function checkAdDuplicate(tgid, env) {
+	let mutedOrBanned = false;
+	try {
+		const statusResult = await checkUserStatus(tgid);
+		const status = statusResult?.result?.status;
+		const canSendMessages = statusResult?.result?.can_send_messages;
+		const isMuted = status === 'restricted' && canSendMessages === false; // 被禁言
+		const isBanned = status === 'kicked';                                // 被踢出/ban
+		mutedOrBanned = isMuted || isBanned;
+	} catch (error) {
+		// 用户不在群里(getChatMember 返回 400 抛异常)或网络异常 → fail-open 放行,不阻断正常举报
+		console.error('[/ad] 重复预检查询本群状态失败(按放行处理):', error.message);
+		mutedOrBanned = false;
+	}
+
+	const blacklistCheck = await checkBlacklist(tgid, env);
+	const localBlacklisted = Boolean(blacklistCheck.isBlacklisted);
+
+	return {
+		shouldSkip: mutedOrBanned && localBlacklisted,
+		mutedOrBanned,
+		localBlacklisted
+	};
+}
+
 async function handleAdCommand(message, env) {
 	const chatId = message.chat.id;
 	const userId = message.from.id;
@@ -2282,6 +2311,14 @@ async function handleAdCommand(message, env) {
 	// 不能对机器人发起(回复场景通过 User 对象检测,直接传 tgid 场景无 User 对象,信任管理员判断)
 	if (repliedUser?.is_bot || targetUserSnapshot?.isBot) {
 		await sendTelegramMessage(chatId, '⚠️ 不能对机器人发起举报投票');
+		return;
+	}
+
+	// 重复操作预检:目标用户在本群既已被禁言或被 ban、又已存在于本地黑名单时,跳过本次举报投票。
+	const duplicateCheck = await checkAdDuplicate(targetUserId, env);
+	console.log(`[/ad] 重复预检 tgid=${targetUserId} 已禁言或被ban=${duplicateCheck.mutedOrBanned} 本地黑名单=${duplicateCheck.localBlacklisted} 跳过=${duplicateCheck.shouldSkip}`);
+	if (duplicateCheck.shouldSkip) {
+		await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已在本群被禁言或被封禁，且已在黑名单中，无需重复发起举报投票`);
 		return;
 	}
 
