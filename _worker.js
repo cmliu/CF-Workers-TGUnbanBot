@@ -761,6 +761,16 @@ async function handleMessage(message, env) {
 
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
+			// 备用通道:非管理员但拥有 /ad 权限(群助推者或 /ad 白名单)→ 按 /ad 举报投票逻辑处理
+			const isBoosted = await checkIfUserBoosted(userId);
+			const isAllowed = await isAdAllowlisted(env, userId);
+			if (!isBoosted && !isAllowed) {
+				// 两者都不是→完全静默
+				return;
+			}
+			// 非管理员但拥有 /ad 权限 → 按 /ad 举报投票逻辑处理
+			const adLikeMessage = { ...message, text: message.text.replace(/^\s*\/(?:spam|ban)(?:@[^\s]+)?/i, '/ad') };
+			await handleAdCommand(adLikeMessage, env);
 			return;
 		}
 
@@ -924,6 +934,16 @@ async function handleMessage(message, env) {
 		// 检查是否是群组管理员
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
+			// 备用通道:非管理员但拥有 /ad 权限(群助推者或 /ad 白名单)→ 按 /ad 举报投票逻辑处理
+			const isBoosted = await checkIfUserBoosted(userId);
+			const isAllowed = await isAdAllowlisted(env, userId);
+			if (isBoosted || isAllowed) {
+				// 按 /ad 举报投票逻辑处理;若为私聊,handleAdCommand 内部会静默 return(符合预期)
+				const adLikeMessage = { ...message, text: message.text.replace(/^\s*\/(?:spam|ban)(?:@[^\s]+)?/i, '/ad') };
+				await handleAdCommand(adLikeMessage, env);
+				return;
+			}
+			// 两者都不是→保持原提示
 			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
 			return;
 		}
