@@ -16,15 +16,15 @@ let GROUP_USERNAME = null;
 // - 管理员在 GROUP_ID 群内回复消息(或带参数)发送 /ad,发起一次隐藏的举报投票。
 // - 回复场景:把被举报内容发给 Workers AI(模型由 AD_AI_MODEL 配置,默认 @cf/openai/gpt-oss-20b),
 //   由 AI 按群规判断威胁评级(0~100 分),评级决定本次投票的生效阈值:
-//     🔴A 高危 = 2 票  🟡B 危险 = 4 票  🟢C 可疑 = 6 票  🔵D 未知 = 8 票
+//     🔴A 高危 = 2 票  🟠B 危险 = 4 票  🟡C 可疑 = 6 票  🔵D 未知 = 8 票
 //   AI 同时给出简短理由说明,仅记录在 Workers 日志中,不展示在投票消息里。
-// - 直接 /ad <tgid>(无回复内容)/ 无文字内容 / AI 基础设施失败(未绑定/超时/异常)→ 回退 🟢C 可疑(6 票)。
-// - AI 有响应但无法识别/拒绝答复(空响应、格式不对、可能触发安全策略拒答)→ 按 🟡B 危险(4 票)处理。
+// - 直接 /ad <tgid>(无回复内容)/ 无文字内容 / AI 基础设施失败(未绑定/超时/异常)→ 回退 🟡C 可疑(6 票)。
+// - AI 有响应但无法识别/拒绝答复(空响应、格式不对、可能触发安全策略拒答)→ 按 🟠B 危险(4 票)处理。
 // - 群规由 AD_GROUP_RULES 变量规定(env 可覆盖),默认"禁止讨论涉及涉政、NSFW、引战、嘲讽引战、广告推销、邪教"。
 // - 投票状态持久化到 env.KV: key = ad_vote:<vote_token>, TTL 7 天。
 // - 结束时调用 editMessageText 移除按钮,若赞成胜出则触发封禁(写入 KV 黑名单 + 群内禁言)。
 // - /ad 不出现在 setMyCommands 命令菜单中(保持隐藏)。
-// - 非管理员触发 /ad 完全静默,不发任何提示。
+// - 非管理员(含普通用户)触发 /ad:助推者/白名单直接发起投票;普通用户回复消息 + /ad 时内容交 AI 评级,仅 A/B 弹投票,C/D 或 AI 失败完全静默,均不发权限提示。
 // ========================================================
 
 // 回退阈值:AI 不可用 / 直接传 tgid / 无文字内容时使用(默认 C 可疑 6 票)
@@ -47,8 +47,8 @@ const AD_AI_MAX_CONTENT_CHARS = 500; // 发送给 AI 的被举报内容最大长
 // 评级表:分数区间决定评级,评级决定本次投票生效阈值
 const AD_THREAT_RATINGS = {
 	A: { level: 'A', emoji: '🔴', label: '🔴 A 高危', minScore: 81, maxScore: 100, votes: 2 },
-	B: { level: 'B', emoji: '🟡', label: '🟡 B 危险', minScore: 61, maxScore: 80, votes: 4 },
-	C: { level: 'C', emoji: '🟢', label: '🟢 C 可疑', minScore: 31, maxScore: 60, votes: 6 },
+	B: { level: 'B', emoji: '🟠', label: '🟠 B 危险', minScore: 61, maxScore: 80, votes: 4 },
+	C: { level: 'C', emoji: '🟡', label: '🟡 C 可疑', minScore: 31, maxScore: 60, votes: 6 },
 	D: { level: 'D', emoji: '🔵', label: '🔵 D 未知', minScore: 0, maxScore: 30, votes: 8 }
 };
 
@@ -802,7 +802,26 @@ async function handleMessage(message, env) {
 			const isBoosted = await checkIfUserBoosted(userId);
 			const isAllowed = await isAdAllowlisted(env, userId);
 			if (!isBoosted && !isAllowed) {
-				// 既非管理员/助推者/白名单→完全静默
+				// 普通用户举报通道:回复消息 + /ad → 内容交 AI 评级,仅 A/B 才弹投票,其余完全静默
+				const replyMsg = message.reply_to_message;
+				const src = (typeof replyMsg?.text === 'string' && replyMsg.text.length > 0)
+					? replyMsg.text
+					: (typeof replyMsg?.caption === 'string' && replyMsg.caption.length > 0 ? replyMsg.caption : '');
+				if (!src) {
+					return; // 非回复方式或无文字内容 → 静默
+				}
+				const userReportAssessment = await assessThreatWithAI(env, src.slice(0, AD_AI_MAX_CONTENT_CHARS), AD_GROUP_RULES);
+				console.log('[ad-user-report] 普通用户举报评级结果:', JSON.stringify(userReportAssessment ? {
+					ok: userReportAssessment.ok, level: userReportAssessment.level, score: userReportAssessment.score
+				} : null));
+				if (!userReportAssessment?.ok) {
+					return; // AI 失败/无法识别 → 静默
+				}
+				if (userReportAssessment.level !== 'A' && userReportAssessment.level !== 'B') {
+					return; // C/D → 静默
+				}
+				// A/B → 按 /ad 逻辑弹投票(传入预评级,避免 handleAdCommand 内重复调用 AI)
+				await handleAdCommand(message, env, userReportAssessment);
 				return;
 			}
 		}
@@ -2271,7 +2290,7 @@ async function checkAdDuplicate(tgid, env) {
 	};
 }
 
-async function handleAdCommand(message, env) {
+async function handleAdCommand(message, env, preAssessedThreat = null) {
 	const chatId = message.chat.id;
 	const userId = message.from.id;
 
@@ -2370,13 +2389,17 @@ async function handleAdCommand(message, env) {
 
 	// 5. AI 威胁评级:有可判断内容(消息或用户资料)→ 调用 Workers AI 判断;
 	//    完全无可判断内容(纯 tgid 且未取到资料)→ 回退 C 可疑(AD_VOTE_THRESHOLD 票);
-	//    AI 基础设施失败(未绑定/超时/异常)、有响应但无法识别/拒绝答复 → 按 🟡B 危险 4 票
+	//    AI 基础设施失败(未绑定/超时/异常)、有响应但无法识别/拒绝答复 → 按 🟡B 危险 4 票;
+	//    普通用户举报通道(preAssessedThreat 非空)→ 直接采用预评级,不再调用 AI
 	let threatAssessment = null;
-	if (aiContent) {
+	if (!preAssessedThreat && aiContent) {
 		threatAssessment = await assessThreatWithAI(env, aiContent, AD_GROUP_RULES);
 	}
 	let threat;
-	if (threatAssessment?.ok) {
+	if (preAssessedThreat) {
+		// 普通用户举报通道预评级路径:直接采用,不再调用 AI
+		threat = preAssessedThreat;
+	} else if (threatAssessment?.ok) {
 		threat = threatAssessment;
 	} else if (threatAssessment?.code === 'unrecognized') {
 		// AI 拒答或返回无法识别 → 视为 B 危险(内容可能确实违规才触发拒答)
@@ -2407,14 +2430,16 @@ async function handleAdCommand(message, env) {
 		};
 	}
 
-	// 最终评级决策日志:诊断哪条路径生效(无内容 / AI成功 / AI拒答-unrecognized / AI异常-null)
-	const path = !aiContent
-		? 'fallback-no-content'
-		: threatAssessment?.ok
-			? 'ai-success'
-			: threatAssessment?.code === 'unrecognized'
-				? 'ai-unrecognized→B'
-				: 'ai-null→B';
+	// 最终评级决策日志:诊断哪条路径生效(预评级 / 无内容 / AI成功 / AI拒答-unrecognized / AI异常-null)
+	const path = preAssessedThreat
+		? 'preassessed-user-report'
+		: !aiContent
+			? 'fallback-no-content'
+			: threatAssessment?.ok
+				? 'ai-success'
+				: threatAssessment?.code === 'unrecognized'
+					? 'ai-unrecognized→B'
+					: 'ai-null→B';
 	console.log('[ad-ai] === 最终评级决策 ===', JSON.stringify({
 		path,
 		level: threat.level,
