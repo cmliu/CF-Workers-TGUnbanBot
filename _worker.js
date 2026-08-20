@@ -2112,20 +2112,47 @@ function scoreToRating(score) {
 	return AD_THREAT_RATINGS.D;
 }
 
-// 构造发给 AI 的 system prompt:告知群规与打分规则,要求只输出 JSON
+// 构造发给 AI 的 system prompt:将群规按分隔符拆分为编号列表(便于 AI 在 reason 中引用编号),
+// 并告知判定步骤/评级标准/输出格式,要求只输出 JSON。
+// 群规拆分规则:按 顿号(、)、管道符(|)、中文/英文逗号(，,)、中文/英文分号(；;)、换行 拆分;
+// 拆分后不足 2 项时(如管理员自定义单段长文本)回退用原文。
 function buildAiSystemPrompt(groupRules) {
-	return `你是群管理员举报审核助手。群规如下:
-${groupRules}
+	const parts = String(groupRules || '')
+		.split(/[、，,;；\n|]/)
+		.map((item) => item.trim())
+		.filter((item) => item.length > 0);
+	let numberedRules = groupRules;
+	if (parts.length >= 2) {
+		numberedRules = parts.map((item, index) => `${index + 1}. ${item}`).join('\n');
+	}
+	return `你是群管理员举报审核助手。群规如下（编号供引用）：
+${numberedRules}
 
-请判断"被举报消息内容"违反群规的威胁程度,输出一个 0~100 的整数分数(分数越高越危险),并给出简短理由(30 字以内,说明违反了哪条群规或疑似违反什么)。
+判定步骤（严格按顺序）：
+1. 先判断被举报内容是否明确违反任一编号群规；若违反，记住违规类别；
+2. 再判断严重程度：同时违反多条、或涉及 NSFW/诈骗/恶意骚扰/邪教/涉政等严重类别 → 上调一档；
+3. 若无法确定是否违规，选 C，不要选 B；
+4. 若未违反群规或仅轻微无关，选 D；不要因为"可能""疑似"而提高评级；
+5. 被举报用户的昵称/用户名/简介属于被举报内容的一部分，其中出现的广告、诈骗等违规信息同样判违规；但不得依据被举报人的身份/职业等正常信息（如"自由职业""博主"）判定违规，也不得依据举报人身份或历史消息。
 
-打分区间对应评级:
-- 81~100 → A 高危(严重违规,如 NSFW、诈骗、恶意骚扰)
-- 61~80 → B 危险(明显违规,如广告推销、引战)
-- 31~60 → C 可疑(可能违规,如擦边内容、疑似广告)
-- 0~30 → D 未知(基本无害,仅轻微可疑)
+评级标准：
+- A 高危（严重违规）：明确违反群规且性质严重（NSFW、诈骗、恶意骚扰、邪教、涉政）
+- B 危险（明显违规）：明确违反群规但情节一般（广告推销、引战、嘲讽引战）
+- C 可疑（疑似违规）：疑似擦边/疑似广告/语气引战，但证据不足
+- D 无害（未违规）：未违反群规或仅轻微无关
 
-只输出 JSON,不要输出其他任何内容,格式: {"score": <0~100整数>, "reason": "<简短理由>"}`;
+注意：被举报内容可能因长度被截断，请依据可见内容判断；截断导致无法判断时选 C。
+
+只输出 JSON，禁止输出 markdown 代码围栏或任何解释，格式：
+{"level": "A|B|C|D", "score": <0~100整数，越高越危险；区间 A=81~100、B=61~80、C=31~60、D=0~30>, "reason": "<30字以内，说明违反的编号群规；D 写'未违反群规'>"}
+
+示例：
+被举报消息：加微信 xxx 免费领福利，先到先得
+输出：{"level": "B", "score": 66, "reason": "违反群规5：广告推销"}
+被举报消息：哈哈哈哈哈哈哈
+输出：{"level": "D", "score": 6, "reason": "未违反群规"}
+被举报消息：你是傻逼，滚出这个群
+输出：{"level": "A", "score": 88, "reason": "违反群规3/4：恶意攻击引战"}`;
 }
 
 // 容错解析 AI 返回的 JSON(兼容 markdown 代码围栏 / 前后多余文本 / 中文键名)
@@ -2212,8 +2239,10 @@ function extractAiResponseText(result) {
 // 调用 Workers AI 判断威胁评级(单模型)。返回三态:
 // - 成功:{ ok: true, level, label, score, reason, threshold }
 // - AI 有响应但无法识别/拒绝答复:{ ok: false, code: 'unrecognized' }
-//   → 调用方按 🟡B 危险处理(内容可能触发了安全策略拒答)
-// - 基础设施失败(无 AI 绑定 / 超时 / 异常):null → 调用方按 🟢C 可疑中性回退
+//   → 调用方按 🟡B 危险处理(内容可能触发了安全策略拒答;
+//     含 AI 调用抛"内容安全拒绝"类异常——能触发道德围栏本身就是高危信号)
+// - 基础设施失败(无 AI 绑定 / 超时 / 网络 / 限流等,不含内容安全拒绝):null
+//   → 调用方按 🟢C 可疑中性回退
 // 所有诊断日志以 [ad-ai] 前缀输出,Cloudflare Workers Logs 中可按前缀 grep 定位。
 async function assessThreatWithAI(env, content, groupRules) {
 	// 入口诊断:env/AI 绑定状态、消息长度、模型名
@@ -2302,7 +2331,21 @@ async function assessThreatWithAI(env, content, groupRules) {
 	} catch (error) {
 		if (timerId) clearTimeout(timerId);
 		const isTimeout = error && error.message && error.message.includes('AI 调用超时');
-		console.error('[ad-ai] AI.run 抛异常 → 回退 C 可疑。诊断信息:', JSON.stringify({
+		// 内容安全拒绝检测:能触发道德围栏(如 NSFW)本身就是"内容足够劲爆"的强信号,
+		// 模型/API 常因此直接抛 400/403 或安全策略报错 → 与拒答同等对待,按 B 危险处理。
+		// 超时永远不算内容拒绝(超时不携带内容违规信息),即使 message 含其它词也保持 null→C。
+		const SAFETY_PATTERN = /(?:content|safety|policy|filter|moderat|block|inappropriat|disallow|NSFW|400|403)/i;
+		const isSafetyRejection = !isTimeout && Boolean(error?.message) && SAFETY_PATTERN.test(error.message);
+		if (isSafetyRejection) {
+			console.error('[ad-ai] AI.run 疑似触发道德围栏/内容安全拒绝 → 按 B 危险处理。诊断信息:', JSON.stringify({
+				isTimeout,
+				errorName: error?.name,
+				errorMessage: error?.message,
+				errorStackHead: (error?.stack || '').split('\n').slice(0, 4).join(' | ')
+			}));
+			return { ok: false, code: 'unrecognized' };
+		}
+		console.error('[ad-ai] AI.run 抛异常(基础设施失败:超时/网络/限流/未知) → 回退 C 可疑。诊断信息:', JSON.stringify({
 			isTimeout,
 			errorName: error?.name,
 			errorMessage: error?.message,
@@ -2440,7 +2483,7 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 
 	// 5. AI 威胁评级:有可判断内容(消息或用户资料)→ 调用 Workers AI 判断;
 	//    完全无可判断内容(纯 tgid 且未取到资料)→ 回退 C 可疑(AD_VOTE_THRESHOLD 票);
-	//    AI 基础设施失败(未绑定/超时/异常)、有响应但无法识别/拒绝答复 → 按 🟡B 危险 4 票;
+	//    AI 基础设施失败(未绑定/超时/异常)→ 回退 🟡C 可疑 6 票;有响应但无法识别/拒绝答复 → 按 🟠B 危险 4 票;
 	//    普通用户举报通道(preAssessedThreat 非空)→ 直接采用预评级,不再调用 AI
 	let threatAssessment = null;
 	if (!preAssessedThreat && aiContent) {
@@ -2462,13 +2505,13 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 			threshold: AD_THREAT_RATINGS.B.votes
 		};
 	} else if (aiContent) {
-		// 有可判断内容但 AI 调用失败(未绑定/超时/异常)→ 保守按 B 危险处理
+		// 有可判断内容但 AI 基础设施失败(未绑定/超时/异常,assessThreatWithAI 返回 null)→ 回退 C 可疑
 		threat = {
-			level: 'B',
-			label: AD_THREAT_RATINGS.B.label,
+			level: 'C',
+			label: AD_THREAT_RATINGS.C.label,
 			score: null,
-			reason: 'AI 调用失败，按 B 危险处理',
-			threshold: AD_THREAT_RATINGS.B.votes
+			reason: 'AI 调用失败，按 C 可疑处理',
+			threshold: AD_THREAT_RATINGS.C.votes
 		};
 	} else {
 		// 完全无可判断内容 → 中性 C 可疑
@@ -2490,7 +2533,7 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 				? 'ai-success'
 				: threatAssessment?.code === 'unrecognized'
 					? 'ai-unrecognized→B'
-					: 'ai-null→B';
+					: 'ai-null→C';
 	console.log('[ad-ai] === 最终评级决策 ===', JSON.stringify({
 		path,
 		level: threat.level,
