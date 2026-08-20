@@ -52,6 +52,10 @@ const AD_THREAT_RATINGS = {
 	D: { level: 'D', emoji: '🔵', label: '🔵 D 未知', minScore: 0, maxScore: 30, votes: 8 }
 };
 
+// 黑名单实例级内存缓存:短 TTL 降低 KV 读频率,避免逼近 KV 免费档读取上限
+const BLACKLIST_CACHE_TTL_MS = 5000; // 5 秒,写入后跨实例最长延迟
+let blacklistCache = { data: null, fetchedAt: 0 };
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
@@ -232,10 +236,28 @@ async function handleInitialization(request) {
 	}
 }
 
+// 黑名单写入后调用,立即失效本实例缓存,保证封禁/解封即时生效
+function invalidateBlacklistCache() {
+	blacklistCache = { data: null, fetchedAt: 0 };
+}
+
 // 检查用户是否在黑名单中
 async function checkBlacklist(userId, env) {
 	// 检查是否绑定了 KV 空间
 	if (!env.KV) {
+		return { isBlacklisted: false, message: null };
+	}
+
+	const now = Date.now();
+	// 实例级内存缓存命中:TTL 内直接复用,不读 KV
+	const cacheValid = blacklistCache.data !== null && (now - blacklistCache.fetchedAt) < BLACKLIST_CACHE_TTL_MS;
+	if (cacheValid) {
+		if (blacklistCache.data.includes(userId.toString()) || blacklistCache.data.includes(userId)) {
+			return {
+				isBlacklisted: true,
+				message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。'
+			};
+		}
 		return { isBlacklisted: false, message: null };
 	}
 
@@ -249,6 +271,9 @@ async function checkBlacklist(userId, env) {
 			await env.KV.put('blacklist', JSON.stringify(blacklist));
 		}
 
+		// 读取成功,更新实例级缓存(fetchedAt=now,后续 TTL 内直接命中)
+		blacklistCache = { data: blacklist, fetchedAt: now };
+
 		// 检查用户 ID 是否在黑名单中
 		if (blacklist.includes(userId.toString()) || blacklist.includes(userId)) {
 			return {
@@ -260,7 +285,7 @@ async function checkBlacklist(userId, env) {
 		return { isBlacklisted: false, message: null };
 	} catch (error) {
 		console.error('检查黑名单时出错:', error);
-		// 如果出错，不阻止用户操作
+		// 如果出错，不阻止用户操作(缓存保持不变,不写入坏数据;旧缓存若仍在 TTL 内可继续降级使用)
 		return { isBlacklisted: false, message: null };
 	}
 }
@@ -290,6 +315,7 @@ async function addToBlacklist(userId, env) {
 		// 添加到黑名单
 		blacklist.push(userIdStr);
 		await env.KV.put('blacklist', JSON.stringify(blacklist));
+		invalidateBlacklistCache(); // 黑名单已写入,立即失效实例级缓存,保证封禁即时生效
 
 		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单` };
 	} catch (error) {
@@ -326,6 +352,7 @@ async function removeFromBlacklist(userId, env) {
 
 		// 保存更新后的黑名单
 		await env.KV.put('blacklist', JSON.stringify(blacklist));
+		invalidateBlacklistCache(); // 黑名单已写入,立即失效实例级缓存,保证解封即时生效
 
 		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 从黑名单中移除` };
 	} catch (error) {
@@ -610,7 +637,8 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 const BOT_MODERATION_LOG_LABELS = {
 	'new-members:found': '检测到新成员入群消息',
 	'skip:new-members-not-target-chat': '跳过：新成员消息不在配置的 GROUP_ID 群',
-	'skip:new-member-not-bot': '跳过：新成员不是机器人',
+	'skip:new-member-without-id': '跳过：新成员缺少用户 ID，无法处理',
+	'skip:new-member-not-blacklisted': '跳过：新入群普通用户不在本地黑名单，正常放行',
 	'skip:new-member-self': '跳过：新成员是当前机器人自己',
 	'new-member-admin-status': '已查询新入群机器人在群里的身份',
 	'skip:new-member-admin-status-check-failed': '跳过：无法确认新入群机器人是否为管理员，为避免误伤不处理',
@@ -618,6 +646,9 @@ const BOT_MODERATION_LOG_LABELS = {
 	'action:mute-new-bot:start': '开始处理：禁言新入群的非管理员机器人',
 	'action:mute-new-bot:success': '处理成功：已禁言新入群的非管理员机器人',
 	'action:mute-new-bot:failed': '处理失败：禁言新入群机器人失败',
+	'action:ban-blacklisted-new-member:start': '开始处理：封禁新入群的黑名单用户',
+	'action:ban-blacklisted-new-member:success': '处理成功：已封禁新入群的黑名单用户',
+	'action:ban-blacklisted-new-member:failed': '处理失败：封禁新入群的黑名单用户失败',
 	'skip:no-message-from': '跳过：消息没有 from 字段，无法按普通用户消息处理',
 	'skip:self-bot-id-missing': '跳过：无法获取当前机器人的 ID，为避免误伤不处理',
 	'telegram-api:restrictChatMember:response': 'Telegram接口返回：禁言'
@@ -660,7 +691,7 @@ function getNewMemberLogInfo(message, member) {
 	};
 }
 
-async function handleNewChatMemberBots(message) {
+async function handleNewChatMemberBots(message, env) {
 	const chat = message.chat;
 	const newMembers = message.new_chat_members;
 
@@ -688,7 +719,27 @@ async function handleNewChatMemberBots(message) {
 		const logInfo = getNewMemberLogInfo(message, member);
 
 		if (!member?.is_bot) {
-			logBotModeration('skip:new-member-not-bot', logInfo);
+			// 普通用户入群:检查本地 KV 黑名单,命中则立即封禁踢出(封禁语义闭环)。
+			// checkBlacklist 仅读 env.KV(无外部 API 阻塞),开销可接受。
+			if (!member?.id) {
+				logBotModeration('skip:new-member-without-id', logInfo);
+				continue;
+			}
+			try {
+				const blacklistCheck = await checkBlacklist(member.id, env);
+				if (blacklistCheck.isBlacklisted) {
+					logBotModeration('action:ban-blacklisted-new-member:start', logInfo);
+					await banUserPermanently(chat.id, member.id);
+					logBotModeration('action:ban-blacklisted-new-member:success', logInfo);
+				} else {
+					logBotModeration('skip:new-member-not-blacklisted', logInfo);
+				}
+			} catch (error) {
+				logBotModeration('action:ban-blacklisted-new-member:failed', {
+					...logInfo,
+					错误: error.message
+				});
+			}
 			continue;
 		}
 
@@ -739,7 +790,7 @@ async function handleNewChatMemberBots(message) {
 }
 
 async function handleMessage(message, env) {
-	if (await handleNewChatMemberBots(message)) {
+	if (await handleNewChatMemberBots(message, env)) {
 		return;
 	}
 
@@ -2711,25 +2762,39 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 		} catch (error) {
 			console.error('[/ad] finalize 写入黑名单失败:', error.message);
 		}
-		// 检查用户群内状态:在群则禁言,不在群则永久封禁
+		// 检查用户群内状态:
+		// - 在群(member/administrator/creator/restricted)→ 禁言;
+		// - 不在群(left/kicked/状态缺失/查询异常/从未入群)→ 永久封禁为主动作。
+		// 注意:用户从未入群时,Telegram 对 getChatMember / banChatMember 都会返回 400
+		// (USER_NOT_PARTICIPANT),此时无法通过 API 封禁,绝不回退到禁言,仅依赖已写入的
+		// 本地黑名单,待其入群时由 handleNewChatMemberBots 入群拦截逻辑处理。
+		let userStatus = null;
 		try {
 			const statusResult = await checkUserStatus(state.targetUserId);
-			const userStatus = statusResult?.result?.status;
-			const inGroup = userStatus === 'member' || userStatus === 'restricted' || userStatus === 'administrator' || userStatus === 'creator';
-			if (inGroup) {
-				await muteChatMember(chatId, state.targetUserId);
-				console.log(`[/ad] 已在群 ${chatId} 内禁言 ${state.targetUserId}`);
-			} else {
-				await banUserPermanently(chatId, state.targetUserId);
-				console.log(`[/ad] 用户 ${state.targetUserId} 不在群内(${userStatus}),已永久封禁`);
-			}
+			userStatus = statusResult?.result?.status || null;
 		} catch (error) {
-			// 状态查询失败→用户大概率不在群,直接永久封禁
-			console.error('[/ad] 查询用户状态失败,执行永久封禁:', error.message);
+			// 状态查询异常(如从未入群返回 400 USER_NOT_PARTICIPANT)→ 视为不在群,走永久封禁分支
+			console.error('[/ad] 查询用户状态失败(视为不在群),执行永久封禁:', error.message);
+		}
+
+		const inGroup = userStatus === 'member' || userStatus === 'restricted' || userStatus === 'administrator' || userStatus === 'creator';
+		if (inGroup) {
+			// 在群(含 restricted 被禁言状态)→ 禁言,不封禁
+			try {
+				await muteChatMember(chatId, state.targetUserId);
+				console.log(`[/ad] 用户 ${state.targetUserId} 在群(${userStatus}),已在群 ${chatId} 内禁言`);
+			} catch (muteError) {
+				console.error('[/ad] finalize 禁言失败:', muteError.message);
+			}
+		} else {
+			// 不在群:永久封禁为主动作
 			try {
 				await banUserPermanently(chatId, state.targetUserId);
+				console.log(`[/ad] 用户 ${state.targetUserId} 不在群内(${userStatus || '状态缺失/查询异常'}),已永久封禁`);
 			} catch (banError) {
-				console.error('[/ad] finalize 永久封禁也失败:', banError.message);
+				// 用户从未入群等场景,banChatMember 同样返回 400:不回退到禁言,
+				// 黑名单已写入,待用户入群时由入群拦截逻辑封禁
+				console.error('[/ad] finalize 永久封禁失败(用户不在群无法通过 API 封禁),已记入本地黑名单,待其入群时由入群拦截逻辑处理:', banError.message);
 			}
 		}
 		// 回复场景:删除被举报的广告消息
