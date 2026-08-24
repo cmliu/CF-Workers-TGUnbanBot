@@ -16,15 +16,15 @@ let GROUP_USERNAME = null;
 // - 管理员在 GROUP_ID 群内回复消息(或带参数)发送 /ad,发起一次隐藏的举报投票。
 // - 回复场景:把被举报内容发给 Workers AI(模型由 AD_AI_MODEL 配置,默认 @cf/openai/gpt-oss-20b),
 //   由 AI 按群规判断威胁评级(0~100 分),评级决定本次投票的生效阈值:
-//     🔴A 高危 = 2 票  🟡B 危险 = 4 票  🟢C 可疑 = 6 票  🔵D 未知 = 8 票
+//     🔴A 高危 = 2 票  🟠B 危险 = 4 票  🟡C 可疑 = 6 票  🔵D 未知 = 8 票
 //   AI 同时给出简短理由说明,仅记录在 Workers 日志中,不展示在投票消息里。
-// - 直接 /ad <tgid>(无回复内容)/ 无文字内容 / AI 基础设施失败(未绑定/超时/异常)→ 回退 🟢C 可疑(6 票)。
-// - AI 有响应但无法识别/拒绝答复(空响应、格式不对、可能触发安全策略拒答)→ 按 🟡B 危险(4 票)处理。
+// - 直接 /ad <tgid>(无回复内容)/ 无文字内容 / AI 基础设施失败(未绑定/超时/异常)→ 回退 🟡C 可疑(6 票)。
+// - AI 有响应但无法识别/拒绝答复(空响应、格式不对、可能触发安全策略拒答)→ 按 🟠B 危险(4 票)处理。
 // - 群规由 AD_GROUP_RULES 变量规定(env 可覆盖),默认"禁止讨论涉及涉政、NSFW、引战、嘲讽引战、广告推销、邪教"。
 // - 投票状态持久化到 env.KV: key = ad_vote:<vote_token>, TTL 7 天。
 // - 结束时调用 editMessageText 移除按钮,若赞成胜出则触发封禁(写入 KV 黑名单 + 群内禁言)。
 // - /ad 不出现在 setMyCommands 命令菜单中(保持隐藏)。
-// - 非管理员触发 /ad 完全静默,不发任何提示。
+// - 非管理员(含普通用户)触发 /ad:助推者/白名单直接发起投票;普通用户回复消息 + /ad 时内容交 AI 评级,仅 A/B 弹投票,C/D 或 AI 失败完全静默,均不发权限提示。
 // ========================================================
 
 // 回退阈值:AI 不可用 / 直接传 tgid / 无文字内容时使用(默认 C 可疑 6 票)
@@ -47,10 +47,14 @@ const AD_AI_MAX_CONTENT_CHARS = 500; // 发送给 AI 的被举报内容最大长
 // 评级表:分数区间决定评级,评级决定本次投票生效阈值
 const AD_THREAT_RATINGS = {
 	A: { level: 'A', emoji: '🔴', label: '🔴 A 高危', minScore: 81, maxScore: 100, votes: 2 },
-	B: { level: 'B', emoji: '🟡', label: '🟡 B 危险', minScore: 61, maxScore: 80, votes: 4 },
-	C: { level: 'C', emoji: '🟢', label: '🟢 C 可疑', minScore: 31, maxScore: 60, votes: 6 },
+	B: { level: 'B', emoji: '🟠', label: '🟠 B 危险', minScore: 61, maxScore: 80, votes: 4 },
+	C: { level: 'C', emoji: '🟡', label: '🟡 C 可疑', minScore: 31, maxScore: 60, votes: 6 },
 	D: { level: 'D', emoji: '🔵', label: '🔵 D 未知', minScore: 0, maxScore: 30, votes: 8 }
 };
+
+// 黑名单实例级内存缓存:短 TTL 降低 KV 读频率,避免逼近 KV 免费档读取上限
+const BLACKLIST_CACHE_TTL_MS = 5000; // 5 秒,写入后跨实例最长延迟
+let blacklistCache = { data: null, fetchedAt: 0 };
 
 export default {
 	async fetch(request, env, ctx) {
@@ -232,10 +236,28 @@ async function handleInitialization(request) {
 	}
 }
 
+// 黑名单写入后调用,立即失效本实例缓存,保证封禁/解封即时生效
+function invalidateBlacklistCache() {
+	blacklistCache = { data: null, fetchedAt: 0 };
+}
+
 // 检查用户是否在黑名单中
 async function checkBlacklist(userId, env) {
 	// 检查是否绑定了 KV 空间
 	if (!env.KV) {
+		return { isBlacklisted: false, message: null };
+	}
+
+	const now = Date.now();
+	// 实例级内存缓存命中:TTL 内直接复用,不读 KV
+	const cacheValid = blacklistCache.data !== null && (now - blacklistCache.fetchedAt) < BLACKLIST_CACHE_TTL_MS;
+	if (cacheValid) {
+		if (blacklistCache.data.includes(userId.toString()) || blacklistCache.data.includes(userId)) {
+			return {
+				isBlacklisted: true,
+				message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。'
+			};
+		}
 		return { isBlacklisted: false, message: null };
 	}
 
@@ -249,6 +271,9 @@ async function checkBlacklist(userId, env) {
 			await env.KV.put('blacklist', JSON.stringify(blacklist));
 		}
 
+		// 读取成功,更新实例级缓存(fetchedAt=now,后续 TTL 内直接命中)
+		blacklistCache = { data: blacklist, fetchedAt: now };
+
 		// 检查用户 ID 是否在黑名单中
 		if (blacklist.includes(userId.toString()) || blacklist.includes(userId)) {
 			return {
@@ -260,7 +285,7 @@ async function checkBlacklist(userId, env) {
 		return { isBlacklisted: false, message: null };
 	} catch (error) {
 		console.error('检查黑名单时出错:', error);
-		// 如果出错，不阻止用户操作
+		// 如果出错，不阻止用户操作(缓存保持不变,不写入坏数据;旧缓存若仍在 TTL 内可继续降级使用)
 		return { isBlacklisted: false, message: null };
 	}
 }
@@ -290,6 +315,7 @@ async function addToBlacklist(userId, env) {
 		// 添加到黑名单
 		blacklist.push(userIdStr);
 		await env.KV.put('blacklist', JSON.stringify(blacklist));
+		invalidateBlacklistCache(); // 黑名单已写入,立即失效实例级缓存,保证封禁即时生效
 
 		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单` };
 	} catch (error) {
@@ -326,6 +352,7 @@ async function removeFromBlacklist(userId, env) {
 
 		// 保存更新后的黑名单
 		await env.KV.put('blacklist', JSON.stringify(blacklist));
+		invalidateBlacklistCache(); // 黑名单已写入,立即失效实例级缓存,保证解封即时生效
 
 		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 从黑名单中移除` };
 	} catch (error) {
@@ -610,7 +637,8 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 const BOT_MODERATION_LOG_LABELS = {
 	'new-members:found': '检测到新成员入群消息',
 	'skip:new-members-not-target-chat': '跳过：新成员消息不在配置的 GROUP_ID 群',
-	'skip:new-member-not-bot': '跳过：新成员不是机器人',
+	'skip:new-member-without-id': '跳过：新成员缺少用户 ID，无法处理',
+	'skip:new-member-not-blacklisted': '跳过：新入群普通用户不在本地黑名单，正常放行',
 	'skip:new-member-self': '跳过：新成员是当前机器人自己',
 	'new-member-admin-status': '已查询新入群机器人在群里的身份',
 	'skip:new-member-admin-status-check-failed': '跳过：无法确认新入群机器人是否为管理员，为避免误伤不处理',
@@ -618,6 +646,9 @@ const BOT_MODERATION_LOG_LABELS = {
 	'action:mute-new-bot:start': '开始处理：禁言新入群的非管理员机器人',
 	'action:mute-new-bot:success': '处理成功：已禁言新入群的非管理员机器人',
 	'action:mute-new-bot:failed': '处理失败：禁言新入群机器人失败',
+	'action:ban-blacklisted-new-member:start': '开始处理：封禁新入群的黑名单用户',
+	'action:ban-blacklisted-new-member:success': '处理成功：已封禁新入群的黑名单用户',
+	'action:ban-blacklisted-new-member:failed': '处理失败：封禁新入群的黑名单用户失败',
 	'skip:no-message-from': '跳过：消息没有 from 字段，无法按普通用户消息处理',
 	'skip:self-bot-id-missing': '跳过：无法获取当前机器人的 ID，为避免误伤不处理',
 	'telegram-api:restrictChatMember:response': 'Telegram接口返回：禁言'
@@ -660,7 +691,7 @@ function getNewMemberLogInfo(message, member) {
 	};
 }
 
-async function handleNewChatMemberBots(message) {
+async function handleNewChatMemberBots(message, env) {
 	const chat = message.chat;
 	const newMembers = message.new_chat_members;
 
@@ -688,7 +719,27 @@ async function handleNewChatMemberBots(message) {
 		const logInfo = getNewMemberLogInfo(message, member);
 
 		if (!member?.is_bot) {
-			logBotModeration('skip:new-member-not-bot', logInfo);
+			// 普通用户入群:检查本地 KV 黑名单,命中则立即封禁踢出(封禁语义闭环)。
+			// checkBlacklist 仅读 env.KV(无外部 API 阻塞),开销可接受。
+			if (!member?.id) {
+				logBotModeration('skip:new-member-without-id', logInfo);
+				continue;
+			}
+			try {
+				const blacklistCheck = await checkBlacklist(member.id, env);
+				if (blacklistCheck.isBlacklisted) {
+					logBotModeration('action:ban-blacklisted-new-member:start', logInfo);
+					await banUserPermanently(chat.id, member.id);
+					logBotModeration('action:ban-blacklisted-new-member:success', logInfo);
+				} else {
+					logBotModeration('skip:new-member-not-blacklisted', logInfo);
+				}
+			} catch (error) {
+				logBotModeration('action:ban-blacklisted-new-member:failed', {
+					...logInfo,
+					错误: error.message
+				});
+			}
 			continue;
 		}
 
@@ -739,7 +790,7 @@ async function handleNewChatMemberBots(message) {
 }
 
 async function handleMessage(message, env) {
-	if (await handleNewChatMemberBots(message)) {
+	if (await handleNewChatMemberBots(message, env)) {
 		return;
 	}
 
@@ -761,6 +812,16 @@ async function handleMessage(message, env) {
 
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
+			// 备用通道:非管理员但拥有 /ad 权限(群助推者或 /ad 白名单)→ 按 /ad 举报投票逻辑处理
+			const isBoosted = await checkIfUserBoosted(userId);
+			const isAllowed = await isAdAllowlisted(env, userId);
+			if (!isBoosted && !isAllowed) {
+				// 两者都不是→完全静默
+				return;
+			}
+			// 非管理员但拥有 /ad 权限 → 按 /ad 举报投票逻辑处理
+			const adLikeMessage = { ...message, text: message.text.replace(/^\s*\/(?:spam|ban)(?:@[^\s]+)?/i, '/ad') };
+			await handleAdCommand(adLikeMessage, env);
 			return;
 		}
 
@@ -792,7 +853,26 @@ async function handleMessage(message, env) {
 			const isBoosted = await checkIfUserBoosted(userId);
 			const isAllowed = await isAdAllowlisted(env, userId);
 			if (!isBoosted && !isAllowed) {
-				// 既非管理员/助推者/白名单→完全静默
+				// 普通用户举报通道:回复消息 + /ad → 内容交 AI 评级,仅 A/B 才弹投票,其余完全静默
+				const replyMsg = message.reply_to_message;
+				const src = (typeof replyMsg?.text === 'string' && replyMsg.text.length > 0)
+					? replyMsg.text
+					: (typeof replyMsg?.caption === 'string' && replyMsg.caption.length > 0 ? replyMsg.caption : '');
+				if (!src) {
+					return; // 非回复方式或无文字内容 → 静默
+				}
+				const userReportAssessment = await assessThreatWithAI(env, src.slice(0, AD_AI_MAX_CONTENT_CHARS), AD_GROUP_RULES);
+				console.log('[ad-user-report] 普通用户举报评级结果:', JSON.stringify(userReportAssessment ? {
+					ok: userReportAssessment.ok, level: userReportAssessment.level, score: userReportAssessment.score
+				} : null));
+				if (!userReportAssessment?.ok) {
+					return; // AI 失败/无法识别 → 静默
+				}
+				if (userReportAssessment.level !== 'A' && userReportAssessment.level !== 'B') {
+					return; // C/D → 静默
+				}
+				// A/B → 按 /ad 逻辑弹投票(传入预评级,避免 handleAdCommand 内重复调用 AI)
+				await handleAdCommand(message, env, userReportAssessment);
 				return;
 			}
 		}
@@ -924,6 +1004,16 @@ async function handleMessage(message, env) {
 		// 检查是否是群组管理员
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
+			// 备用通道:非管理员但拥有 /ad 权限(群助推者或 /ad 白名单)→ 按 /ad 举报投票逻辑处理
+			const isBoosted = await checkIfUserBoosted(userId);
+			const isAllowed = await isAdAllowlisted(env, userId);
+			if (isBoosted || isAllowed) {
+				// 按 /ad 举报投票逻辑处理;若为私聊,handleAdCommand 内部会静默 return(符合预期)
+				const adLikeMessage = { ...message, text: message.text.replace(/^\s*\/(?:spam|ban)(?:@[^\s]+)?/i, '/ad') };
+				await handleAdCommand(adLikeMessage, env);
+				return;
+			}
+			// 两者都不是→保持原提示
 			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
 			return;
 		}
@@ -2022,20 +2112,47 @@ function scoreToRating(score) {
 	return AD_THREAT_RATINGS.D;
 }
 
-// 构造发给 AI 的 system prompt:告知群规与打分规则,要求只输出 JSON
+// 构造发给 AI 的 system prompt:将群规按分隔符拆分为编号列表(便于 AI 在 reason 中引用编号),
+// 并告知判定步骤/评级标准/输出格式,要求只输出 JSON。
+// 群规拆分规则:按 顿号(、)、管道符(|)、中文/英文逗号(，,)、中文/英文分号(；;)、换行 拆分;
+// 拆分后不足 2 项时(如管理员自定义单段长文本)回退用原文。
 function buildAiSystemPrompt(groupRules) {
-	return `你是群管理员举报审核助手。群规如下:
-${groupRules}
+	const parts = String(groupRules || '')
+		.split(/[、，,;；\n|]/)
+		.map((item) => item.trim())
+		.filter((item) => item.length > 0);
+	let numberedRules = groupRules;
+	if (parts.length >= 2) {
+		numberedRules = parts.map((item, index) => `${index + 1}. ${item}`).join('\n');
+	}
+	return `你是群管理员举报审核助手。群规如下（编号供引用）：
+${numberedRules}
 
-请判断"被举报消息内容"违反群规的威胁程度,输出一个 0~100 的整数分数(分数越高越危险),并给出简短理由(30 字以内,说明违反了哪条群规或疑似违反什么)。
+判定步骤（严格按顺序）：
+1. 先判断被举报内容是否明确违反任一编号群规；若违反，记住违规类别；
+2. 再判断严重程度：同时违反多条、或涉及 NSFW/诈骗/恶意骚扰/邪教/涉政等严重类别 → 上调一档；
+3. 若无法确定是否违规，选 C，不要选 B；
+4. 若未违反群规或仅轻微无关，选 D；不要因为"可能""疑似"而提高评级；
+5. 被举报用户的昵称/用户名/简介属于被举报内容的一部分，其中出现的广告、诈骗等违规信息同样判违规；但不得依据被举报人的身份/职业等正常信息（如"自由职业""博主"）判定违规，也不得依据举报人身份或历史消息。
 
-打分区间对应评级:
-- 81~100 → A 高危(严重违规,如 NSFW、诈骗、恶意骚扰)
-- 61~80 → B 危险(明显违规,如广告推销、引战)
-- 31~60 → C 可疑(可能违规,如擦边内容、疑似广告)
-- 0~30 → D 未知(基本无害,仅轻微可疑)
+评级标准：
+- A 高危（严重违规）：明确违反群规且性质严重（NSFW、诈骗、恶意骚扰、邪教、涉政）
+- B 危险（明显违规）：明确违反群规但情节一般（广告推销、引战、嘲讽引战）
+- C 可疑（疑似违规）：疑似擦边/疑似广告/语气引战，但证据不足
+- D 无害（未违规）：未违反群规或仅轻微无关
 
-只输出 JSON,不要输出其他任何内容,格式: {"score": <0~100整数>, "reason": "<简短理由>"}`;
+注意：被举报内容可能因长度被截断，请依据可见内容判断；截断导致无法判断时选 C。
+
+只输出 JSON，禁止输出 markdown 代码围栏或任何解释，格式：
+{"level": "A|B|C|D", "score": <0~100整数，越高越危险；区间 A=81~100、B=61~80、C=31~60、D=0~30>, "reason": "<30字以内，说明违反的编号群规；D 写'未违反群规'>"}
+
+示例：
+被举报消息：加微信 xxx 免费领福利，先到先得
+输出：{"level": "B", "score": 66, "reason": "违反群规5：广告推销"}
+被举报消息：哈哈哈哈哈哈哈
+输出：{"level": "D", "score": 6, "reason": "未违反群规"}
+被举报消息：你是傻逼，滚出这个群
+输出：{"level": "A", "score": 88, "reason": "违反群规3/4：恶意攻击引战"}`;
 }
 
 // 容错解析 AI 返回的 JSON(兼容 markdown 代码围栏 / 前后多余文本 / 中文键名)
@@ -2122,8 +2239,10 @@ function extractAiResponseText(result) {
 // 调用 Workers AI 判断威胁评级(单模型)。返回三态:
 // - 成功:{ ok: true, level, label, score, reason, threshold }
 // - AI 有响应但无法识别/拒绝答复:{ ok: false, code: 'unrecognized' }
-//   → 调用方按 🟡B 危险处理(内容可能触发了安全策略拒答)
-// - 基础设施失败(无 AI 绑定 / 超时 / 异常):null → 调用方按 🟢C 可疑中性回退
+//   → 调用方按 🟡B 危险处理(内容可能触发了安全策略拒答;
+//     含 AI 调用抛"内容安全拒绝"类异常——能触发道德围栏本身就是高危信号)
+// - 基础设施失败(无 AI 绑定 / 超时 / 网络 / 限流等,不含内容安全拒绝):null
+//   → 调用方按 🟢C 可疑中性回退
 // 所有诊断日志以 [ad-ai] 前缀输出,Cloudflare Workers Logs 中可按前缀 grep 定位。
 async function assessThreatWithAI(env, content, groupRules) {
 	// 入口诊断:env/AI 绑定状态、消息长度、模型名
@@ -2212,7 +2331,21 @@ async function assessThreatWithAI(env, content, groupRules) {
 	} catch (error) {
 		if (timerId) clearTimeout(timerId);
 		const isTimeout = error && error.message && error.message.includes('AI 调用超时');
-		console.error('[ad-ai] AI.run 抛异常 → 回退 C 可疑。诊断信息:', JSON.stringify({
+		// 内容安全拒绝检测:能触发道德围栏(如 NSFW)本身就是"内容足够劲爆"的强信号,
+		// 模型/API 常因此直接抛 400/403 或安全策略报错 → 与拒答同等对待,按 B 危险处理。
+		// 超时永远不算内容拒绝(超时不携带内容违规信息),即使 message 含其它词也保持 null→C。
+		const SAFETY_PATTERN = /(?:content|safety|policy|filter|moderat|block|inappropriat|disallow|NSFW|400|403)/i;
+		const isSafetyRejection = !isTimeout && Boolean(error?.message) && SAFETY_PATTERN.test(error.message);
+		if (isSafetyRejection) {
+			console.error('[ad-ai] AI.run 疑似触发道德围栏/内容安全拒绝 → 按 B 危险处理。诊断信息:', JSON.stringify({
+				isTimeout,
+				errorName: error?.name,
+				errorMessage: error?.message,
+				errorStackHead: (error?.stack || '').split('\n').slice(0, 4).join(' | ')
+			}));
+			return { ok: false, code: 'unrecognized' };
+		}
+		console.error('[ad-ai] AI.run 抛异常(基础设施失败:超时/网络/限流/未知) → 回退 C 可疑。诊断信息:', JSON.stringify({
 			isTimeout,
 			errorName: error?.name,
 			errorMessage: error?.message,
@@ -2251,7 +2384,7 @@ async function checkAdDuplicate(tgid, env) {
 	};
 }
 
-async function handleAdCommand(message, env) {
+async function handleAdCommand(message, env, preAssessedThreat = null) {
 	const chatId = message.chat.id;
 	const userId = message.from.id;
 
@@ -2350,13 +2483,17 @@ async function handleAdCommand(message, env) {
 
 	// 5. AI 威胁评级:有可判断内容(消息或用户资料)→ 调用 Workers AI 判断;
 	//    完全无可判断内容(纯 tgid 且未取到资料)→ 回退 C 可疑(AD_VOTE_THRESHOLD 票);
-	//    AI 基础设施失败(未绑定/超时/异常)、有响应但无法识别/拒绝答复 → 按 🟡B 危险 4 票
+	//    AI 基础设施失败(未绑定/超时/异常)→ 回退 🟡C 可疑 6 票;有响应但无法识别/拒绝答复 → 按 🟠B 危险 4 票;
+	//    普通用户举报通道(preAssessedThreat 非空)→ 直接采用预评级,不再调用 AI
 	let threatAssessment = null;
-	if (aiContent) {
+	if (!preAssessedThreat && aiContent) {
 		threatAssessment = await assessThreatWithAI(env, aiContent, AD_GROUP_RULES);
 	}
 	let threat;
-	if (threatAssessment?.ok) {
+	if (preAssessedThreat) {
+		// 普通用户举报通道预评级路径:直接采用,不再调用 AI
+		threat = preAssessedThreat;
+	} else if (threatAssessment?.ok) {
 		threat = threatAssessment;
 	} else if (threatAssessment?.code === 'unrecognized') {
 		// AI 拒答或返回无法识别 → 视为 B 危险(内容可能确实违规才触发拒答)
@@ -2368,13 +2505,13 @@ async function handleAdCommand(message, env) {
 			threshold: AD_THREAT_RATINGS.B.votes
 		};
 	} else if (aiContent) {
-		// 有可判断内容但 AI 调用失败(未绑定/超时/异常)→ 保守按 B 危险处理
+		// 有可判断内容但 AI 基础设施失败(未绑定/超时/异常,assessThreatWithAI 返回 null)→ 回退 C 可疑
 		threat = {
-			level: 'B',
-			label: AD_THREAT_RATINGS.B.label,
+			level: 'C',
+			label: AD_THREAT_RATINGS.C.label,
 			score: null,
-			reason: 'AI 调用失败，按 B 危险处理',
-			threshold: AD_THREAT_RATINGS.B.votes
+			reason: 'AI 调用失败，按 C 可疑处理',
+			threshold: AD_THREAT_RATINGS.C.votes
 		};
 	} else {
 		// 完全无可判断内容 → 中性 C 可疑
@@ -2387,14 +2524,16 @@ async function handleAdCommand(message, env) {
 		};
 	}
 
-	// 最终评级决策日志:诊断哪条路径生效(无内容 / AI成功 / AI拒答-unrecognized / AI异常-null)
-	const path = !aiContent
-		? 'fallback-no-content'
-		: threatAssessment?.ok
-			? 'ai-success'
-			: threatAssessment?.code === 'unrecognized'
-				? 'ai-unrecognized→B'
-				: 'ai-null→B';
+	// 最终评级决策日志:诊断哪条路径生效(预评级 / 无内容 / AI成功 / AI拒答-unrecognized / AI异常-null)
+	const path = preAssessedThreat
+		? 'preassessed-user-report'
+		: !aiContent
+			? 'fallback-no-content'
+			: threatAssessment?.ok
+				? 'ai-success'
+				: threatAssessment?.code === 'unrecognized'
+					? 'ai-unrecognized→B'
+					: 'ai-null→C';
 	console.log('[ad-ai] === 最终评级决策 ===', JSON.stringify({
 		path,
 		level: threat.level,
@@ -2666,25 +2805,39 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 		} catch (error) {
 			console.error('[/ad] finalize 写入黑名单失败:', error.message);
 		}
-		// 检查用户群内状态:在群则禁言,不在群则永久封禁
+		// 检查用户群内状态:
+		// - 在群(member/administrator/creator/restricted)→ 禁言;
+		// - 不在群(left/kicked/状态缺失/查询异常/从未入群)→ 永久封禁为主动作。
+		// 注意:用户从未入群时,Telegram 对 getChatMember / banChatMember 都会返回 400
+		// (USER_NOT_PARTICIPANT),此时无法通过 API 封禁,绝不回退到禁言,仅依赖已写入的
+		// 本地黑名单,待其入群时由 handleNewChatMemberBots 入群拦截逻辑处理。
+		let userStatus = null;
 		try {
 			const statusResult = await checkUserStatus(state.targetUserId);
-			const userStatus = statusResult?.result?.status;
-			const inGroup = userStatus === 'member' || userStatus === 'restricted' || userStatus === 'administrator' || userStatus === 'creator';
-			if (inGroup) {
-				await muteChatMember(chatId, state.targetUserId);
-				console.log(`[/ad] 已在群 ${chatId} 内禁言 ${state.targetUserId}`);
-			} else {
-				await banUserPermanently(chatId, state.targetUserId);
-				console.log(`[/ad] 用户 ${state.targetUserId} 不在群内(${userStatus}),已永久封禁`);
-			}
+			userStatus = statusResult?.result?.status || null;
 		} catch (error) {
-			// 状态查询失败→用户大概率不在群,直接永久封禁
-			console.error('[/ad] 查询用户状态失败,执行永久封禁:', error.message);
+			// 状态查询异常(如从未入群返回 400 USER_NOT_PARTICIPANT)→ 视为不在群,走永久封禁分支
+			console.error('[/ad] 查询用户状态失败(视为不在群),执行永久封禁:', error.message);
+		}
+
+		const inGroup = userStatus === 'member' || userStatus === 'restricted' || userStatus === 'administrator' || userStatus === 'creator';
+		if (inGroup) {
+			// 在群(含 restricted 被禁言状态)→ 禁言,不封禁
+			try {
+				await muteChatMember(chatId, state.targetUserId);
+				console.log(`[/ad] 用户 ${state.targetUserId} 在群(${userStatus}),已在群 ${chatId} 内禁言`);
+			} catch (muteError) {
+				console.error('[/ad] finalize 禁言失败:', muteError.message);
+			}
+		} else {
+			// 不在群:永久封禁为主动作
 			try {
 				await banUserPermanently(chatId, state.targetUserId);
+				console.log(`[/ad] 用户 ${state.targetUserId} 不在群内(${userStatus || '状态缺失/查询异常'}),已永久封禁`);
 			} catch (banError) {
-				console.error('[/ad] finalize 永久封禁也失败:', banError.message);
+				// 用户从未入群等场景,banChatMember 同样返回 400:不回退到禁言,
+				// 黑名单已写入,待用户入群时由入群拦截逻辑封禁
+				console.error('[/ad] finalize 永久封禁失败(用户不在群无法通过 API 封禁),已记入本地黑名单,待其入群时由入群拦截逻辑处理:', banError.message);
 			}
 		}
 		// 回复场景:删除被举报的广告消息
