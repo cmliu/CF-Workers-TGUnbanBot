@@ -64,7 +64,8 @@ let blacklistCache = { data: null, fetchedAt: 0 };
 // - 绑定 D1(env.DB)后黑名单/白名单/用户记录优先走数据库;未绑定自动回退旧 KV 逻辑(向下兼容)。
 // - 首个请求惰性建表 + 检测 KV 是否还有未导入数据,有则自动导入一次(幂等,并发安全)。
 // - users 表以 tgid 为唯一标识,记录所有收到消息的用户:资料快照 / 最后对话时间 /
-//   活跃群组 ID 数组 / 黑名单状态与原因时间 / 举报资格(/add_ad_admin) / 消息计数。
+//   活跃群组数组(元素 {id, status},status 三态:健康/禁言/封禁) / 黑名单状态与原因时间 /
+//   举报资格(/add_ad_admin) / 消息计数。
 // - ad_vote:<token> 投票状态仍存 KV:利用 TTL 自动过期,D1 无 TTL 需额外清理逻辑。
 
 // 建表 SQL:幂等 CREATE TABLE IF NOT EXISTS,首次请求执行。
@@ -107,6 +108,115 @@ const DB_BAN_REASON_MAP = {
 	spam: '管理员封禁(/spam)',
 	ban: '管理员封禁(/ban)'
 };
+
+// 用户在群组内的健康状态(active_group_ids 数组元素 status 字段取值):
+// 健康=正常成员(含管理员/群主,可发言), 禁言=被 restrictChatMember 禁发消息,
+// 封禁=被 banChatMember 踢出群组(含被踢后尚未重新加入)。
+const GROUP_MEMBER_STATUS = {
+	HEALTHY: '健康',
+	MUTED: '禁言',
+	BANNED: '封禁'
+};
+
+// 归一化群组状态:仅接受 健康/禁言/封禁,其余一律回退 健康(未知状态按正常处理,不误标)。
+function normalizeGroupStatus(status) {
+	if (status === GROUP_MEMBER_STATUS.MUTED || status === GROUP_MEMBER_STATUS.BANNED) {
+		return status;
+	}
+	return GROUP_MEMBER_STATUS.HEALTHY;
+}
+
+// 解析 active_group_ids 字段(JSON 字符串)→ 规范化数组 [{ id, status }]:
+// - 旧格式(纯字符串数组 ["-1001", ...])→ 元素转 { id, status: '健康' }(历史数据无状态,默认健康);
+// - 新格式({ id, status })→ 校验 status,非法值回退健康;
+// - 非法 JSON / 非数组 / 元素结构异常 → 返回空数组(上层重建,不抛错)。
+function parseActiveGroups(rawStr) {
+	if (!rawStr) return [];
+	let parsed;
+	try {
+		parsed = JSON.parse(rawStr);
+	} catch (error) {
+		return [];
+	}
+	if (!Array.isArray(parsed)) return [];
+	const groups = [];
+	for (const item of parsed) {
+		if (typeof item === 'string') {
+			const id = item.trim();
+			if (id === '') continue;
+			groups.push({ id, status: GROUP_MEMBER_STATUS.HEALTHY });
+		} else if (item && typeof item === 'object' && (typeof item.id === 'string' || typeof item.id === 'number')) {
+			const id = String(item.id);
+			if (id === '') continue;
+			groups.push({ id, status: normalizeGroupStatus(item.status) });
+		}
+	}
+	return groups;
+}
+
+// Telegram getChatMember.status → 群内三态映射:
+// - kicked(被踢出/封禁)→ 封禁;
+// - restricted 且 can_send_messages === false(被禁言)→ 禁言;
+// - 其余(member/left/administrator/creator/restricted 可发言/未知)→ 健康。
+// can_send_messages 为 getChatMember 返回的直挂属性;kicked/left 等状态该字段为 undefined,不误判。
+function mapTgStatusToGroupStatus(status, canSendMessages) {
+	if (status === 'kicked') return GROUP_MEMBER_STATUS.BANNED;
+	if (status === 'restricted' && canSendMessages === false) return GROUP_MEMBER_STATUS.MUTED;
+	return GROUP_MEMBER_STATUS.HEALTHY;
+}
+
+// 标记用户在某群组的状态(写入 active_group_ids 数组元素的 status):
+// - 用户不存在时自动建档(仅写 tgid + active_group_ids + created_at,不触碰其他列);
+// - 非法状态值回退"健康";读不到数组(非法 JSON 等)时按空数组重建;
+// - 成功返回 true,失败返回 false(不抛错,不阻塞上层业务)。
+async function dbSetUserGroupStatus(env, tgid, chatId, status) {
+	if (!hasDb(env)) return false;
+	const tgidStr = String(tgid);
+	const chatIdStr = String(chatId);
+	const normalizedStatus = normalizeGroupStatus(status);
+	const now = Math.floor(Date.now() / 1000);
+	try {
+		let groups = [];
+		try {
+			const row = await env.DB.prepare('SELECT active_group_ids FROM users WHERE tgid = ?').bind(tgidStr).first();
+			if (row?.active_group_ids) {
+				groups = parseActiveGroups(row.active_group_ids);
+			}
+		} catch (readErr) {
+			console.error('[DB] 读取活跃群组失败:', readErr.message);
+		}
+		const existing = groups.find((g) => g.id === chatIdStr);
+		if (existing) {
+			existing.status = normalizedStatus;
+		} else {
+			groups.push({ id: chatIdStr, status: normalizedStatus });
+		}
+		await env.DB.prepare(
+			`INSERT INTO users (tgid, active_group_ids, created_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(tgid) DO UPDATE SET active_group_ids = excluded.active_group_ids`
+		).bind(tgidStr, JSON.stringify(groups), now).run();
+		return true;
+	} catch (error) {
+		console.error('[DB] 标记群组状态失败:', error.message);
+		return false;
+	}
+}
+
+// 读取用户在某群组的状态;用户不存在或未记录该群 → 返回 null(上层区分"未记录"与"健康")。
+async function dbGetUserGroupStatus(env, tgid, chatId) {
+	if (!hasDb(env)) return null;
+	try {
+		const row = await env.DB.prepare('SELECT active_group_ids FROM users WHERE tgid = ?').bind(String(tgid)).first();
+		if (!row?.active_group_ids) return null;
+		const groups = parseActiveGroups(row.active_group_ids);
+		const found = groups.find((g) => g.id === String(chatId));
+		return found ? found.status : null;
+	} catch (error) {
+		console.error('[DB] 读取群组状态失败:', error.message);
+		return null;
+	}
+}
 
 // 实例级 DB 初始化标记:首次请求完成建表+迁移后置 true,避免每请求重复检查
 let dbReady = false;
@@ -315,7 +425,9 @@ async function recordUserActivity(message, env) {
 	const isGroupChat = chat?.type === 'group' || chat?.type === 'supergroup';
 
 	if (isGroupChat && chat?.id !== undefined && chat.id !== null) {
-		// 群聊:先读活跃群组数组,合并当前群 ID(去重)后写回。
+		// 群聊:先读活跃群组数组(元素 {id, status}),合并当前群后写回。
+		// 收到消息说明该用户当前在本群可发言 → 刷新本群状态为"健康"
+		// (曾被禁言/封禁的用户若恢复发言,再次发言时状态自动回正)。
 		// 已知竞态:同一用户并发在多个群发言时,读-改-写可能丢失一个群 ID
 		// (概率极低:单用户消息经 Webhook 串行到达,且群数量有限;如需严格可改规范化子表)。
 		const chatIdStr = String(chat.id);
@@ -323,13 +435,17 @@ async function recordUserActivity(message, env) {
 		try {
 			const row = await env.DB.prepare('SELECT active_group_ids FROM users WHERE tgid = ?').bind(tgid).first();
 			if (row?.active_group_ids) {
-				const parsed = JSON.parse(row.active_group_ids);
-				if (Array.isArray(parsed)) groupIds = parsed;
+				groupIds = parseActiveGroups(row.active_group_ids); // 兼容旧格式与非法 JSON,不抛错
 			}
 		} catch (error) {
 			console.error('[DB] 读取活跃群组失败:', error.message);
 		}
-		if (!groupIds.includes(chatIdStr)) groupIds.push(chatIdStr);
+		const existingGroup = groupIds.find((g) => g.id === chatIdStr);
+		if (existingGroup) {
+			existingGroup.status = GROUP_MEMBER_STATUS.HEALTHY;
+		} else {
+			groupIds.push({ id: chatIdStr, status: GROUP_MEMBER_STATUS.HEALTHY });
+		}
 
 		try {
 			await env.DB.prepare(
@@ -884,6 +1000,17 @@ function getCommandTargetUserId(command, message) {
 	return repliedUserId ? repliedUserId.toString() : '';
 }
 
+// 业务层辅助:成功执行群内操作后,同步标记该用户在 GROUP_ID 群的状态(仅 DB 模式生效)。
+// 传入的 status 必须是 GROUP_MEMBER_STATUS 三态之一;标记失败仅记日志,不阻塞主流程。
+async function markUserGroupStatus(env, userId, status) {
+	if (!isDbReady(env)) return;
+	try {
+		await dbSetUserGroupStatus(env, userId, GROUP_ID, status);
+	} catch (error) {
+		console.error('[DB] 标记群状态失败:', error.message);
+	}
+}
+
 async function getManagedGroupUser(userId) {
 	try {
 		const statusResult = await checkUserStatus(userId);
@@ -894,7 +1021,9 @@ async function getManagedGroupUser(userId) {
 	}
 }
 
-async function restoreUserInManagedGroup(userId) {
+// 恢复用户在 GROUP_ID 群的状态(unban 解封 / restrict 解除禁言)。
+// env:每次成功执行恢复操作后,同步把该用户在本群状态标记为"健康"。
+async function restoreUserInManagedGroup(userId, env) {
 	let status = null;
 	let isMember = null;
 	const actions = [];
@@ -912,6 +1041,7 @@ async function restoreUserInManagedGroup(userId) {
 		try {
 			await unbanUser(userId);
 			actions.push(`已解除群封禁`);
+			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
 		} catch (error) {
 			console.error('群内解除封禁失败:', error);
 			failures.push(`解除封禁失败: ${escapeHtml(error.message)}`);
@@ -922,6 +1052,7 @@ async function restoreUserInManagedGroup(userId) {
 		try {
 			await restrictUser(userId);
 			actions.push(`已恢复发言权限`);
+			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
 		} catch (error) {
 			console.error('群内恢复权限失败:', error);
 			failures.push(`恢复发言权限失败: ${escapeHtml(error.message)}`);
@@ -944,6 +1075,7 @@ async function restoreUserInManagedGroup(userId) {
 		try {
 			await unbanUser(userId);
 			actions.push(`已解除群封禁`);
+			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
 		} catch (error) {
 			console.error('群内解除封禁失败:', error);
 			failures.push(`解除封禁失败: ${escapeHtml(error.message)}`);
@@ -954,6 +1086,7 @@ async function restoreUserInManagedGroup(userId) {
 		try {
 			await restrictUser(userId);
 			actions.push(`已尝试恢复发言权限`);
+			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
 		} catch (error) {
 			console.error('群内恢复权限失败:', error);
 			failures.push(`恢复发言权限失败: ${escapeHtml(error.message)}`);
@@ -1224,6 +1357,8 @@ async function handleNewChatMemberBots(message, env) {
 					logBotModeration('action:ban-blacklisted-new-member:start', logInfo);
 					await banUserPermanently(chat.id, member.id);
 					logBotModeration('action:ban-blacklisted-new-member:success', logInfo);
+					// 入群拦截封禁成功 → 标记该用户在本群状态为"封禁"
+					await markUserGroupStatus(env, member.id, GROUP_MEMBER_STATUS.BANNED);
 				} else {
 					logBotModeration('skip:new-member-not-blacklisted', logInfo);
 				}
@@ -1531,6 +1666,8 @@ async function handleMessage(message, env) {
 			try {
 				await muteChatMember(chatId, targetUserId);
 				responseMessage += `\n✅ 已在群内禁言用户 <a href="tg://user?id=${targetUserId}">${targetUserId}</a>`;
+				// 群内禁言成功 → 标记该用户在本群状态为"禁言"
+				await markUserGroupStatus(env, targetUserId, GROUP_MEMBER_STATUS.MUTED);
 			} catch (error) {
 				console.error('群内禁言失败:', error);
 				if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
@@ -1582,7 +1719,7 @@ async function handleMessage(message, env) {
 			let responseMessage = result.message;
 
 			if (result.success || result.notFound) {
-				const restoreResult = await restoreUserInManagedGroup(targetUserId);
+				const restoreResult = await restoreUserInManagedGroup(targetUserId, env);
 				responseMessage += `\n${restoreResult.message}`;
 			}
 
@@ -1638,17 +1775,20 @@ async function handleMessage(message, env) {
 				// 用户被封禁，需要解封
 				await unbanUser(userId);
 				await sendTelegramMessage(chatId, '✅ 您已被解封，可以重新加入群组。如果仍然无法发言，请联系管理员。');
+				await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
 				//await sendTelegramMessage(GROUP_ID, `${userId} 已通过自助解封`);
 			} else if (userStatus === 'restricted') {
 				// 用户被禁言，需要解除禁言
 				await restrictUser(userId);
 				await sendTelegramMessage(chatId, '✅ 您的禁言已解除，可以正常发言了。');
+				await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
 			} else if (userStatus === 'left' || userStatus === 'member') {
 				// 用户已离开群组或已是成员，检查权限
 				if (userPermissions.can_send_messages === false) {
 					// 用户有发言限制，解除限制
 					await restrictUser(userId);
 					await sendTelegramMessage(chatId, '✅ 您的发言限制已解除，可以正常发言了。');
+					await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
 					//await sendTelegramMessage(GROUP_ID, `${userId} 已通过自助解禁`);
 				} else {
 					// 用户没有明显的限制
@@ -1679,12 +1819,14 @@ async function handleMessage(message, env) {
 				// 首先尝试解除禁言（恢复发言权限）
 				await restrictUser(userId);
 				await sendTelegramMessage(chatId, '✅ 您的禁言已解除，可以正常发言了。如果仍然无法发言，请联系管理员。');
+				await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
 				await sendTelegramMessage(GROUP_ID, `用户 ${userId} 已通过自助解禁`);
 			} catch (restrictError) {
 				console.error('解除禁言失败:', restrictError);
 				try {
 					await unbanUser(userId);
 					await sendTelegramMessage(chatId, '✅ 您已被解封，可以重新加入群组。如果仍然无法发言，请联系管理员。');
+					await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
 					await sendTelegramMessage(GROUP_ID, `用户 ${userId} 已通过自助解禁`);
 				} catch (unbanError) {
 					console.error('解封失败:', unbanError);
@@ -3356,6 +3498,8 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 			try {
 				await muteChatMember(chatId, state.targetUserId);
 				console.log(`[/ad] 用户 ${state.targetUserId} 在群(${userStatus}),已在群 ${chatId} 内禁言`);
+				// 禁言成功 → 标记该用户在本群状态为"禁言"
+				await markUserGroupStatus(env, state.targetUserId, GROUP_MEMBER_STATUS.MUTED);
 			} catch (muteError) {
 				console.error('[/ad] finalize 禁言失败:', muteError.message);
 			}
@@ -3364,6 +3508,8 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 			try {
 				await banUserPermanently(chatId, state.targetUserId);
 				console.log(`[/ad] 用户 ${state.targetUserId} 不在群内(${userStatus || '状态缺失/查询异常'}),已永久封禁`);
+				// 封禁成功 → 标记该用户在本群状态为"封禁"
+				await markUserGroupStatus(env, state.targetUserId, GROUP_MEMBER_STATUS.BANNED);
 			} catch (banError) {
 				// 用户从未入群等场景,banChatMember 同样返回 400:不回退到禁言,
 				// 黑名单已写入,待用户入群时由入群拦截逻辑封禁
