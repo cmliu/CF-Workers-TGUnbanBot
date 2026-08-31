@@ -248,8 +248,20 @@ function formatTimestamp(ts) {
 // 幂等建表 + 旧库列级升级(SQLite ALTER TABLE ADD COLUMN 补齐缺失列):
 // 新库直接按 DB_SCHEMA_SQL 全量建表;已上线的旧库 CREATE TABLE IF NOT EXISTS 不会补列,
 // 这里用 PRAGMA table_info 检查缺失列并逐个补齐,保证旧数据不丢、新字段有默认值。
+//
+// ⚠️ D1 与真 SQLite 的差异(必须忽略此坑的请打住):
+//   - 真 SQLite 的 `connection.exec(sql)` / `db.exec(sql)` 一次执行可以吃多条以 `;` 分隔的 SQL;
+//   - D1 Workers 绑定的 `env.DB.exec(sql)` 严格单语句。多语句传进来会被截到第一条 `;` 处
+//     报 `incomplete input`,QA 在 node:sqlite 测试里能跑过(那是真 SQLite 的 exec 语义)不代表生产环境 OK。
+//   - DB.batch 只能装 DML(prepared statement),不能装 DDL。所以多张表只能用循环 exec。
+//   - 此处把 DB_SCHEMA_SQL 按 `;` 拆开逐条 exec,保持模板字符串可读性,避免破坏既有测试。
 async function ensureDbSchema(env) {
-	await env.DB.exec(DB_SCHEMA_SQL);
+	for (const stmt of DB_SCHEMA_SQL.split(';')) {
+		const sql = stmt.trim();
+		if (sql) {
+			await env.DB.exec(sql);
+		}
+	}
 	const colsRes = await env.DB.prepare('PRAGMA table_info(users)').all();
 	const cols = (colsRes.results || []).map((c) => c.name);
 	const upgradeCols = [
