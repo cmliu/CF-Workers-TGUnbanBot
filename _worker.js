@@ -407,7 +407,7 @@ async function migrateFromKV(env) {
 		// 回滚锁,允许下次重试(已插入部分通过 ON CONFLICT 幂等,重复执行安全)
 		try {
 			await env.DB.prepare('DELETE FROM schema_meta WHERE key = ?').bind(DB_KV_IMPORT_KEY).run();
-		} catch (_) {}
+		} catch (_) { }
 		console.error('[DB] KV → D1 迁移失败:', error.message);
 		return { migrated: false, error: error.message };
 	}
@@ -841,7 +841,7 @@ async function checkBlacklist(userId, env) {
 	try {
 		// 读取黑名单
 		let blacklist = await env.KV.get('blacklist', { type: 'json' });
-		
+
 		// 如果黑名单不存在，初始化为空数组
 		if (!blacklist || !Array.isArray(blacklist)) {
 			blacklist = [];
@@ -883,14 +883,14 @@ async function addToBlacklist(userId, env, source = 'ban', operatorId) {
 	try {
 		// 读取黑名单
 		let blacklist = await env.KV.get('blacklist', { type: 'json' });
-		
+
 		// 如果黑名单不存在，初始化为空数组
 		if (!blacklist || !Array.isArray(blacklist)) {
 			blacklist = [];
 		}
 
 		const userIdStr = userId.toString();
-		
+
 		// 检查是否已在黑名单中
 		if (blacklist.includes(userIdStr) || blacklist.includes(userId)) {
 			return { success: false, alreadyExists: true, message: '⚠️ 该用户已在黑名单中' };
@@ -923,7 +923,7 @@ async function removeFromBlacklist(userId, env, operatorId) {
 	try {
 		// 读取黑名单
 		let blacklist = await env.KV.get('blacklist', { type: 'json' });
-		
+
 		// 如果黑名单不存在，初始化为空数组
 		if (!blacklist || !Array.isArray(blacklist)) {
 			blacklist = [];
@@ -931,7 +931,7 @@ async function removeFromBlacklist(userId, env, operatorId) {
 
 		const userIdStr = userId.toString();
 		const originalLength = blacklist.length;
-		
+
 		// 移除用户ID（同时处理字符串和数字类型）
 		blacklist = blacklist.filter(id => id != userIdStr && id != userId);
 
@@ -1805,7 +1805,7 @@ async function handleMessage(message, env) {
 			if (banlistData.banned) {
 				// 获取机器人用户名
 				const botUsername = await getBotUsername();
-				
+
 				let infoMessage = `⚠️ 注意：您的账号存在封禁黑名单。\n`;
 				infoMessage += `- TGID: <a href="tg://user?id=${banlistData.tgid}">${banlistData.tgid}</a>\n`;
 				if (banlistData.reason) infoMessage += `- 封禁原因: ${banlistData.reason}\n`;
@@ -2423,7 +2423,7 @@ async function getChatInfoFromId(chatId) {
 		if (response.ok && result.result) {
 			const title = result.result.title || result.result.first_name || null;
 			const username = result.result.username;
-			
+
 			// 构建返回对象
 			const info = {
 				title: title
@@ -2818,7 +2818,7 @@ function parseAiThreatJson(text) {
 	try {
 		const obj = JSON.parse(cleaned);
 		if (obj && obj.score !== undefined) return obj;
-	} catch (_) {}
+	} catch (_) { }
 	// 2) 截取首个 { 到最后一个 }
 	const start = cleaned.indexOf('{');
 	const end = cleaned.lastIndexOf('}');
@@ -2826,7 +2826,7 @@ function parseAiThreatJson(text) {
 		try {
 			const obj = JSON.parse(cleaned.slice(start, end + 1));
 			if (obj && obj.score !== undefined) return obj;
-		} catch (_) {}
+		} catch (_) { }
 	}
 	// 3) 正则兜底提取 score 与 reason
 	const scoreMatch = cleaned.match(/(?:score|分数|评分)\D{0,12}?(\d{1,3})/i);
@@ -3267,17 +3267,17 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 	const tail = data.slice(AD_VOTE_BUTTON_PREFIX.length);
 	const parts = tail.split(':');
 	if (parts.length < 2) {
-		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) { }
 		return;
 	}
 	const action = parts[0];
 	const voteToken = parts.slice(1).join(':'); // token 可能含额外冒号,防御性拼接
 	if (action !== 'A' && action !== 'R') {
-		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) { }
 		return;
 	}
 	if (!voteToken || voteToken.length < 2) {
-		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) { }
 		return;
 	}
 
@@ -3294,7 +3294,7 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 	const messageId = state.messageId;
 	if (!messageId || messageId <= 0) {
 		// messageId 尚未回填(极端竞态:点击发生在回填前),静默应答稍后重试
-		try { await answerCallbackQuery(callbackQuery.id); } catch (_) {}
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) { }
 		return;
 	}
 
