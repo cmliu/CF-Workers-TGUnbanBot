@@ -56,6 +56,457 @@ const AD_THREAT_RATINGS = {
 const BLACKLIST_CACHE_TTL_MS = 5000; // 5 秒,写入后跨实例最长延迟
 let blacklistCache = { data: null, fetchedAt: 0 };
 
+// ========================================================
+// D1 数据库层(数据访问 + KV→D1 自动迁移)
+// [DB-LAYER-START] 边界标记,QA 切片依赖,勿改动此行
+// ========================================================
+// 说明:
+// - 绑定 D1(env.DB)后黑名单/白名单/用户记录优先走数据库;未绑定自动回退旧 KV 逻辑(向下兼容)。
+// - 首个请求惰性建表 + 检测 KV 是否还有未导入数据,有则自动导入一次(幂等,并发安全)。
+// - users 表以 tgid 为唯一标识,记录所有收到消息的用户:资料快照 / 最后对话时间 /
+//   活跃群组 ID 数组 / 黑名单状态与原因时间 / 举报资格(/add_ad_admin) / 消息计数。
+// - ad_vote:<token> 投票状态仍存 KV:利用 TTL 自动过期,D1 无 TTL 需额外清理逻辑。
+
+// 建表 SQL:幂等 CREATE TABLE IF NOT EXISTS,首次请求执行。
+const DB_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS users (
+  tgid TEXT PRIMARY KEY,
+  first_name TEXT NOT NULL DEFAULT '',
+  last_name TEXT NOT NULL DEFAULT '',
+  username TEXT NOT NULL DEFAULT '',
+  is_bot INTEGER NOT NULL DEFAULT 0,
+  is_blacklisted INTEGER NOT NULL DEFAULT 0,
+  ban_reason TEXT NOT NULL DEFAULT '',
+  banned_at INTEGER NOT NULL DEFAULT 0,
+  banned_by TEXT NOT NULL DEFAULT '',
+  can_report INTEGER NOT NULL DEFAULT 0,
+  is_gky_blacklisted INTEGER NOT NULL DEFAULT 0,
+  last_active_at INTEGER NOT NULL DEFAULT 0,
+  active_group_ids TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL DEFAULT 0,
+  last_unban_at INTEGER NOT NULL DEFAULT 0,
+  unbanned_by TEXT NOT NULL DEFAULT '',
+  message_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`;
+// schema_meta 中 KV 导入完成标记 key
+const DB_KV_IMPORT_KEY = 'kv_imported_v1';
+// 迁移锁租约:持锁实例崩溃/被回收时,锁超龄后由其他实例清除并重新抢锁,避免迁移永久停滞
+const DB_MIGRATE_LOCK_TTL_SECONDS = 120;
+// 迁移等待上限:未持锁实例轮询等待迁移者完成的最长时间(ms)
+const DB_MIGRATE_WAIT_MS = 2000;
+// KV 导入黑名单时缺失的时间字段默认值:0 表示"未知",避免 NULL 造成数据错误
+const DB_DEFAULT_UNKNOWN_TIME = 0;
+// 黑名单原因映射:source → ban_reason(/ad=举报,/spam 与 /ban=管理员封禁,细分来源便于追溯)
+const DB_BAN_REASON_MAP = {
+	ad: '举报',
+	spam: '管理员封禁(/spam)',
+	ban: '管理员封禁(/ban)'
+};
+
+// 实例级 DB 初始化标记:首次请求完成建表+迁移后置 true,避免每请求重复检查
+let dbReady = false;
+// 用户黑名单实例级内存缓存:短 TTL 降低 D1 读频率(tgid → { isBlacklisted, banReason, bannedAt, fetchedAt })
+const DB_USER_CACHE_TTL_MS = 5000;
+let dbUserCache = new Map();
+
+function hasDb(env) {
+	return Boolean(env?.DB);
+}
+
+// 失效用户缓存:传 tgid 只清单个,不传清全部(封禁/解封/白名单变更后调用)
+function invalidateDbUserCache(tgid) {
+	if (tgid === undefined || tgid === null) {
+		dbUserCache.clear();
+	} else {
+		dbUserCache.delete(String(tgid));
+	}
+}
+
+// 时间戳(epoch 秒)→ 北京时间字符串;0/缺失 → "未知"
+function formatTimestamp(ts) {
+	if (!ts || ts <= 0) return '未知';
+	const d = new Date(ts * 1000 + 8 * 3600 * 1000);
+	const pad = (n) => String(n).padStart(2, '0');
+	return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+// 幂等建表 + 旧库列级升级(SQLite ALTER TABLE ADD COLUMN 补齐缺失列):
+// 新库直接按 DB_SCHEMA_SQL 全量建表;已上线的旧库 CREATE TABLE IF NOT EXISTS 不会补列,
+// 这里用 PRAGMA table_info 检查缺失列并逐个补齐,保证旧数据不丢、新字段有默认值。
+async function ensureDbSchema(env) {
+	await env.DB.exec(DB_SCHEMA_SQL);
+	const colsRes = await env.DB.prepare('PRAGMA table_info(users)').all();
+	const cols = (colsRes.results || []).map((c) => c.name);
+	const upgradeCols = [
+		['is_gky_blacklisted', 'INTEGER NOT NULL DEFAULT 0'],
+		['banned_by', "TEXT NOT NULL DEFAULT ''"],
+		['unbanned_by', "TEXT NOT NULL DEFAULT ''"]
+	];
+	for (const [name, def] of upgradeCols) {
+		if (!cols.includes(name)) {
+			await env.DB.exec(`ALTER TABLE users ADD COLUMN ${name} ${def}`);
+			console.log(`[DB] 升级 users 表: 新增列 ${name}`);
+		}
+	}
+	return true;
+}
+
+// 惰性初始化:建表/升级 + 检查 KV 迁移状态,未完成则执行迁移。
+// 返回是否已就绪;无 D1 绑定返回 false(上层走 KV 回退)。
+async function ensureDbReady(env) {
+	if (dbReady) return true;
+	if (!hasDb(env)) return false;
+	try {
+		await ensureDbSchema(env);
+		const row = await env.DB.prepare('SELECT value FROM schema_meta WHERE key = ?').bind(DB_KV_IMPORT_KEY).first();
+		if (row?.value === 'done') {
+			dbReady = true;
+			return true;
+		}
+		const result = await migrateFromKV(env);
+		if (result.migrated) dbReady = true;
+		return result.migrated;
+	} catch (error) {
+		console.error('[DB] 初始化失败:', error.message);
+		return false;
+	}
+}
+
+// DB 是否已确认就绪:绑定 D1 且本实例完成建表+迁移。
+// 未就绪时上层读写回退 KV,避免迁移窗口期打空表漏放黑名单。
+function isDbReady(env) {
+	return dbReady && hasDb(env);
+}
+
+// KV → D1 一次性数据迁移(幂等):
+// - 抢锁:INSERT OR IGNORE 写入 kv_imported_v1='started:<时间戳>',changes=1 的实例负责导入;
+// - 导入:KV blacklist → is_blacklisted=1(缺失时间填默认 0),KV ad_admin_list → can_report=1;
+// - 完成:标记 'done';失败回滚锁,下次请求重试。
+// - 锁租约:锁携带时间戳,持锁实例崩溃后锁超龄(>120s)由其他实例清除并重新抢锁,防止迁移永久停滞。
+async function migrateFromKV(env) {
+	if (!hasDb(env)) return { migrated: false, error: 'no-db' };
+	try {
+		// 幂等建表 + 旧库列升级(即使 ensureDbReady 已执行过,双保险)
+		await ensureDbSchema(env);
+
+		const lockTs = Math.floor(Date.now() / 1000);
+		const lockRes = await env.DB.prepare(
+			'INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, ?)'
+		).bind(DB_KV_IMPORT_KEY, 'started:' + lockTs).run();
+		const isMigrator = lockRes.meta?.changes === 1;
+
+		if (!isMigrator) {
+			// 其他实例正在迁移/已完成:轮询等待迁移者写 'done'(每次 100ms,最多 DB_MIGRATE_WAIT_MS)
+			const waitedUntil = Date.now() + DB_MIGRATE_WAIT_MS;
+			while (Date.now() < waitedUntil) {
+				const row = await env.DB.prepare('SELECT value FROM schema_meta WHERE key = ?').bind(DB_KV_IMPORT_KEY).first();
+				if (row?.value === 'done') return { migrated: true, imported: true };
+				if (row?.value && String(row.value).startsWith('started:')) {
+					const startedTs = Number(String(row.value).slice('started:'.length));
+					if (Number.isFinite(startedTs) && Date.now() / 1000 - startedTs > DB_MIGRATE_LOCK_TTL_SECONDS) {
+						// 陈旧锁:持锁实例崩溃/被回收,清除后重新抢锁(递归一次)
+						await env.DB.prepare('DELETE FROM schema_meta WHERE key = ?').bind(DB_KV_IMPORT_KEY).run();
+						return await migrateFromKV(env);
+					}
+				}
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+			// 等待超时(迁移者仍在进行或锁未超龄):返回未就绪,
+			// ensureDbReady 不会置 dbReady,本请求读写回退 KV,下次请求继续尝试
+			return { migrated: false, error: 'migration-wait-timeout' };
+		}
+
+		// 读 KV 旧数据;KV 未绑定则视为无旧数据直接跳过。
+		// 区分两类错误:KV 基础设施故障(网络/配额)→ 抛错回滚锁,下次请求重试;
+		//               脏数据(值不是合法 JSON / 非数组)→ 跳过并警告,不中断迁移(否则坏数据会永久阻塞迁移)。
+		let blacklist = [];
+		if (env.KV) {
+			try {
+				const rawStr = await env.KV.get('blacklist');
+				if (rawStr !== null) {
+					try {
+						const parsed = JSON.parse(rawStr);
+						if (Array.isArray(parsed)) blacklist = parsed;
+						else console.error('[DB] KV blacklist 非数组,跳过(需人工检查 KV): typeof=' + typeof parsed);
+					} catch (jsonErr) {
+						console.error('[DB] KV blacklist 不是合法 JSON,跳过(需人工检查 KV):', jsonErr.message);
+					}
+				}
+			} catch (error) {
+				throw new Error('读取 KV blacklist 失败: ' + error.message);
+			}
+		}
+		let adAdminList = [];
+		if (env.KV) {
+			try {
+				const rawStr = await env.KV.get('ad_admin_list');
+				if (rawStr !== null) {
+					try {
+						const parsed = JSON.parse(rawStr);
+						if (Array.isArray(parsed)) adAdminList = parsed;
+						else console.error('[DB] KV ad_admin_list 非数组,跳过(需人工检查 KV): typeof=' + typeof parsed);
+					} catch (jsonErr) {
+						console.error('[DB] KV ad_admin_list 不是合法 JSON,跳过(需人工检查 KV):', jsonErr.message);
+					}
+				}
+			} catch (error) {
+				throw new Error('读取 KV ad_admin_list 失败: ' + error.message);
+			}
+		}
+
+		const now = Math.floor(Date.now() / 1000);
+		// 过滤无效元素:仅保留 number/string 标量,对象/数组/布尔/null 等一律跳过
+		// (否则对象会被 String() 化成 '[object Object]' 作为 tgid 入库产生脏行)
+		const isScalarTgid = (t) => (typeof t === 'number' || typeof t === 'string') && String(t) !== '';
+		const validBlacklist = blacklist.filter(isScalarTgid);
+		const validAdAdminList = adAdminList.filter(isScalarTgid);
+		const stmts = [];
+		for (const tgid of validBlacklist) {
+			stmts.push(env.DB.prepare(
+				`INSERT INTO users (tgid, is_blacklisted, ban_reason, banned_at, created_at)
+				 VALUES (?, 1, ?, ?, ?)
+				 ON CONFLICT(tgid) DO UPDATE SET
+				   is_blacklisted = 1,
+				   ban_reason = excluded.ban_reason,
+				   banned_at = excluded.banned_at`
+			).bind(String(tgid), DB_BAN_REASON_MAP.ban, DB_DEFAULT_UNKNOWN_TIME, now));
+		}
+		for (const tgid of validAdAdminList) {
+			stmts.push(env.DB.prepare(
+				`INSERT INTO users (tgid, can_report, created_at)
+				 VALUES (?, 1, ?)
+				 ON CONFLICT(tgid) DO UPDATE SET can_report = 1`
+			).bind(String(tgid), now));
+		}
+		if (stmts.length > 0) {
+			// 分批写入,避免单请求 batch 过大超限
+			for (let i = 0; i < stmts.length; i += 100) {
+				await env.DB.batch(stmts.slice(i, i + 100));
+			}
+		}
+
+		await env.DB.prepare("UPDATE schema_meta SET value = 'done' WHERE key = ?").bind(DB_KV_IMPORT_KEY).run();
+		console.log(`[DB] KV → D1 迁移完成: blacklist=${validBlacklist.length}, ad_admin_list=${validAdAdminList.length}`);
+		return { migrated: true, importedBlacklist: validBlacklist.length, importedAdAdmins: validAdAdminList.length };
+	} catch (error) {
+		// 回滚锁,允许下次重试(已插入部分通过 ON CONFLICT 幂等,重复执行安全)
+		try {
+			await env.DB.prepare('DELETE FROM schema_meta WHERE key = ?').bind(DB_KV_IMPORT_KEY).run();
+		} catch (_) {}
+		console.error('[DB] KV → D1 迁移失败:', error.message);
+		return { migrated: false, error: error.message };
+	}
+}
+
+// 记录用户活动:tgid 唯一标识,每次收到消息时更新资料快照 / 最后对话时间 / 活跃群组 / 消息计数。
+// 群聊(chat.type 为 group/supergroup)才把 chat.id 并入活跃群组数组;私聊只更新档案与时间。
+async function recordUserActivity(message, env) {
+	if (!isDbReady(env)) return;
+	const from = message?.from;
+	if (!from || from.id === undefined || from.id === null) return;
+	const chat = message?.chat;
+	const tgid = String(from.id);
+	const now = Math.floor(Date.now() / 1000);
+	const isGroupChat = chat?.type === 'group' || chat?.type === 'supergroup';
+
+	if (isGroupChat && chat?.id !== undefined && chat.id !== null) {
+		// 群聊:先读活跃群组数组,合并当前群 ID(去重)后写回。
+		// 已知竞态:同一用户并发在多个群发言时,读-改-写可能丢失一个群 ID
+		// (概率极低:单用户消息经 Webhook 串行到达,且群数量有限;如需严格可改规范化子表)。
+		const chatIdStr = String(chat.id);
+		let groupIds = [];
+		try {
+			const row = await env.DB.prepare('SELECT active_group_ids FROM users WHERE tgid = ?').bind(tgid).first();
+			if (row?.active_group_ids) {
+				const parsed = JSON.parse(row.active_group_ids);
+				if (Array.isArray(parsed)) groupIds = parsed;
+			}
+		} catch (error) {
+			console.error('[DB] 读取活跃群组失败:', error.message);
+		}
+		if (!groupIds.includes(chatIdStr)) groupIds.push(chatIdStr);
+
+		try {
+			await env.DB.prepare(
+				`INSERT INTO users (tgid, first_name, last_name, username, is_bot, last_active_at, active_group_ids, created_at, message_count)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+				 ON CONFLICT(tgid) DO UPDATE SET
+				   first_name = excluded.first_name,
+				   last_name = excluded.last_name,
+				   username = excluded.username,
+				   is_bot = excluded.is_bot,
+				   last_active_at = excluded.last_active_at,
+				   active_group_ids = excluded.active_group_ids,
+				   message_count = message_count + 1`
+			).bind(tgid, from.first_name || '', from.last_name || '', from.username || '', from.is_bot ? 1 : 0, now, JSON.stringify(groupIds), now).run();
+		} catch (error) {
+			console.error('[DB] 记录用户活动失败(群聊):', error.message);
+		}
+	} else {
+		// 私聊/其他:仅更新档案与时间,不触碰 active_group_ids(避免覆盖既有群记录)
+		try {
+			await env.DB.prepare(
+				`INSERT INTO users (tgid, first_name, last_name, username, is_bot, last_active_at, created_at, message_count)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+				 ON CONFLICT(tgid) DO UPDATE SET
+				   first_name = excluded.first_name,
+				   last_name = excluded.last_name,
+				   username = excluded.username,
+				   is_bot = excluded.is_bot,
+				   last_active_at = excluded.last_active_at,
+				   message_count = message_count + 1`
+			).bind(tgid, from.first_name || '', from.last_name || '', from.username || '', from.is_bot ? 1 : 0, now, now).run();
+		} catch (error) {
+			console.error('[DB] 记录用户活动失败(私聊):', error.message);
+		}
+	}
+}
+
+// D1 版黑名单查询(带 5s 实例级缓存);无 D1 绑定直接返回未命中(上层 hasDb 已分流,此处为防御)
+async function dbCheckBlacklist(env, userId) {
+	if (!hasDb(env)) return { isBlacklisted: false, message: null };
+	const tgid = String(userId);
+	const now = Date.now();
+	const cached = dbUserCache.get(tgid);
+	if (cached && (now - cached.fetchedAt) < DB_USER_CACHE_TTL_MS) {
+		return cached.isBlacklisted
+			? { isBlacklisted: true, message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。', banReason: cached.banReason, bannedAt: cached.bannedAt }
+			: { isBlacklisted: false, message: null };
+	}
+	try {
+		const row = await env.DB.prepare('SELECT is_blacklisted, ban_reason, banned_at FROM users WHERE tgid = ?').bind(tgid).first();
+		const isBlacklisted = Boolean(row?.is_blacklisted);
+		const banReason = row?.ban_reason || '';
+		const bannedAt = row?.banned_at || 0;
+		dbUserCache.set(tgid, { isBlacklisted, banReason, bannedAt, fetchedAt: now });
+		return isBlacklisted
+			? { isBlacklisted: true, message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。', banReason, bannedAt }
+			: { isBlacklisted: false, message: null };
+	} catch (error) {
+		console.error('检查黑名单时出错:', error);
+		return { isBlacklisted: false, message: null };
+	}
+}
+
+// D1 版添加黑名单:source ∈ ad/spam/ban,映射 ban_reason 并记录封禁时间与处理人 tgid
+// operatorId: 处理人 tgid(溯源)——/ad 传举报发起人, /spam、/ban 传操作管理员
+async function dbAddToBlacklist(env, userId, source, operatorId) {
+	if (!hasDb(env)) return { success: false, message: '❌ 未绑定D1数据库' };
+	const tgid = String(userId);
+	const operator = operatorId === undefined || operatorId === null ? '' : String(operatorId);
+	const now = Math.floor(Date.now() / 1000);
+	const banReason = DB_BAN_REASON_MAP[source] || DB_BAN_REASON_MAP.ban;
+	try {
+		const existing = await env.DB.prepare('SELECT is_blacklisted FROM users WHERE tgid = ?').bind(tgid).first();
+		if (existing?.is_blacklisted) {
+			return { success: false, alreadyExists: true, message: '⚠️ 该用户已在黑名单中' };
+		}
+		await env.DB.prepare(
+			`INSERT INTO users (tgid, is_blacklisted, ban_reason, banned_at, banned_by, created_at)
+			 VALUES (?, 1, ?, ?, ?, ?)
+			 ON CONFLICT(tgid) DO UPDATE SET
+			   is_blacklisted = 1,
+			   ban_reason = excluded.ban_reason,
+			   banned_at = excluded.banned_at,
+			   banned_by = excluded.banned_by`
+		).bind(tgid, banReason, now, operator, now).run();
+		invalidateDbUserCache(tgid);
+		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单` };
+	} catch (error) {
+		console.error('添加黑名单时出错:', error);
+		return { success: false, message: '❌ 添加黑名单失败: ' + error.message };
+	}
+}
+
+// D1 版移除黑名单:清除标记/原因/时间,记录解封时间与处理人 tgid(溯源)
+// operatorId: 处理人 tgid——/unban 传操作管理员;自助解封传用户本人
+async function dbRemoveFromBlacklist(env, userId, operatorId) {
+	if (!hasDb(env)) return { success: false, message: '❌ 未绑定D1数据库' };
+	const tgid = String(userId);
+	const operator = operatorId === undefined || operatorId === null ? '' : String(operatorId);
+	try {
+		const row = await env.DB.prepare('SELECT is_blacklisted FROM users WHERE tgid = ?').bind(tgid).first();
+		if (!row?.is_blacklisted) {
+			return { success: false, notFound: true, message: '⚠️ 该用户不在黑名单中' };
+		}
+		await env.DB.prepare(
+			'UPDATE users SET is_blacklisted = 0, ban_reason = ?, banned_at = ?, last_unban_at = ?, unbanned_by = ? WHERE tgid = ?'
+		).bind('', DB_DEFAULT_UNKNOWN_TIME, Math.floor(Date.now() / 1000), operator, tgid).run();
+		invalidateDbUserCache(tgid);
+		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 从黑名单中移除` };
+	} catch (error) {
+		console.error('移除黑名单时出错:', error);
+		return { success: false, message: '❌ 移除黑名单失败: ' + error.message };
+	}
+}
+
+// D1 版同步 GKY 黑名单状态(/check 查到 GKY 封禁记录时调用,后期可直接按此字段筛选)
+async function dbSetGkyBlacklistStatus(env, userId, isGkyBanned) {
+	if (!hasDb(env)) return;
+	try {
+		await env.DB.prepare(
+			`INSERT INTO users (tgid, is_gky_blacklisted, created_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(tgid) DO UPDATE SET is_gky_blacklisted = excluded.is_gky_blacklisted`
+		).bind(String(userId), isGkyBanned ? 1 : 0, Math.floor(Date.now() / 1000)).run();
+	} catch (error) {
+		console.error('[DB] 更新 GKY 黑名单状态失败:', error.message);
+	}
+}
+
+// D1 版读取 /add_ad_admin 白名单(tgid 数组,兼容旧调用方)
+async function dbGetAdAdminList(env) {
+	if (!hasDb(env)) return [];
+	try {
+		const res = await env.DB.prepare('SELECT tgid FROM users WHERE can_report = 1').all();
+		return (res.results || []).map((r) => r.tgid);
+	} catch (error) {
+		console.error('[/ad] 读取 ad_admin_list 失败:', error.message);
+		return [];
+	}
+}
+
+// D1 版整体保存 /add_ad_admin 白名单:先全量清零,再逐个置位(list 为权威)
+async function dbSaveAdAdminList(env, list) {
+	if (!hasDb(env)) return false;
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		const stmts = [env.DB.prepare('UPDATE users SET can_report = 0 WHERE can_report = 1')];
+		for (const tgid of list) {
+			if (tgid === undefined || tgid === null || String(tgid) === '') continue;
+			stmts.push(env.DB.prepare(
+				`INSERT INTO users (tgid, can_report, created_at)
+				 VALUES (?, 1, ?)
+				 ON CONFLICT(tgid) DO UPDATE SET can_report = 1`
+			).bind(String(tgid), now));
+		}
+		await env.DB.batch(stmts);
+		invalidateDbUserCache();
+		return true;
+	} catch (error) {
+		console.error('[/ad] 保存 ad_admin_list 失败:', error.message);
+		return false;
+	}
+}
+
+// D1 版举报资格判断(/add_ad_admin 白名单)
+async function dbIsAdAllowlisted(env, userId) {
+	if (!hasDb(env)) return false;
+	try {
+		const row = await env.DB.prepare('SELECT can_report FROM users WHERE tgid = ?').bind(String(userId)).first();
+		return Boolean(row?.can_report);
+	} catch (error) {
+		console.error('[/ad] 判断举报资格失败:', error.message);
+		return false;
+	}
+}
+// [DB-LAYER-END]
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
@@ -77,6 +528,9 @@ export default {
 				error: error.message
 			}, 500);
 		}
+
+		// 数据库模式:首个请求惰性建表 + 执行 KV→D1 自动迁移(幂等;无 D1 绑定跳过,自动回退 KV)
+		await ensureDbReady(env);
 
 		if (url.pathname === "/banlist" && url.searchParams.has('tgid') && url.searchParams.get('tgid') != '') {
 			const tgid = url.searchParams.get('tgid');
@@ -101,6 +555,8 @@ export default {
 
 				// 处理消息
 				if (update.message) {
+					// 数据库版:对所有收到消息的 tgid 记录活动(资料快照/最后对话时间/活跃群组/消息计数)
+					await recordUserActivity(update.message, env);
 					await handleMessage(update.message, env);
 				} else if (update.callback_query) {
 					await handleAdCallbackQuery(update.callback_query, env);
@@ -243,6 +699,11 @@ function invalidateBlacklistCache() {
 
 // 检查用户是否在黑名单中
 async function checkBlacklist(userId, env) {
+	// D1 优先:绑定数据库后走 DB 层(含 5s 实例级缓存);未绑定则回退 KV
+	if (isDbReady(env)) {
+		return await dbCheckBlacklist(env, userId);
+	}
+
 	// 检查是否绑定了 KV 空间
 	if (!env.KV) {
 		return { isBlacklisted: false, message: null };
@@ -291,7 +752,14 @@ async function checkBlacklist(userId, env) {
 }
 
 // 添加用户到黑名单
-async function addToBlacklist(userId, env) {
+// source: 封禁来源,用于记录黑名单原因 → 'ad'=举报投票通过 / 'spam'=管理员 /spam / 'ban'=管理员 /ban
+// operatorId: 处理人 tgid(溯源),/ad 传举报发起人,/spam、/ban 传操作管理员
+async function addToBlacklist(userId, env, source = 'ban', operatorId) {
+	// D1 优先:绑定数据库后走 DB 层;未绑定则回退 KV
+	if (isDbReady(env)) {
+		return await dbAddToBlacklist(env, userId, source, operatorId);
+	}
+
 	if (!env.KV) {
 		return { success: false, message: '❌ 未绑定KV存储空间' };
 	}
@@ -325,7 +793,13 @@ async function addToBlacklist(userId, env) {
 }
 
 // 从黑名单中移除用户
-async function removeFromBlacklist(userId, env) {
+// operatorId: 处理人 tgid(溯源),/unban 传操作管理员;自助解封传用户本人
+async function removeFromBlacklist(userId, env, operatorId) {
+	// D1 优先:绑定数据库后走 DB 层;未绑定则回退 KV
+	if (isDbReady(env)) {
+		return await dbRemoveFromBlacklist(env, userId, operatorId);
+	}
+
 	if (!env.KV) {
 		return { success: false, message: '❌ 未绑定KV存储空间' };
 	}
@@ -537,11 +1011,24 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		banlistData = { success: false, banned: false, error: error.message };
 	}
 
-	// 2. 查询本地 KV
+	// 1.5 同步 GKY 黑名单状态到数据库(后期备用:可按 is_gky_blacklisted 筛选全量清单);
+	//     仅查询成功且 DB 已就绪时更新,查询失败不覆盖原状态
+	if (isDbReady(options.env) && banlistData.success) {
+		await dbSetGkyBlacklistStatus(options.env, tgidToCheck, Boolean(banlistData.banned));
+	}
+
+	// 2. 查询本地黑名单(数据库版可返回封禁原因/时间,供下方展示)
 	let isLocalBlacklisted = false;
+	let localBlacklistInfo = null;
 	if (options.env) {
 		const blacklistCheck = await checkBlacklist(tgidToCheck, options.env);
 		isLocalBlacklisted = blacklistCheck.isBlacklisted;
+		if (blacklistCheck.banReason || blacklistCheck.bannedAt) {
+			localBlacklistInfo = {
+				banReason: blacklistCheck.banReason,
+				bannedAt: blacklistCheck.bannedAt
+			};
+		}
 	}
 
 	const isBannedAnywhere = (banlistData.success && banlistData.banned) || isLocalBlacklisted;
@@ -569,15 +1056,21 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		responseMessage += `🌐 <b>GKYbot 库:</b> ⚠️ 查询失败 (${escapeHtml(banlistData.error || '未知错误')})\n`;
 	}
 
-	// 本地 KV 状态
+	// 本地黑名单状态(数据库版可附带封禁原因与时间;KV 版仅 ID 数组,无原因字段)
 	if (options.env) {
 		if (isLocalBlacklisted) {
 			responseMessage += `💾 <b>本地黑名单:</b> 🚫 <b>已封禁</b>\n`;
+			if (localBlacklistInfo?.banReason) {
+				responseMessage += `     ⚠️ 原因: ${escapeHtml(localBlacklistInfo.banReason)}\n`;
+			}
+			if (localBlacklistInfo?.bannedAt) {
+				responseMessage += `     📅 时间: ${escapeHtml(formatTimestamp(localBlacklistInfo.bannedAt))}\n`;
+			}
 		} else {
 			responseMessage += `💾 <b>本地黑名单:</b> ✅ 正常\n`;
 		}
 	} else {
-		responseMessage += `💾 <b>本地黑名单:</b> ⚠️ 未检查 (未配置KV空间)\n`;
+		responseMessage += `💾 <b>本地黑名单:</b> ⚠️ 未检查 (未配置KV/D1存储)\n`;
 	}
 
 	// 3. 输出 GKYbot 详细封禁信息
@@ -831,7 +1324,7 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-		const result = await addToBlacklist(repliedUserId, env);
+		const result = await addToBlacklist(repliedUserId, env, 'spam', message.from.id);
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success) {
@@ -1031,7 +1524,7 @@ async function handleMessage(message, env) {
 		}
 
 		// 添加到黑名单
-		const result = await addToBlacklist(targetUserId, env);
+		const result = await addToBlacklist(targetUserId, env, 'ban', message.from.id);
 		let responseMessage = result.message;
 
 		if (isManagedGroupMessage(message) && (result.success || result.alreadyExists)) {
@@ -1085,7 +1578,7 @@ async function handleMessage(message, env) {
 			}
 
 			// 从黑名单移除
-			const result = await removeFromBlacklist(targetUserId, env);
+			const result = await removeFromBlacklist(targetUserId, env, message.from.id);
 			let responseMessage = result.message;
 
 			if (result.success || result.notFound) {
@@ -1958,6 +2451,11 @@ async function saveAdVoteState(env, state) {
 // ---- /add_ad_admin /del_ad_admin 热心群友白名单 ----
 
 async function getAdAdminList(env) {
+	// D1 优先:绑定数据库后走 DB 层(can_report 字段);未绑定则回退 KV
+	if (isDbReady(env)) {
+		return await dbGetAdAdminList(env);
+	}
+
 	if (!env.KV) return [];
 	try {
 		const list = await env.KV.get('ad_admin_list', { type: 'json' });
@@ -1969,6 +2467,11 @@ async function getAdAdminList(env) {
 }
 
 async function saveAdAdminList(env, list) {
+	// D1 优先:绑定数据库后走 DB 层;未绑定则回退 KV
+	if (isDbReady(env)) {
+		return await dbSaveAdAdminList(env, list);
+	}
+
 	if (!env.KV) return false;
 	try {
 		await env.KV.put('ad_admin_list', JSON.stringify(list));
@@ -1980,6 +2483,11 @@ async function saveAdAdminList(env, list) {
 }
 
 async function isAdAllowlisted(env, userId) {
+	// D1 优先:单行查询 can_report(免整表扫描);未绑定则回退 KV 数组
+	if (isDbReady(env)) {
+		return await dbIsAdAllowlisted(env, userId);
+	}
+
 	const list = await getAdAdminList(env);
 	return list.some((id) => String(id) === String(userId));
 }
@@ -2822,7 +3330,7 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 
 	if (result === 'approved') {
 		try {
-			await addToBlacklist(state.targetUserId, env);
+			await addToBlacklist(state.targetUserId, env, 'ad', state.creatorUserId);
 			console.log(`[/ad] 已将用户 ${state.targetUserId} 加入黑名单`);
 		} catch (error) {
 			console.error('[/ad] finalize 写入黑名单失败:', error.message);
