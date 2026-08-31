@@ -250,17 +250,27 @@ function formatTimestamp(ts) {
 // 这里用 PRAGMA table_info 检查缺失列并逐个补齐,保证旧数据不丢、新字段有默认值。
 //
 // ⚠️ D1 与真 SQLite 的差异(必须忽略此坑的请打住):
-//   - 真 SQLite 的 `connection.exec(sql)` / `db.exec(sql)` 一次执行可以吃多条以 `;` 分隔的 SQL;
-//   - D1 Workers 绑定的 `env.DB.exec(sql)` 严格单语句。多语句传进来会被截到第一条 `;` 处
-//     报 `incomplete input`,QA 在 node:sqlite 测试里能跑过(那是真 SQLite 的 exec 语义)不代表生产环境 OK。
+//   - 真 SQLite 的 `connection.exec(sql)` / `db.exec(sql)` 接受任意换行/多语句,一次可吃多条以 `;` 分隔的 SQL;
+//   - D1 Workers 绑定的 `env.DB.exec(sql)` 按 `\n` 分隔多条查询,每条查询必须在一行内完成
+//     (官方文档原话:"The input can be one or multiple queries separated by `\n`.")。
+//     多行排版 SQL(如建表语句)首行未写完就会报 `incomplete input`;QA 在 node:sqlite 测试里
+//     能跑过(那是真 SQLite 的 exec 语义)不代表生产环境 OK。
 //   - DB.batch 只能装 DML(prepared statement),不能装 DDL。所以多张表只能用循环 exec。
-//   - 此处把 DB_SCHEMA_SQL 按 `;` 拆开逐条 exec,保持模板字符串可读性,避免破坏既有测试。
+//   - 此处把 DB_SCHEMA_SQL 按 `;` 拆开,每条语句压成单行并以 `;` 结尾,再逐条 exec
+//     (模板字符串保持可读排版,运行时由 flattenSqlStatements 压平),保证传给 D1 的每条 SQL
+//     都是一行完整语句。
+// 把多行 SQL 模板压成"单行完整语句"列表:按 `;` 拆分,折叠换行/缩进/多余空白为单个空格,
+// 跳过空段并补回结尾分号(D1 exec 需要)。只折叠空白,不改动单引号字符串字面量(DEFAULT '[]' 等)。
+function flattenSqlStatements(multiSql) {
+	return multiSql
+		.split(';')
+		.map((stmt) => stmt.replace(/\s+/g, ' ').trim())
+		.filter((stmt) => stmt.length > 0)
+		.map((stmt) => stmt + ';');
+}
 async function ensureDbSchema(env) {
-	for (const stmt of DB_SCHEMA_SQL.split(';')) {
-		const sql = stmt.trim();
-		if (sql) {
-			await env.DB.exec(sql);
-		}
+	for (const sql of flattenSqlStatements(DB_SCHEMA_SQL)) {
+		await env.DB.exec(sql);
 	}
 	const colsRes = await env.DB.prepare('PRAGMA table_info(users)').all();
 	const cols = (colsRes.results || []).map((c) => c.name);
@@ -271,7 +281,7 @@ async function ensureDbSchema(env) {
 	];
 	for (const [name, def] of upgradeCols) {
 		if (!cols.includes(name)) {
-			await env.DB.exec(`ALTER TABLE users ADD COLUMN ${name} ${def}`);
+			await env.DB.exec(`ALTER TABLE users ADD COLUMN ${name} ${def};`);
 			console.log(`[DB] 升级 users 表: 新增列 ${name}`);
 		}
 	}
