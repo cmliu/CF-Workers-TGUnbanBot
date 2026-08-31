@@ -2022,6 +2022,7 @@ function buildAdTargetText(state, mask) {
 function buildAdVoteMessageText(state) {
 	const isApproved = state.result === 'approved';
 	const isRejected = state.result === 'rejected';
+	const isCancelled = state.result === 'cancelled';
 
 	const approverCount = state.approvers.length;
 	const rejecterCount = state.rejecters.length;
@@ -2036,6 +2037,8 @@ function buildAdVoteMessageText(state) {
 			resultLine = '💀 <b>举报通过</b>\n';
 		} else if (isRejected) {
 			resultLine = '❎ <b>已被否决</b>\n';
+		} else if (isCancelled) {
+			resultLine = '🗑️ <b>发起人已放弃举报</b>\n';
 		}
 	}
 
@@ -2059,6 +2062,8 @@ function buildAdVoteMessageText(state) {
 		actionLine = `\n✅ <b>已封禁:</b> ${targetText}\n`;
 	} else if (state.finalized && isRejected) {
 		actionLine = `\n❎ <i>举报未通过，未处理</i>\n`;
+	} else if (state.finalized && isCancelled) {
+		actionLine = `\n🚫 <i>发起人放弃举报，未处理</i>\n`;
 	}
 
 	// 威胁评级与生效阈值(兼容旧 KV 状态:无评级字段时按 C 可疑 / 存储阈值兜底)
@@ -2719,6 +2724,23 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 	}
 	// 其余状态(member / administrator / creator)以及"受限但能发消息"的 restricted 允许投票
 
+	// 发起人放弃举报:发起人自己点"反对"视为放弃举报,立即关闭投票
+	// (即使发起人同时是管理员也优先走放弃语义,因为该分支位于管理员否决之前)
+	if (action === 'R' && voterId.toString() === state.creatorUserId.toString()) {
+		// 把发起人从赞成/反对名单中都移除:放弃后其默认的 1 票赞成不再显示/计数
+		state.approvers = state.approvers.filter((v) => v.id.toString() !== voterId.toString());
+		state.rejecters = state.rejecters.filter((v) => v.id.toString() !== voterId.toString());
+		state.withdrawnBy = snapshotTelegramUser(callbackQuery.from);
+		console.log(`[/ad] 发起人 ${voterId} 放弃举报,投票关闭`);
+		await finalizeAdVote(env, state, chatId, messageId, 'cancelled');
+		try {
+			await answerCallbackQuery(callbackQuery.id, '你已放弃举报，投票已关闭');
+		} catch (error) {
+			console.error('[/ad] answerCallbackQuery (发起人放弃) 失败:', error.message);
+		}
+		return;
+	}
+
 	// 群管理员一票否决:管理员点"赞成"或"反对"立即结束
 	const voterIsAdmin = await checkIfUserIsAdmin(voterId);
 	if (voterIsAdmin) {
@@ -2849,6 +2871,6 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 			}
 		}
 	} else {
-		console.log(`[/ad] 投票 ${messageId} 被否决,目标用户 ${state.targetUserId} 不处理`);
+		console.log(`[/ad] 投票 ${messageId} 已结束(result=${result}),目标用户 ${state.targetUserId} 不处理`);
 	}
 }
