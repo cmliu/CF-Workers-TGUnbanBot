@@ -490,6 +490,10 @@ async function recordUserActivity(message, env) {
 		// (管理员豁免:即使 DB 中残留禁言/封禁标记,发言时也回正为"管理员")
 		const isAdmin = await isGroupAdmin(tgid);
 		const refreshedStatus = isAdmin ? GROUP_MEMBER_STATUS.ADMIN : GROUP_MEMBER_STATUS.HEALTHY;
+		// 管理员发言 → 顺手修复黑名单数据层(历史遗留的 is_blacklisted=1 管理员行清为 0)
+		if (isAdmin) {
+			await dbClearBlacklistStatus(env, tgid);
+		}
 		if (existingGroup) {
 			existingGroup.status = refreshedStatus;
 		} else {
@@ -532,9 +536,33 @@ async function recordUserActivity(message, env) {
 	}
 }
 
+// 管理员黑名单数据修复:将 is_blacklisted 清 0(保留 ban_reason/banned_at/banned_by 作审计痕迹)。
+// 识别到 GROUP_ID 群管理员时调用,保证数据层与查询层一致(管理员 is_blacklisted 恒为 0,
+// D1 控制台/任何直接读库的路径看到的都是 0,而非仅查询层豁免)。
+// 与 /unban 不同:不写 last_unban_at/unbanned_by(这是系统自动豁免,不是管理员的解封动作)。
+// 返回 true 表示实际清除了脏数据,false 表示无需处理(本就为 0 或用户不存在或失败)。
+async function dbClearBlacklistStatus(env, tgid) {
+	if (!hasDb(env)) return false;
+	try {
+		const info = await env.DB.prepare(
+			'UPDATE users SET is_blacklisted = 0 WHERE tgid = ? AND is_blacklisted = 1'
+		).bind(String(tgid)).run();
+		const cleared = Boolean(info?.meta?.changes);
+		if (cleared) {
+			console.log(`[DB] 管理员黑名单数据修复: tgid=${tgid} is_blacklisted 已清为 0`);
+			invalidateDbUserCache(String(tgid));
+		}
+		return cleared;
+	} catch (error) {
+		console.error('[DB] 管理员黑名单数据修复失败:', error.message);
+		return false;
+	}
+}
+
 // D1 版黑名单查询(带 5s 实例级缓存);无 D1 绑定直接返回未命中(上层 hasDb 已分流,此处为防御)
 // 管理员豁免:即使 DB 中 is_blacklisted=1,GROUP_ID 群管理员也永远视为未拉黑(查询结果恒为 0)。
-// 豁免在写入层(dbAddToBlacklist)已拒绝管理员入库,这里兜底历史数据/绕过写入层的存量脏数据。
+// 豁免在写入层(dbAddToBlacklist)已拒绝管理员入库,这里兜底历史数据/绕过写入层的存量脏数据,
+// 并在命中时顺手把数据层 is_blacklisted 清 0(一次查询即修复,下次控制台刷新即见 0)。
 async function dbCheckBlacklist(env, userId) {
 	if (!hasDb(env)) return { isBlacklisted: false, message: null };
 	const tgid = String(userId);
@@ -550,10 +578,11 @@ async function dbCheckBlacklist(env, userId) {
 		let isBlacklisted = Boolean(row?.is_blacklisted);
 		const banReason = row?.ban_reason || '';
 		const bannedAt = row?.banned_at || 0;
-		// 命中黑名单 → 复核是否为 GROUP_ID 群管理员,是则视为未拉黑(管理员 is_blacklisted 永远为 0)
+		// 命中黑名单 → 复核是否为 GROUP_ID 群管理员,是则视为未拉黑并修复数据层(管理员 is_blacklisted 永远为 0)
 		if (isBlacklisted && await isGroupAdmin(tgid)) {
 			console.log(`[DB] 黑名单豁免: tgid=${tgid} 是群组管理员,视为未拉黑`);
 			isBlacklisted = false;
+			await dbClearBlacklistStatus(env, tgid);
 		}
 		dbUserCache.set(tgid, { isBlacklisted, banReason, bannedAt, fetchedAt: now });
 		return isBlacklisted
@@ -578,6 +607,8 @@ async function dbAddToBlacklist(env, userId, source, operatorId) {
 		// 管理员豁免优先:先确认身份再判断是否已存在(管理员永远不允许入黑名单)
 		if (await isGroupAdmin(tgid)) {
 			console.log(`[DB] 黑名单写入拒绝: tgid=${tgid} 是群组管理员,不允许加入黑名单`);
+			// 顺手修复存量脏数据(历史遗留的 is_blacklisted=1 管理员行)
+			await dbClearBlacklistStatus(env, tgid);
 			return { success: false, adminExempt: true, message: '⚠️ 该用户是群组管理员，不能加入黑名单' };
 		}
 		const existing = await env.DB.prepare('SELECT is_blacklisted FROM users WHERE tgid = ?').bind(tgid).first();
