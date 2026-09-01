@@ -116,7 +116,8 @@ const GROUP_MEMBER_STATUS = {
 	ADMIN: '管理员',
 	HEALTHY: '健康',
 	MUTED: '禁言',
-	BANNED: '封禁'
+	BANNED: '封禁',
+	WHITELISTED: '白名单'
 };
 
 // 群组管理员判定钩子(黑名单豁免 / 管理员状态标记用):
@@ -137,11 +138,12 @@ async function isGroupAdmin(tgid) {
 	}
 }
 
-// 归一化群组状态:仅接受 管理员/健康/禁言/封禁,其余一律回退 健康(未知状态按正常处理,不误标)。
+// 归一化群组状态:仅接受 管理员/健康/禁言/封禁/白名单,其余一律回退 健康(未知状态按正常处理,不误标)。
 function normalizeGroupStatus(status) {
 	if (status === GROUP_MEMBER_STATUS.ADMIN
 		|| status === GROUP_MEMBER_STATUS.MUTED
-		|| status === GROUP_MEMBER_STATUS.BANNED) {
+		|| status === GROUP_MEMBER_STATUS.BANNED
+		|| status === GROUP_MEMBER_STATUS.WHITELISTED) {
 		return status;
 	}
 	return GROUP_MEMBER_STATUS.HEALTHY;
@@ -239,6 +241,39 @@ async function dbGetUserGroupStatus(env, tgid, chatId) {
 		console.error('[DB] 读取群组状态失败:', error.message);
 		return null;
 	}
+}
+
+// 联网黑名单查杀:一次查询取黑名单标记 + 活跃群组原始 JSON(用户不存在返回 null)。
+// 业务层(handleNetworkBlacklistKill)与 QA 测试共用,避免两次读库。
+async function dbGetUserKillInfo(env, tgid) {
+	if (!hasDb(env)) return null;
+	try {
+		const row = await env.DB.prepare('SELECT is_blacklisted, active_group_ids FROM users WHERE tgid = ?').bind(String(tgid)).first();
+		if (!row) return null;
+		return {
+			isBlacklisted: Boolean(row.is_blacklisted),
+			active_group_ids: row.active_group_ids
+		};
+	} catch (error) {
+		console.error('[DB] 读取查杀信息失败:', error.message);
+		return null;
+	}
+}
+
+// 联网查杀决策(纯逻辑、无 IO,可单测):根据用户行数据判断在当前群应执行的动作。
+// 语义(与需求一致):
+// - 用户不存在 → { action: 'record' } 建档放行(新用户不可能在 CM 黑名单);
+// - 本群已有状态且非"健康"(禁言/封禁/白名单/管理员)→ { action: 'skip', status } 已处理或豁免,不重复查杀;
+// - 本群无状态记录 → 视同"健康"(存量用户首次出现在本群),继续黑名单判定;
+// - 状态"健康"但不在黑名单 → { action: 'skip', reason: 'not-blacklisted' };
+// - 状态"健康"且 is_blacklisted=1 → { action: 'mute' } 命中 CM 黑名单,禁言 + 通知。
+function decideNetKillAction(row, chatId) {
+	if (!row) return { action: 'record' };
+	const status = parseActiveGroups(row.active_group_ids)
+		.find((g) => g.id === String(chatId))?.status || GROUP_MEMBER_STATUS.HEALTHY;
+	if (status !== GROUP_MEMBER_STATUS.HEALTHY) return { action: 'skip', status };
+	if (!row.isBlacklisted) return { action: 'skip', reason: 'not-blacklisted' };
+	return { action: 'mute' };
 }
 
 // 实例级 DB 初始化标记:首次请求完成建表+迁移后置 true,避免每请求重复检查
@@ -489,7 +524,11 @@ async function recordUserActivity(message, env) {
 		// 管理员在群内发言 → 标记"管理员";普通成员 → "健康"
 		// (管理员豁免:即使 DB 中残留禁言/封禁标记,发言时也回正为"管理员")
 		const isAdmin = await isGroupAdmin(tgid);
-		const refreshedStatus = isAdmin ? GROUP_MEMBER_STATUS.ADMIN : GROUP_MEMBER_STATUS.HEALTHY;
+		// 白名单豁免保持:被管理员显式加入本群白名单的用户,其"白名单"状态不因发言回正为"健康",
+		// 否则下一条消息会被"联网黑名单自动查杀"再次禁言(白名单 = 本群免查杀豁免)。
+		const refreshedStatus = existingGroup?.status === GROUP_MEMBER_STATUS.WHITELISTED
+			? GROUP_MEMBER_STATUS.WHITELISTED
+			: (isAdmin ? GROUP_MEMBER_STATUS.ADMIN : GROUP_MEMBER_STATUS.HEALTHY);
 		// 管理员发言 → 顺手修复黑名单数据层(历史遗留的 is_blacklisted=1 管理员行清为 0)
 		if (isAdmin) {
 			await dbClearBlacklistStatus(env, tgid);
@@ -768,7 +807,11 @@ export default {
 					await recordUserActivity(update.message, env);
 					await handleMessage(update.message, env);
 				} else if (update.callback_query) {
-					await handleAdCallbackQuery(update.callback_query, env);
+					// 优先处理联网查杀按钮回调(cmk: 前缀),未被消费再交给 /ad 投票回调
+					const consumed = await handleNetworkKillCallbackQuery(update.callback_query, env);
+					if (!consumed) {
+						await handleAdCallbackQuery(update.callback_query, env);
+					}
 				} else {
 					console.log('[Telegram更新] 跳过：update.message 和 update.callback_query 都为空，当前代码只处理普通消息和投票回调。');
 				}
@@ -1085,7 +1128,8 @@ function getCommandTargetUserId(command, message) {
 		return command.firstArg;
 	}
 
-	if (!isManagedGroupMessage(message)) {
+	// 群聊(含 GROUP_ID 与其他群)支持回复取目标用户;私聊无回复目标返回空
+	if (!message.chat || (message.chat.type !== 'group' && message.chat.type !== 'supergroup')) {
 		return '';
 	}
 
@@ -1425,6 +1469,13 @@ async function handleNewChatMemberBots(message, env) {
 
 	if (!chat || chat.id.toString() !== GROUP_ID.toString()) {
 		logBotModeration('skip:new-members-not-target-chat', getMessageLogInfo(message));
+		// 非 GROUP_ID 群:若 bot 是当前群管理员(且具备限制成员权限)→ 对入群真人成员执行
+		// "联网黑名单自动查杀"(bot 身份/权限在函数内部判断,不满足则整群跳过,不误伤)。
+		try {
+			await handleNetworkBlacklistKill(chat, newMembers, env);
+		} catch (error) {
+			console.error('[机器人风控] 联网查杀(入群)异常:', error.message);
+		}
 		return true;
 	}
 
@@ -1525,9 +1576,52 @@ async function handleMessage(message, env) {
 	const text = message.text;
 	const username = message.from.username || message.from.first_name || '用户';
 
-	// 处理 GROUP_ID 群组内管理员回复 /spam - 添加被回复用户到黑名单
+	// 联网黑名单自动查杀(消息路径):非 GROUP_ID 群内,真人发送的每条消息都过一遍查杀。
+	// - 命令消息也会走到这里:命令发送者通常为本群管理员(不在 CM 黑名单)或已被 TG API
+	//   拒绝禁言(管理员不可被 restrict),不会误杀;
+	// - 触发条件(非 GROUP_ID 群 + bot 是群管理员且有限制成员权限 + 绑定 D1)在函数内部判断。
+	if (chatId.toString() !== GROUP_ID.toString()) {
+		try {
+			await handleNetworkBlacklistKill(message.chat, [message.from], env);
+		} catch (error) {
+			console.error('[联网查杀] 消息路径异常:', error.message);
+		}
+	}
+
+	// 处理管理员 /spam:
+	// - GROUP_ID 群:添加被回复用户到 CM 黑名单(可同步修改 is_blacklisted);
+	// - 非 GROUP_ID 群(bot 为该群管理员):仅本群禁言 + 状态"禁言",不修改 is_blacklisted。
 	if (isSpamCommand(text)) {
-		if (chatId.toString() !== GROUP_ID.toString()) {
+		const isGroupIdChat = chatId.toString() === GROUP_ID.toString();
+		if (!isGroupIdChat) {
+			// 非 GROUP_ID 群:模式触发条件 = bot 是该群管理员;仅维护本群状态,不同步 CM 黑名单
+			if (message.chat.type !== 'group' && message.chat.type !== 'supergroup') {
+				return;
+			}
+			if (!isDbReady(env)) {
+				return;
+			}
+			const botIsAdmin = await checkIfBotIsAdminInChat(chatId);
+			if (!botIsAdmin) {
+				return; // 模式未启用,保持原行为(不处理)
+			}
+			const isAdmin = await checkIfUserIsAdminInChat(userId, chatId);
+			if (!isAdmin) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限本群管理员使用。');
+				return;
+			}
+			const repliedUserId = message.reply_to_message?.from?.id;
+			if (!repliedUserId) {
+				await sendTelegramMessage(chatId, '❌ 请回复要禁言的用户消息后再发送 <code>/spam</code>');
+				return;
+			}
+			try {
+				await muteChatMember(chatId, repliedUserId);
+				await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.MUTED);
+				await sendTelegramMessage(chatId, `✅ 已在群内禁言 <a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>\n📌 本群状态: 禁言`);
+			} catch (error) {
+				await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
+			}
 			return;
 		}
 
@@ -1715,8 +1809,46 @@ async function handleMessage(message, env) {
 	}
 
 	const banCommand = parseCommand(text, 'ban');
-	// 处理 /ban 命令 - 添加用户到黑名单
+	// 处理 /ban 命令:
+	// - GROUP_ID 群/私聊:添加用户到 CM 黑名单(可同步修改 is_blacklisted);
+	// - 非 GROUP_ID 群(bot 为该群管理员):仅本群封禁踢出 + 状态"封禁",不修改 is_blacklisted。
 	if (banCommand) {
+		const isGroupIdChat = chatId.toString() === GROUP_ID.toString();
+		const isGroupChat = message.chat.type === 'group' || message.chat.type === 'supergroup';
+
+		// 非 GROUP_ID 群:模式触发条件 = bot 是该群管理员;仅维护本群状态,不同步 CM 黑名单
+		if (isGroupChat && !isGroupIdChat) {
+			if (!isDbReady(env)) {
+				return;
+			}
+			const botIsAdmin = await checkIfBotIsAdminInChat(chatId);
+			if (!botIsAdmin) {
+				return; // 模式未启用,保持原行为(不处理)
+			}
+			const isAdmin = await checkIfUserIsAdminInChat(userId, chatId);
+			if (!isAdmin) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限本群管理员使用。');
+				return;
+			}
+			const targetUserId = getCommandTargetUserId(banCommand, message);
+			if (!targetUserId) {
+				await sendTelegramMessage(chatId, '❌ 使用方法: <code>/ban 用户ID</code>，或在群内回复用户消息发送 <code>/ban</code>');
+				return;
+			}
+			if (!/^\d+$/.test(targetUserId)) {
+				await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
+				return;
+			}
+			try {
+				await banUserPermanently(chatId, targetUserId);
+				await dbSetUserGroupStatus(env, targetUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
+				await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本群状态: 封禁`);
+			} catch (error) {
+				await sendTelegramMessage(chatId, `⚠️ 封禁失败: ${escapeHtml(error.message)}`);
+			}
+			return;
+		}
+
 		// 仅允许私聊或被管理的 GROUP_ID 群组内使用
 		if (!isPrivateOrManagedGroup(message)) {
 			return;
@@ -1778,10 +1910,54 @@ async function handleMessage(message, env) {
 	}
 
 	const unbanCommand = parseCommand(text, 'unban');
-	// 处理 /unban 命令 - 从黑名单移除或显示欢迎消息
+	// 处理 /unban 命令:
+	// - GROUP_ID 群/私聊:从 CM 黑名单移除(可同步修改 is_blacklisted);
+	// - 非 GROUP_ID 群(bot 为该群管理员):本群白名单 + 解除封禁/禁言,不修改 is_blacklisted。
 	if (unbanCommand) {
 		const targetUserId = getCommandTargetUserId(unbanCommand, message);
-		const shouldHandleAdminUnban = Boolean(targetUserId) || isManagedGroupMessage(message);
+		const isGroupIdChat = chatId.toString() === GROUP_ID.toString();
+		const isGroupChat = message.chat.type === 'group' || message.chat.type === 'supergroup';
+
+		// 非 GROUP_ID 群:白名单模式(仅维护本群状态,不同步 CM 黑名单)
+		if (isGroupChat && !isGroupIdChat) {
+			if (!isDbReady(env)) {
+				return;
+			}
+			const botIsAdmin = await checkIfBotIsAdminInChat(chatId);
+			if (!botIsAdmin) {
+				return; // 模式未启用,保持原行为(不处理)
+			}
+			if (!targetUserId) {
+				await sendTelegramMessage(chatId, '❌ 使用方法: <code>/unban 用户ID</code>，或回复用户消息发送 <code>/unban</code>');
+				return;
+			}
+			const isAdmin = await checkIfUserIsAdminInChat(userId, chatId);
+			if (!isAdmin) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限本群管理员使用。');
+				return;
+			}
+			if (!/^\d+$/.test(targetUserId)) {
+				await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
+				return;
+			}
+			try {
+				await unbanUserInChat(chatId, targetUserId);
+				try {
+					await restrictUserInChat(chatId, targetUserId);
+				} catch (restoreError) {
+					// 用户不在群内(如已被踢出且未重新加入)→ restrictChatMember 报错,忽略:
+					// 白名单状态已记录,待其重新入群时不会触发查杀
+					console.log('[联网查杀] 恢复发言权限跳过(用户不在群内):', restoreError.message);
+				}
+				await dbSetUserGroupStatus(env, targetUserId, chatId, GROUP_MEMBER_STATUS.WHITELISTED);
+				await sendTelegramMessage(chatId, `✅ 已将 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 加入本群白名单，并解除封禁/禁言\n📌 本群状态: 白名单`);
+			} catch (error) {
+				await sendTelegramMessage(chatId, `⚠️ 操作失败: ${escapeHtml(error.message)}`);
+			}
+			return;
+		}
+
+		const shouldHandleAdminUnban = Boolean(targetUserId) || isGroupIdChat;
 
 		// 有参数或群内回复用户时，处理黑名单移除。
 		if (shouldHandleAdminUnban) {
@@ -2103,29 +2279,8 @@ async function muteChatMember(chatId, userId) {
 }
 
 async function unbanUser(userId) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`;
-	const body = {
-		chat_id: GROUP_ID,
-		user_id: userId,
-		only_if_banned: true
-	};
-
-	const response = await fetch(url, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(body)
-	});
-
-	const result = await response.json();
-
-	if (!response.ok) {
-		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
-	}
-
-	// 添加调试日志
-	console.log(`执行 unbanUser，状态: ${response.status}, 响应: ${JSON.stringify(result)}`);
-
-	return result;
+	// GROUP_ID 群专用封装:委托通用版 unbanUserInChat(支持任意群,本处固定 GROUP_ID)
+	return await unbanUserInChat(GROUP_ID, userId);
 }
 
 // 永久封禁用户(踢出群组并禁止重新加入)
@@ -2152,46 +2307,9 @@ async function banUserPermanently(chatId, userId) {
 	return result;
 }
 
-// 解除用户禁言（恢复发言权限）
+// 解除用户禁言（恢复发言权限）— GROUP_ID 群专用封装
 async function restrictUser(userId) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/restrictChatMember`;
-	const body = {
-		chat_id: GROUP_ID,
-		user_id: userId,
-		use_independent_chat_permissions: true,
-		permissions: {
-			can_send_messages: true,
-			can_send_audios: true,
-			can_send_documents: true,
-			can_send_photos: true,
-			can_send_videos: true,
-			can_send_video_notes: true,
-			can_send_voice_notes: true,
-			can_send_polls: true,
-			can_send_other_messages: true,
-			can_add_web_page_previews: true,
-			can_change_info: false,
-			can_invite_users: true,
-			can_pin_messages: false
-		}
-	};
-
-	const response = await fetch(url, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(body)
-	});
-
-	const result = await response.json();
-
-	if (!response.ok) {
-		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
-	}
-
-	// 添加调试日志
-	console.log(`执行 restrictUser，状态: ${response.status}, 响应: ${JSON.stringify(result)}`);
-
-	return result;
+	return await restrictUserInChat(GROUP_ID, userId);
 }
 
 // 检查用户在群组中的状态
@@ -3643,6 +3761,328 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 	} else {
 		console.log(`[/ad] 投票 ${messageId} 已结束(result=${result}),目标用户 ${state.targetUserId} 不处理`);
 	}
+}
+
+// ========================================================
+// 联网黑名单自动查杀(非 GROUP_ID 群, bot 为群管理员时启用)
+// ========================================================
+// 概要:
+// - 触发条件:事件发生在非 GROUP_ID 的群聊,且 bot 仍是该群管理员(administrator/creator;
+//   administrator 还需具备 can_restrict_members 权限,否则禁言/封禁无法执行,模式视为不可用)。
+// - 触发事件:① 新成员入群(new_chat_members) ② 真人发送消息(消息路径)。
+// - 新 TGID(users 表无记录):自动建档,active_group_ids 记录本群 + 状态"健康",放行
+//   (新用户不可能在 CM 黑名单)。
+// - 存量 TGID:本群状态为"健康"且 is_blacklisted=1(CM 黑名单)→ 禁言 + 本群状态同步"禁言" +
+//   群内通知,通知附带"永久封禁 / 加入白名单"按钮(仅本群管理员可点)。
+// - 按钮"永久封禁"→ banChatMember 踢出 + 本群状态"封禁";"加入白名单"→ unban + 恢复发言 +
+//   状态"白名单"(白名单为本群豁免,不再触发查杀)。
+// - 非 GROUP_ID 群内的 /ban /spam /unban 仅维护本群状态,绝不修改 is_blacklisted;
+//   is_blacklisted 只代表"CM 黑名单"(GROUP_ID 群黑名单),只能由 GROUP_ID 群内的
+//   /ad /ban /spam /unban 修改。
+const NETKILL_BUTTON_PREFIX = 'cmk:';
+
+const NETKILL_LOG_LABELS = {
+	'trigger:skip-group-id': '跳过:消息来自 GROUP_ID 主群,不启用联网查杀',
+	'trigger:skip-not-group-chat': '跳过:非群聊(私聊/频道),不启用联网查杀',
+	'trigger:skip-no-db': '跳过:未绑定 D1,无法维护 active_group_ids 群组状态',
+	'trigger:skip-bot-not-admin': '跳过:bot 不是当前群管理员(或缺少限制成员权限),联网查杀模式未启用',
+	'new-user:record-created': '新 TGID:已在数据库建档(本群状态=健康)',
+	'status:skip': '跳过:该用户在本群已有状态(禁言/封禁/白名单/管理员),已处理或豁免,不重复查杀',
+	'blacklist:miss': '跳过:本群状态健康,但用户不在 CM 黑名单',
+	'action:mute:start': '开始:命中 CM 黑名单,执行禁言',
+	'action:mute:success': '成功:已禁言并同步本群状态为"禁言"',
+	'action:mute:failed': '失败:禁言失败(不写状态、不通知)',
+	'status:admin-detected': '检测:目标用户实为本群管理员,禁言被 TG API 拒绝,记录状态"管理员"避免重复尝试',
+	'notify:sent': '已发送 CM 黑名单通知与管理员操作按钮',
+	'callback:ban:start': '按钮:本群管理员点击"永久封禁"',
+	'callback:ban:success': '按钮:已永久封禁并同步本群状态"封禁"',
+	'callback:ban:failed': '按钮:永久封禁失败',
+	'callback:wl:start': '按钮:本群管理员点击"加入白名单"',
+	'callback:wl:success': '按钮:已加入本群白名单并解除封禁/禁言',
+	'callback:wl:failed': '按钮:白名单操作失败'
+};
+
+function logNetKill(step, details = {}) {
+	const label = NETKILL_LOG_LABELS[step] || step;
+	try {
+		console.log(`[联网查杀] ${label}: ${JSON.stringify(details)}`);
+	} catch (error) {
+		console.log(`[联网查杀] ${label}: 日志详情序列化失败：${error.message}`);
+	}
+}
+
+// getChatMember 原始结果(任意用户/任意群);失败或用户不在群返回 null
+async function getChatMemberInfo(chatId, userId) {
+	try {
+		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`;
+		const body = { chat_id: chatId, user_id: userId };
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok || !result.result) return null;
+		return result.result;
+	} catch (error) {
+		console.error('获取群成员信息失败:', error.message);
+		return null;
+	}
+}
+
+// 任意用户在任意群是否管理员(creator/administrator)
+async function checkIfUserIsAdminInChat(userId, chatId) {
+	const info = await getChatMemberInfo(chatId, userId);
+	return info ? (info.status === 'creator' || info.status === 'administrator') : false;
+}
+
+// bot 是否当前群管理员(按群缓存 60s):
+// - creator(群主)→ 是;
+// - administrator → 要求 can_restrict_members !== false(无"限制成员"权限则无法执行
+//   禁言/封禁,视为模式不可用,避免每次消息都产生无效的 restrictChatMember 调用);
+// - 其余(member/left/restricted 等)→ 否。
+const BOT_CHAT_ADMIN_CACHE_TTL_MS = 60000;
+const botChatAdminCache = new Map();
+async function checkIfBotIsAdminInChat(chatId) {
+	const key = String(chatId);
+	const now = Date.now();
+	const cached = botChatAdminCache.get(key);
+	if (cached && (now - cached.fetchedAt) < BOT_CHAT_ADMIN_CACHE_TTL_MS) {
+		return cached.isAdmin;
+	}
+	const botId = await getBotId();
+	if (!botId) return false;
+	const info = await getChatMemberInfo(chatId, botId);
+	let isAdmin = false;
+	if (info?.status === 'creator') {
+		isAdmin = true;
+	} else if (info?.status === 'administrator') {
+		isAdmin = info.can_restrict_members !== false;
+	}
+	botChatAdminCache.set(key, { isAdmin, fetchedAt: now });
+	return isAdmin;
+}
+
+// 解除指定群封禁(unbanChatMember,only_if_banned 幂等:未封禁时为成功空操作)
+async function unbanUserInChat(chatId, userId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/unbanChatMember`;
+	const body = {
+		chat_id: chatId,
+		user_id: userId,
+		only_if_banned: true
+	};
+	const response = await fetch(url, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+	const result = await response.json();
+	if (!response.ok || !result.ok) {
+		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
+	}
+	console.log(`执行 unbanUserInChat，chat=${chatId} user=${userId}, 响应: ${JSON.stringify(result)}`);
+	return result;
+}
+
+// 恢复指定群发言权限(restrictChatMember 全权限放开)
+async function restrictUserInChat(chatId, userId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/restrictChatMember`;
+	const body = {
+		chat_id: chatId,
+		user_id: userId,
+		use_independent_chat_permissions: true,
+		permissions: {
+			can_send_messages: true,
+			can_send_audios: true,
+			can_send_documents: true,
+			can_send_photos: true,
+			can_send_videos: true,
+			can_send_video_notes: true,
+			can_send_voice_notes: true,
+			can_send_polls: true,
+			can_send_other_messages: true,
+			can_add_web_page_previews: true,
+			can_change_info: false,
+			can_invite_users: true,
+			can_pin_messages: false
+		}
+	};
+	const response = await fetch(url, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+	const result = await response.json();
+	if (!response.ok || !result.ok) {
+		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
+	}
+	console.log(`执行 restrictUserInChat，chat=${chatId} user=${userId}, 响应: ${JSON.stringify(result)}`);
+	return result;
+}
+
+// 构建联网查杀通知文案 + 操作按钮(仅本群管理员可点,业务侧校验)
+function buildNetKillNotification(tgid, member) {
+	const mention = formatUserMention(member)
+		|| `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
+	const text = `⚠️ <b>CM 黑名单用户检测</b>
+
+🚫 该用户存在于 <b>CM 黑名单</b> 中，已在本群禁言处理。
+
+👤 用户: ${mention}
+📋 TGID: <code>${escapeHtml(tgid)}</code>
+
+👇 仅限本群管理员操作：`;
+	const replyMarkup = {
+		inline_keyboard: [[
+			{ text: '🔨 永久封禁', callback_data: `${NETKILL_BUTTON_PREFIX}ban:${tgid}` },
+			{ text: '✅ 加入白名单', callback_data: `${NETKILL_BUTTON_PREFIX}wl:${tgid}` }
+		]]
+	};
+	return { text, replyMarkup };
+}
+
+// 联网黑名单自动查杀主逻辑:
+// members 为待检查的 user 对象数组(入群事件取 new_chat_members,普通消息取 [message.from])。
+// 仅在非 GROUP_ID 群 + bot 为该群管理员时生效;依赖 D1(active_group_ids / is_blacklisted)。
+async function handleNetworkBlacklistKill(chat, members, env) {
+	if (!chat || !Array.isArray(members) || members.length === 0) return;
+	const chatId = chat.id;
+	if (chatId === undefined || chatId === null) return;
+	if (chatId.toString() === GROUP_ID.toString()) {
+		logNetKill('trigger:skip-group-id', { chatId: chatId.toString() });
+		return;
+	}
+	if (chat.type !== 'group' && chat.type !== 'supergroup') {
+		logNetKill('trigger:skip-not-group-chat', { chatId: chatId.toString(), type: chat.type });
+		return;
+	}
+	if (!isDbReady(env)) {
+		logNetKill('trigger:skip-no-db', { chatId: chatId.toString() });
+		return;
+	}
+
+	// 触发条件:bot 必须是当前群管理员(且有限制成员权限)
+	const botIsAdmin = await checkIfBotIsAdminInChat(chatId);
+	if (!botIsAdmin) {
+		logNetKill('trigger:skip-bot-not-admin', { chatId: chatId.toString() });
+		return;
+	}
+
+	for (const member of members) {
+		if (!member || member.id === undefined || member.id === null) continue;
+		if (member.is_bot) continue; // 只处理真人 TGID
+		const tgid = String(member.id);
+		const row = await dbGetUserKillInfo(env, tgid);
+		const decision = decideNetKillAction(row, chatId);
+
+		if (decision.action === 'record') {
+			// 新 TGID:建档(本群状态=健康),新用户不可能在黑名单,直接放行
+			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.HEALTHY);
+			logNetKill('new-user:record-created', { tgid, chatId: chatId.toString() });
+			continue;
+		}
+		if (decision.action === 'skip') {
+			logNetKill(decision.reason === 'not-blacklisted' ? 'blacklist:miss' : 'status:skip',
+				{ tgid, chatId: chatId.toString(), ...decision });
+			continue;
+		}
+
+		// action === 'mute':命中 CM 黑名单 → 禁言 + 本群状态同步"禁言" + 通知按钮
+		logNetKill('action:mute:start', { tgid, chatId: chatId.toString() });
+		try {
+			await muteChatMember(chatId, member.id);
+			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.MUTED);
+			logNetKill('action:mute:success', { tgid, chatId: chatId.toString() });
+			const notification = buildNetKillNotification(tgid, member);
+			await sendTelegramMessage(chatId, notification.text, notification.replyMarkup);
+			logNetKill('notify:sent', { tgid, chatId: chatId.toString() });
+		} catch (error) {
+			const errMsg = String(error?.message || '');
+			// 目标实为本群管理员/群主时 TG API 拒绝 restrict → 记录"管理员"避免每条消息重复尝试
+			if (/administrator|chat creator|creator of the chat/i.test(errMsg)) {
+				await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.ADMIN);
+				logNetKill('status:admin-detected', { tgid, chatId: chatId.toString() });
+			}
+			logNetKill('action:mute:failed', { tgid, chatId: chatId.toString(), 错误: errMsg });
+		}
+	}
+}
+
+// 处理联网查杀通知的按钮回调("永久封禁" / "加入白名单")。
+// 返回 true 表示已消费该回调(无论成败),false 表示不是本功能回调(交由 /ad 投票处理)。
+async function handleNetworkKillCallbackQuery(callbackQuery, env) {
+	const data = callbackQuery.data || '';
+	if (!data.startsWith(NETKILL_BUTTON_PREFIX)) return false;
+
+	const message = callbackQuery.message;
+	const chatId = message?.chat?.id;
+	if (!chatId) {
+		try { await answerCallbackQuery(callbackQuery.id); } catch (_) { }
+		return true;
+	}
+	if (chatId.toString() === GROUP_ID.toString()) {
+		// 防御:该按钮只应出现在非 GROUP_ID 群的通知里
+		try { await answerCallbackQuery(callbackQuery.id, '无效操作', true); } catch (_) { }
+		return true;
+	}
+
+	const parts = data.split(':');
+	const action = parts[1];
+	const tgid = parts.slice(2).join(':');
+	if ((action !== 'ban' && action !== 'wl') || !/^\d+$/.test(tgid)) {
+		try { await answerCallbackQuery(callbackQuery.id, '无效操作', true); } catch (_) { }
+		return true;
+	}
+
+	const operatorId = callbackQuery.from.id;
+	// 按钮仅允许当前群管理员点击
+	const isAdmin = await checkIfUserIsAdminInChat(operatorId, chatId);
+	if (!isAdmin) {
+		try { await answerCallbackQuery(callbackQuery.id, '仅限本群管理员操作', true); } catch (_) { }
+		return true;
+	}
+
+	const messageId = message.message_id;
+	const removeButtons = { inline_keyboard: [] };
+	const mention = `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
+
+	if (action === 'ban') {
+		logNetKill('callback:ban:start', { tgid, chatId: chatId.toString(), operatorId });
+		try {
+			await banUserPermanently(chatId, tgid);
+			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.BANNED);
+			await editMessageText(chatId, messageId,
+				`🔨 <b>已永久封禁</b>\n\n${mention} 已移出本群。\n📌 本群状态: 封禁`, removeButtons);
+			logNetKill('callback:ban:success', { tgid, chatId: chatId.toString(), operatorId });
+			try { await answerCallbackQuery(callbackQuery.id, '已永久封禁该用户'); } catch (_) { }
+		} catch (error) {
+			logNetKill('callback:ban:failed', { tgid, chatId: chatId.toString(), 错误: error.message });
+			try { await answerCallbackQuery(callbackQuery.id, `封禁失败: ${String(error.message).slice(0, 80)}`, true); } catch (_) { }
+		}
+		return true;
+	}
+
+	// action === 'wl':加入本群白名单 + 解除封禁/禁言
+	logNetKill('callback:wl:start', { tgid, chatId: chatId.toString(), operatorId });
+	try {
+		await unbanUserInChat(chatId, tgid);
+		try {
+			await restrictUserInChat(chatId, tgid);
+		} catch (restoreError) {
+			// 用户已被踢出且未重新入群 → restrictChatMember 报 USER_NOT_PARTICIPANT,忽略:
+			// 白名单状态已记录,待其重新入群时不会触发查杀
+			console.log('[联网查杀] 恢复发言权限跳过(用户不在群内):', restoreError.message);
+		}
+		await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.WHITELISTED);
+		await editMessageText(chatId, messageId,
+			`✅ <b>已加入本群白名单</b>\n\n${mention} 已解除封禁/禁言，后续不再自动查杀。\n📌 本群状态: 白名单`, removeButtons);
+		logNetKill('callback:wl:success', { tgid, chatId: chatId.toString(), operatorId });
+		try { await answerCallbackQuery(callbackQuery.id, '已加入白名单并解除限制'); } catch (_) { }
+	} catch (error) {
+		logNetKill('callback:wl:failed', { tgid, chatId: chatId.toString(), 错误: error.message });
+		try { await answerCallbackQuery(callbackQuery.id, `操作失败: ${String(error.message).slice(0, 80)}`, true); } catch (_) { }
+	}
+	return true;
 }
 
 // ========================================================
