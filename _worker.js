@@ -110,17 +110,38 @@ const DB_BAN_REASON_MAP = {
 };
 
 // 用户在群组内的健康状态(active_group_ids 数组元素 status 字段取值):
-// 健康=正常成员(含管理员/群主,可发言), 禁言=被 restrictChatMember 禁发消息,
-// 封禁=被 banChatMember 踢出群组(含被踢后尚未重新加入)。
+// 管理员=群主/管理员(可发言,豁免黑名单), 健康=普通正常成员(可发言),
+// 禁言=被 restrictChatMember 禁发消息, 封禁=被 banChatMember 踢出群组(含被踢后尚未重新加入)。
 const GROUP_MEMBER_STATUS = {
+	ADMIN: '管理员',
 	HEALTHY: '健康',
 	MUTED: '禁言',
 	BANNED: '封禁'
 };
 
-// 归一化群组状态:仅接受 健康/禁言/封禁,其余一律回退 健康(未知状态按正常处理,不误标)。
+// 群组管理员判定钩子(黑名单豁免 / 管理员状态标记用):
+// DB 层不直接调用 Telegram API(保持 QA 沙箱可测),由业务层在模块加载时注入真实检查器。
+// 未注入(null)时一律按"非管理员"处理:QA 沙箱与纯 DB 层场景行为稳定。
+let groupAdminChecker = null;
+function setGroupAdminChecker(fn) {
+	groupAdminChecker = typeof fn === 'function' ? fn : null;
+}
+// 同步判断某 tgid 是否为 GROUP_ID 群管理员(钩子未注入时恒 false,不抛错)
+async function isGroupAdmin(tgid) {
+	if (!groupAdminChecker) return false;
+	try {
+		return Boolean(await groupAdminChecker(tgid));
+	} catch (error) {
+		console.error('[DB] 管理员判定钩子调用失败(按非管理员处理):', error.message);
+		return false;
+	}
+}
+
+// 归一化群组状态:仅接受 管理员/健康/禁言/封禁,其余一律回退 健康(未知状态按正常处理,不误标)。
 function normalizeGroupStatus(status) {
-	if (status === GROUP_MEMBER_STATUS.MUTED || status === GROUP_MEMBER_STATUS.BANNED) {
+	if (status === GROUP_MEMBER_STATUS.ADMIN
+		|| status === GROUP_MEMBER_STATUS.MUTED
+		|| status === GROUP_MEMBER_STATUS.BANNED) {
 		return status;
 	}
 	return GROUP_MEMBER_STATUS.HEALTHY;
@@ -154,14 +175,16 @@ function parseActiveGroups(rawStr) {
 	return groups;
 }
 
-// Telegram getChatMember.status → 群内三态映射:
+// Telegram getChatMember.status → 群内状态映射:
 // - kicked(被踢出/封禁)→ 封禁;
 // - restricted 且 can_send_messages === false(被禁言)→ 禁言;
-// - 其余(member/left/administrator/creator/restricted 可发言/未知)→ 健康。
+// - administrator / creator(群主/管理员)→ 管理员;
+// - 其余(member/left/restricted 可发言/未知)→ 健康。
 // can_send_messages 为 getChatMember 返回的直挂属性;kicked/left 等状态该字段为 undefined,不误判。
 function mapTgStatusToGroupStatus(status, canSendMessages) {
 	if (status === 'kicked') return GROUP_MEMBER_STATUS.BANNED;
 	if (status === 'restricted' && canSendMessages === false) return GROUP_MEMBER_STATUS.MUTED;
+	if (status === 'administrator' || status === 'creator') return GROUP_MEMBER_STATUS.ADMIN;
 	return GROUP_MEMBER_STATUS.HEALTHY;
 }
 
@@ -463,10 +486,14 @@ async function recordUserActivity(message, env) {
 			console.error('[DB] 读取活跃群组失败:', error.message);
 		}
 		const existingGroup = groupIds.find((g) => g.id === chatIdStr);
+		// 管理员在群内发言 → 标记"管理员";普通成员 → "健康"
+		// (管理员豁免:即使 DB 中残留禁言/封禁标记,发言时也回正为"管理员")
+		const isAdmin = await isGroupAdmin(tgid);
+		const refreshedStatus = isAdmin ? GROUP_MEMBER_STATUS.ADMIN : GROUP_MEMBER_STATUS.HEALTHY;
 		if (existingGroup) {
-			existingGroup.status = GROUP_MEMBER_STATUS.HEALTHY;
+			existingGroup.status = refreshedStatus;
 		} else {
-			groupIds.push({ id: chatIdStr, status: GROUP_MEMBER_STATUS.HEALTHY });
+			groupIds.push({ id: chatIdStr, status: refreshedStatus });
 		}
 
 		try {
@@ -506,6 +533,8 @@ async function recordUserActivity(message, env) {
 }
 
 // D1 版黑名单查询(带 5s 实例级缓存);无 D1 绑定直接返回未命中(上层 hasDb 已分流,此处为防御)
+// 管理员豁免:即使 DB 中 is_blacklisted=1,GROUP_ID 群管理员也永远视为未拉黑(查询结果恒为 0)。
+// 豁免在写入层(dbAddToBlacklist)已拒绝管理员入库,这里兜底历史数据/绕过写入层的存量脏数据。
 async function dbCheckBlacklist(env, userId) {
 	if (!hasDb(env)) return { isBlacklisted: false, message: null };
 	const tgid = String(userId);
@@ -518,9 +547,14 @@ async function dbCheckBlacklist(env, userId) {
 	}
 	try {
 		const row = await env.DB.prepare('SELECT is_blacklisted, ban_reason, banned_at FROM users WHERE tgid = ?').bind(tgid).first();
-		const isBlacklisted = Boolean(row?.is_blacklisted);
+		let isBlacklisted = Boolean(row?.is_blacklisted);
 		const banReason = row?.ban_reason || '';
 		const bannedAt = row?.banned_at || 0;
+		// 命中黑名单 → 复核是否为 GROUP_ID 群管理员,是则视为未拉黑(管理员 is_blacklisted 永远为 0)
+		if (isBlacklisted && await isGroupAdmin(tgid)) {
+			console.log(`[DB] 黑名单豁免: tgid=${tgid} 是群组管理员,视为未拉黑`);
+			isBlacklisted = false;
+		}
 		dbUserCache.set(tgid, { isBlacklisted, banReason, bannedAt, fetchedAt: now });
 		return isBlacklisted
 			? { isBlacklisted: true, message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。', banReason, bannedAt }
@@ -533,6 +567,7 @@ async function dbCheckBlacklist(env, userId) {
 
 // D1 版添加黑名单:source ∈ ad/spam/ban,映射 ban_reason 并记录封禁时间与处理人 tgid
 // operatorId: 处理人 tgid(溯源)——/ad 传举报发起人, /spam、/ban 传操作管理员
+// 管理员豁免:GROUP_ID 群管理员(含群主)一律拒绝加入黑名单(写入层保证 is_blacklisted 恒为 0)
 async function dbAddToBlacklist(env, userId, source, operatorId) {
 	if (!hasDb(env)) return { success: false, message: '❌ 未绑定D1数据库' };
 	const tgid = String(userId);
@@ -540,6 +575,11 @@ async function dbAddToBlacklist(env, userId, source, operatorId) {
 	const now = Math.floor(Date.now() / 1000);
 	const banReason = DB_BAN_REASON_MAP[source] || DB_BAN_REASON_MAP.ban;
 	try {
+		// 管理员豁免优先:先确认身份再判断是否已存在(管理员永远不允许入黑名单)
+		if (await isGroupAdmin(tgid)) {
+			console.log(`[DB] 黑名单写入拒绝: tgid=${tgid} 是群组管理员,不允许加入黑名单`);
+			return { success: false, adminExempt: true, message: '⚠️ 该用户是群组管理员，不能加入黑名单' };
+		}
 		const existing = await env.DB.prepare('SELECT is_blacklisted FROM users WHERE tgid = ?').bind(tgid).first();
 		if (existing?.is_blacklisted) {
 			return { success: false, alreadyExists: true, message: '⚠️ 该用户已在黑名单中' };
@@ -1023,7 +1063,7 @@ function getCommandTargetUserId(command, message) {
 }
 
 // 业务层辅助:成功执行群内操作后,同步标记该用户在 GROUP_ID 群的状态(仅 DB 模式生效)。
-// 传入的 status 必须是 GROUP_MEMBER_STATUS 三态之一;标记失败仅记日志,不阻塞主流程。
+// 传入的 status 必须是 GROUP_MEMBER_STATUS 四态之一;标记失败仅记日志,不阻塞主流程。
 async function markUserGroupStatus(env, userId, status) {
 	if (!isDbReady(env)) return;
 	try {
@@ -2182,6 +2222,23 @@ async function checkIfUserIsAdmin(userId) {
 	}
 }
 
+// 管理员身份实例级缓存(带 TTL):供高频路径使用(recordUserActivity 每条群聊消息都调用,
+// 直接打 getChatMember 会成倍消耗 Telegram API 配额)。管理员身份变动不频繁,TTL 内不感知。
+// 60s 窗口内的身份变化(如刚被提升的管理员)最多延迟 60s 生效;降级同理,期间按旧身份处理。
+const ADMIN_CHECK_CACHE_TTL_MS = 60000;
+const groupAdminCache = new Map();
+async function checkIfUserIsAdminCached(userId) {
+	const tgid = String(userId);
+	const now = Date.now();
+	const cached = groupAdminCache.get(tgid);
+	if (cached && (now - cached.fetchedAt) < ADMIN_CHECK_CACHE_TTL_MS) {
+		return cached.isAdmin;
+	}
+	const isAdmin = await checkIfUserIsAdmin(tgid); // 内部已 catch 全部异常,失败返回 false
+	groupAdminCache.set(tgid, { isAdmin, fetchedAt: now });
+	return isAdmin;
+}
+
 // 检查用户是否助推过 GROUP_ID 群组(getUserChatBoosts 需要机器人是管理员)
 async function checkIfUserBoosted(userId) {
 	try {
@@ -3101,6 +3158,13 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 	// bio 在群内取不到时再用 getChat 兜底(仅当对方私聊过本机器人)。
 	try {
 		const statusResult = await checkUserStatus(targetUserId);
+		// 管理员豁免:不能对 GROUP_ID 群管理员发起举报投票
+		// (复用本次 getChatMember 的 status,零额外 API 调用;查询异常/不在群时 status 缺失 → 放行)
+		const targetStatus = statusResult?.result?.status;
+		if (targetStatus === 'administrator' || targetStatus === 'creator') {
+			await sendTelegramMessage(chatId, `⚠️ 不能对群组管理员 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 发起举报投票`);
+			return;
+		}
 		if (statusResult?.result?.user) {
 			// 以 getChatMember 返回的 user 为准(可能比回复快照多 bio 等字段)
 			targetUserSnapshot = snapshotTelegramUser(statusResult.result.user);
@@ -3498,8 +3562,7 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 			console.log(`[/ad] 已将用户 ${state.targetUserId} 加入黑名单`);
 		} catch (error) {
 			console.error('[/ad] finalize 写入黑名单失败:', error.message);
-		}
-		// 检查用户群内状态:
+		}		// 检查用户群内状态:
 		// - 在群(member/administrator/creator/restricted)→ 禁言;
 		// - 不在群(left/kicked/状态缺失/查询异常/从未入群)→ 永久封禁为主动作。
 		// 注意:用户从未入群时,Telegram 对 getChatMember / banChatMember 都会返回 400
@@ -3550,3 +3613,12 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 		console.log(`[/ad] 投票 ${messageId} 已结束(result=${result}),目标用户 ${state.targetUserId} 不处理`);
 	}
 }
+
+// ========================================================
+// 业务层注入 DB 层管理员判定钩子
+// ========================================================
+// DB 层(黑名单豁免 / recordUserActivity 管理员状态标记)通过 setGroupAdminChecker 注册的
+// 钩子判断"是否 GROUP_ID 群管理员",自身不直接调 Telegram API(保持 QA 沙箱可测)。
+// 此处注入缓存版检查器(60s TTL),高频路径不吃 getChatMember 配额。
+// 模块加载时仅注册钩子,不触发任何 API 调用;QA 沙箱切片不含此行,DB 层按无钩子(非管理员)处理。
+setGroupAdminChecker(async (tgid) => checkIfUserIsAdminCached(tgid));
