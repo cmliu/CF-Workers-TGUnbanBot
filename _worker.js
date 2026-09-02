@@ -1582,7 +1582,7 @@ async function handleMessage(message, env) {
 	// - 触发条件(非 GROUP_ID 群 + bot 是群管理员且有限制成员权限 + 绑定 D1)在函数内部判断。
 	if (chatId.toString() !== GROUP_ID.toString()) {
 		try {
-			await handleNetworkBlacklistKill(message.chat, [message.from], env);
+			await handleNetworkBlacklistKill(message.chat, [message.from], env, message.message_id);
 		} catch (error) {
 			console.error('[联网查杀] 消息路径异常:', error.message);
 		}
@@ -3924,7 +3924,7 @@ async function restrictUserInChat(chatId, userId) {
 function buildNetKillNotification(tgid, member) {
 	const mention = formatUserMention(member)
 		|| `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
-	const text = `⚠️ <b>CM 黑名单用户检测</b>
+	const text = `⚠️ <b>#黑名单用户检测</b>
 
 🚫 该用户存在于 <b>CM 黑名单</b> 中，已在本群禁言处理。
 
@@ -3944,7 +3944,7 @@ function buildNetKillNotification(tgid, member) {
 // 联网黑名单自动查杀主逻辑:
 // members 为待检查的 user 对象数组(入群事件取 new_chat_members,普通消息取 [message.from])。
 // 仅在非 GROUP_ID 群 + bot 为该群管理员时生效;依赖 D1(active_group_ids / is_blacklisted)。
-async function handleNetworkBlacklistKill(chat, members, env) {
+async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) {
 	if (!chat || !Array.isArray(members) || members.length === 0) return;
 	const chatId = chat.id;
 	if (chatId === undefined || chatId === null) return;
@@ -3994,7 +3994,7 @@ async function handleNetworkBlacklistKill(chat, members, env) {
 			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.MUTED);
 			logNetKill('action:mute:success', { tgid, chatId: chatId.toString() });
 			const notification = buildNetKillNotification(tgid, member);
-			await sendTelegramMessage(chatId, notification.text, notification.replyMarkup);
+			await sendTelegramMessage(chatId, notification.text, notification.replyMarkup, replyToMessageId);
 			logNetKill('notify:sent', { tgid, chatId: chatId.toString() });
 		} catch (error) {
 			const errMsg = String(error?.message || '');
