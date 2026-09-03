@@ -985,6 +985,15 @@ function formatMainGroupsHint(infos) {
 	return parts.filter(Boolean).join('、');
 }
 
+// 把主群列表渲染为自我介绍中的群名串:多群返回 "群名1、群名2"(顿号分隔,纯群名,无 @/链接)。
+// 用法:与 formatMainGroupsHint 区分——前者面向"点击返回群组"的入口链接,后者面向"我是哪个群的机器人"自我介绍。
+function formatMainGroupsNamesHint(infos) {
+	if (!Array.isArray(infos) || infos.length === 0) return '主群';
+	const titles = infos.map((info) => info?.title).filter(Boolean);
+	if (titles.length === 0) return '主群';
+	return titles.map((t) => escapeHtml(t)).join('、');
+}
+
 // 恢复单个主群中用户的群内状态(查状态 → 解封/解禁 → 状态回写"健康"),返回动作/失败明细。
 // 状态语义与旧单群 restoreUserInManagedGroup 完全一致(kicked/restricted/left/member/admin 分支)。
 async function restoreUserInSingleMainGroup(chatId, userId, env) {
@@ -1557,6 +1566,17 @@ function formatUserMention(user) {
 
 	const displayName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.id;
 	return `<a href="tg://user?id=${user.id}">${escapeHtml(displayName)}</a>`;
+}
+
+// 纯文本用户标识(无 HTML 链接):"用户名(TGID)"。
+// 用于自助解封欢迎词等"上下文已明确是对方"的场景,既保留人类可读的名字,又附带 tgid 便于用户核对。
+// 与 formatUserMention(返回 <a> 链接,适合主群公开消息中"@提一下")的差异:
+//   - 私聊欢迎词不需要再做成链接(对方就在对话框里),纯文本更直观;
+//   - 名字在前、TGID 在括号内,符合日常"名字(ID)"的展示习惯,避免只看到一串数字。
+function formatUserLabel(user) {
+	if (!user?.id) return '';
+	const displayName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.id;
+	return `${escapeHtml(displayName)}(${escapeHtml(user.id)})`;
 }
 
 async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
@@ -2307,8 +2327,12 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-		const groupInfo = await getGroupInfo();
-		const welcomeMessage = `🤖 <b>亲爱的 ${userId}</b>，我是 <b>${groupInfo.title}</b> 的 自助解封机器人
+		const mainGroupInfos = await listMainGroupInfos(env);
+		const groupsLabel = formatMainGroupsNamesHint(mainGroupInfos);
+		// 自助解封欢迎词展示"用户名(TGID)",而非裸 TGID:bot 在私聊场景中能看到 message.from 的
+		// first_name/last_name/username,直接拼到文案里既友好又便于用户核对身份(用户反馈:只看到 TGID 不美观)。
+		const userLabel = formatUserLabel(message.from);
+		const welcomeMessage = `🤖 <b>亲爱的 ${userLabel}</b>，我是 <b>${groupsLabel}</b> 的 自助解封机器人
 
 🔍 <b>请自行检查以下内容：</b>
 
