@@ -685,7 +685,7 @@ async function dbRemoveFromBlacklist(env, userId, operatorId) {
 	try {
 		const row = await env.DB.prepare('SELECT is_blacklisted FROM users WHERE tgid = ?').bind(tgid).first();
 		if (!row?.is_blacklisted) {
-			return { success: false, notFound: true, message: '⚠️ 该用户不在黑名单中' };
+			return { success: false, notFound: true, message: `⚠️ 用户 <code>${tgid}</code> 不在黑名单中` };
 		}
 		await env.DB.prepare(
 			'UPDATE users SET is_blacklisted = 0, ban_reason = ?, banned_at = ?, last_unban_at = ?, unbanned_by = ? WHERE tgid = ?'
@@ -1061,6 +1061,16 @@ async function restoreUserInSingleMainGroup(chatId, userId, env) {
 // 返回 { success, notifyMainGroups, message };notifyMainGroups=是否实际执行过恢复动作/存在失败
 // (供"自助解封处理后是否需要向主群广播系统通知"判断);message 汇总各群动作与失败明细。
 // 群名显示通过 getChatInfoCached 复用永久缓存(0 额外请求);fallback 场景回退 chatId 避免多主群同显示。
+//
+// 多主群文案格式:每个主群独立一行(以 '\n' 分隔,不再是 ';'),成功/失败分别用 ✅/⚠️ 前缀区分;
+// 整个 message 渲染后是从上到下逐主群罗列的视觉结构,
+// 避免过去把多主群拼成单行、用 ';' 隔开导致的拥挤感(用户截图反馈)。
+//
+// 用户标识(tgid @ 链接)由外层调用方负责展示一次,message 本身不再内嵌:
+//   - 自助解封主群广播:首行 "用户 <a>X</a> 已通过自助解封" 已含;
+//   - /unban 管理员操作:removeFromBlacklist 返回文案已含用户(notFound 也补了);
+//   - 私聊 DM 结果:收件人即用户本人,/start 欢迎语已展示其 ID。
+// 避免同一消息里用户 TGID 重复汇报(用户反馈:两次汇报多余)。
 async function restoreUserInAllMainGroups(userId, env) {
 	const allActions = [];
 	const allFailures = [];
@@ -1069,10 +1079,10 @@ async function restoreUserInAllMainGroups(userId, env) {
 		const info = await getChatInfoCached(chatId);
 		const label = info?.fromFallback ? result.chatId : info.title;
 		if (result.actions.length > 0) {
-			allActions.push(`主群 ${label}: ${result.actions.join('，')}`);
+			allActions.push(`✅ 主群 ${label}: ${result.actions.join('，')}`);
 		}
 		if (result.failures.length > 0) {
-			allFailures.push(`主群 ${label}: ${result.failures.join('；')}`);
+			allFailures.push(`⚠️ 主群 ${label}: ${result.failures.join('；')}`);
 		}
 	}
 
@@ -1080,27 +1090,27 @@ async function restoreUserInAllMainGroups(userId, env) {
 		return {
 			success: false,
 			notifyMainGroups: true,
-			message: `⚠️ 群内解封禁失败：${allFailures.join('；')}`
+			message: `⚠️ 群内解封禁失败：\n${allFailures.join('\n')}`
 		};
 	}
 	if (allFailures.length > 0) {
 		return {
 			success: false,
 			notifyMainGroups: true,
-			message: `⚠️ ${allActions.join('，')}；但${allFailures.join('；')}`
+			message: `⚠️ 部分主群处理成功，但仍有失败：\n${allActions.join('\n')}\n${allFailures.join('\n')}`
 		};
 	}
 	if (allActions.length === 0) {
 		return {
 			success: true,
 			notifyMainGroups: false,
-			message: `✅ 已确认全部主群权限无需调整：<a href="tg://user?id=${userId}">${userId}</a>`
+			message: '✅ 已确认全部主群权限无需调整'
 		};
 	}
 	return {
 		success: true,
 		notifyMainGroups: true,
-		message: `✅ ${allActions.join('；')}：<a href="tg://user?id=${userId}">${userId}</a>`
+		message: allActions.join('\n')
 	};
 }
 
@@ -1431,7 +1441,7 @@ async function removeFromBlacklist(userId, env, operatorId) {
 
 		// 检查是否有移除
 		if (blacklist.length === originalLength) {
-			return { success: false, notFound: true, message: '⚠️ 该用户不在黑名单中' };
+			return { success: false, notFound: true, message: `⚠️ 用户 <code>${userIdStr}</code> 不在黑名单中` };
 		}
 
 		// 保存更新后的黑名单
