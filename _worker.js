@@ -108,6 +108,9 @@ const DB_MIGRATE_WAIT_MS = 2000;
 // KV 导入黑名单时缺失的时间字段默认值:0 表示"未知",避免 NULL 造成数据错误
 const DB_DEFAULT_UNKNOWN_TIME = 0;
 // 黑名单原因映射:source → ban_reason(/ad=举报,/spam 与 /ban=管理员封禁,细分来源便于追溯)
+// 注意:此处保留命令名(/ban /spam)是为了数据层语义精细化(便于审计追溯与未来按来源统计);
+// 实际在公开消息(/check 等主群回复)展示时,会通过正则把命令后缀剥掉,避免普通成员误以为是
+// 命令提示并误点导致误导 bot;因此 DB 中存储的 '管理员封禁(/ban)' 落到 UI 是 '管理员封禁'。
 const DB_BAN_REASON_MAP = {
 	ad: '举报',
 	spam: '管理员封禁(/spam)',
@@ -1614,13 +1617,16 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	// 本地黑名单状态(数据库版可附带封禁原因与时间;KV 版仅 ID 数组,无原因字段)
 	if (options.env) {
 		if (isLocalBlacklisted) {
-			responseMessage += `💾 <b>本地黑名单:</b> 🚫 <b>已封禁</b>\n`;
-			if (localBlacklistInfo?.banReason) {
-				responseMessage += `     ⚠️ 原因: ${escapeHtml(localBlacklistInfo.banReason)}\n`;
-			}
-			if (localBlacklistInfo?.bannedAt) {
-				responseMessage += `     📅 时间: ${escapeHtml(formatTimestamp(localBlacklistInfo.bannedAt))}\n`;
-			}
+			// 兼容旧数据中可能残留的命令后缀(如 '管理员封禁(/ban)'/'管理员封禁(/spam)'),
+			// 展示前剥掉,确保在主群 /check 公开回复里普通成员看不到具体命令提示;
+			// 新写入通过 DB_BAN_REASON_MAP 已是干净文案。
+			const rawReason = localBlacklistInfo?.banReason ? escapeHtml(localBlacklistInfo.banReason) : '';
+			const reason = rawReason.replace(/\s*\(\/\w+\)\s*$/, '');
+			const ts = localBlacklistInfo?.bannedAt;
+			const tsStr = ts && ts > 0 ? formatTimestamp(ts).slice(0, 16) : ''; // YYYY-MM-DD HH:MM
+			const detail = [reason, tsStr].filter(Boolean).join(', ');
+			const suffix = detail ? ` (${detail})` : '';
+			responseMessage += `💾 <b>本地黑名单:</b> 🚫 <b>已封禁</b>${suffix}\n`;
 		} else {
 			responseMessage += `💾 <b>本地黑名单:</b> ✅ 正常\n`;
 		}
