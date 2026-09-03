@@ -26,7 +26,8 @@ let BOT_ID = null;
 // - 结束时调用 editMessageText 移除按钮,若赞成胜出则触发封禁(写入 KV 黑名单 + 群内禁言)。
 // - /ad 不出现在 setMyCommands 命令菜单中(保持隐藏)。
 // - 非管理员(含普通用户)触发 /ad:助推者/白名单直接发起投票;普通用户回复消息 + /ad 时先发占位
-//   "AI 正在评级",评级 A/B 把占位编辑为投票,C/D 或 AI 失败把占位编辑为"未触发投票"收尾,均不发权限提示。
+//   "AI 正在评级",评级 A/B 把占位编辑为投票,AI 拒答/无法识别(unrecognized)沿用既有语义按 🟠B 弹投票,
+//   明确 C/D 或 AI 基础设施失败(null)把占位编辑为"未触发投票"收尾,均不发权限提示。
 // - 主群内 /ad 命令消息发送后即被删除(隐藏命令痕迹);需要 await AI 的场景均先发占位消息再编辑落定,
 //   避免"等待 AI 期间群内无任何回应"的失效观感;纯 /ad <tgid> 无内容直接 C 级投票时不发占位。
 // ========================================================
@@ -1956,7 +1957,8 @@ async function handleMessage(message, env) {
 			const isAllowed = await isAdAllowlisted(env, userId);
 			if (!isBoosted && !isAllowed) {
 				// 普通用户举报通道:回复消息 + /ad → 评级逻辑已收敛进 handleAdCommand(userReport 模式:
-				// 先发占位消息,AI 评级 A/B 编辑为投票;C/D 或 AI 无法评级编辑为"未触发投票"收尾)。
+				// 先发占位消息,AI 评级 A/B 编辑为投票,拒答/unrecognized 按 🟠B 弹投票,
+				// 明确 C/D 或 AI 基础设施失败(null)编辑为"未触发投票"收尾)。
 				// 此处仅做"有无可评内容"门槛:非回复或无文字(caption 也算)→ 命令消息已删除,静默。
 				const replyMsg = message.reply_to_message;
 				const src = (typeof replyMsg?.text === 'string' && replyMsg.text.length > 0)
@@ -3366,8 +3368,10 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 	const chatId = message.chat.id;
 	const userId = message.from.id;
 	// options.userReport=true → 普通用户举报通道(无举报权限):
-	// AI 评级明确 A/B 才把占位消息编辑为投票;评级 C/D 或 AI 无法评级 → 把占位编辑为
-	// "未触发投票"收尾文案,不建投票 state、不写 KV(取代旧"外层预评级+非A/B完全静默")。
+	// AI 评级明确 A/B → 把占位编辑为投票;AI 拒答/道德围墙/无法解析(unrecognized)→ 沿用仓库
+	// 评级语义按 B 危险把占位编辑为投票;评级 C/D → 编辑占位为"✅ 无害"收尾;仅 AI 基础设施
+	// 失败(null: 未绑定/超时/网络/限流)→ 编辑占位为"⚠️ 无法完成评级"收尾;后两者不建投票
+	// state、不写 KV(取代旧"外层预评级+非A/B完全静默")。
 	const userReportMode = Boolean(options && options.userReport);
 
 	// 1. 必须在任一主群内(/ad 投票"动作发生在哪个主群就只在哪个主群处理",不跨群广播)
@@ -3515,11 +3519,12 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 
 	// 7. 评级决策:
 	//    - preAssessedThreat(兼容旧调用点:外部已评级)→ 直接采用,不再调 AI;
-	//    - 普通用户通道 → 仅 AI 明确 A/B 弹投票;C/D → 无害收尾;AI 失败/无法识别/拒答 → 未评级收尾
-	//      (与旧"仅 A/B 弹投票,其余完全静默"的触发口径一致,区别是现在通过编辑占位给出可见反馈);
+	//    - 普通用户通道(userReportMode)→ AI 明确 A/B 弹投票;unrecognized(AI 拒答/道德围墙/
+	//      无法解析,内容可能确实违规才触发)→ 沿用仓库评级语义按 B 危险弹投票;AI 明确 C/D →
+	//      ✅ 无害收尾;仅 AI 基础设施失败(null)→ ⚠️ 未评级收尾(后两者不建投票 state、不写 KV);
 	//    - 有举报权限通道 → 评级只决定门槛,一律弹投票(AI成功按评级 / unrecognized→B / 失败→C / 无内容→C)。
 	let threat = null;
-	let closeKind = null; // 'harmless'=明确无害 | 'unassessable'=AI无法评级 | null=弹投票
+	let closeKind = null; // 'harmless'=明确无害 | 'unassessable'=AI基础设施失败(null) | null=弹投票
 	if (preAssessedThreat) {
 		threat = preAssessedThreat;
 		if (userReportMode && threat.level !== 'A' && threat.level !== 'B') {
@@ -3530,8 +3535,18 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 			threat = threatAssessment; // 明确 A/B → 弹投票
 		} else if (threatAssessment?.ok) {
 			closeKind = 'harmless'; // 明确 C/D → 无害收尾
+		} else if (threatAssessment?.code === 'unrecognized') {
+			// AI 拒答/返回无法识别(含道德围墙拒绝)→ 内容可能确实违规才触发,必须沿用仓库评级语义:
+			// 按 B 危险弹投票,不得降级为"无法评级"收尾(与下方有举报权限通道的 unrecognized→B 同构)。
+			threat = {
+				level: 'B',
+				label: AD_THREAT_RATINGS.B.label,
+				score: null,
+				reason: 'AI 无法识别或拒绝答复，按 B 危险处理',
+				threshold: AD_THREAT_RATINGS.B.votes
+			};
 		} else {
-			closeKind = 'unassessable'; // AI 失败/无法识别/拒答 → 未评级收尾,不弹投票
+			closeKind = 'unassessable'; // 仅 AI 基础设施失败(null,无 code)→ 未评级收尾,不弹投票
 		}
 	} else if (threatAssessment?.ok) {
 		threat = threatAssessment;
