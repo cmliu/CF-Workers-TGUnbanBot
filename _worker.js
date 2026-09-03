@@ -1075,8 +1075,9 @@ async function restoreUserInSingleMainGroup(chatId, userId, env) {
 // 群名显示通过 getChatInfoCached 复用永久缓存(0 额外请求);fallback 场景回退 chatId 避免多主群同显示。
 //
 // 多主群文案格式:每个主群独立一行(以 '\n' 分隔,不再是 ';'),成功/失败分别用 ✅/⚠️ 前缀区分;
-// 整个 message 渲染后是从上到下逐主群罗列的视觉结构,
-// 避免过去把多主群拼成单行、用 ';' 隔开导致的拥挤感(用户截图反馈)。
+// 整个 message 渲染后是从上到下逐主群罗列的视觉结构。
+// 行内不再写 "主群" 前缀,因为消息本身是由"自助解封主群广播"调用方触发,
+// 受众是各主群管理员,语义上下文已明确是"各主群处理结果",前缀显得冗余(用户反馈)。
 //
 // 用户标识(tgid @ 链接)由外层调用方负责展示一次,message 本身不再内嵌:
 //   - 自助解封主群广播:首行 "用户 <a>X</a> 已通过自助解封" 已含;
@@ -1091,10 +1092,10 @@ async function restoreUserInAllMainGroups(userId, env) {
 		const info = await getChatInfoCached(chatId);
 		const label = info?.fromFallback ? result.chatId : info.title;
 		if (result.actions.length > 0) {
-			allActions.push(`✅ 主群 ${label}: ${result.actions.join('，')}`);
+			allActions.push(`✅ ${label}: ${result.actions.join('，')}`);
 		}
 		if (result.failures.length > 0) {
-			allFailures.push(`⚠️ 主群 ${label}: ${result.failures.join('；')}`);
+			allFailures.push(`⚠️ ${label}: ${result.failures.join('；')}`);
 		}
 	}
 
@@ -1928,7 +1929,12 @@ async function handleMessage(message, env) {
 			try {
 				await muteChatMember(chatId, repliedUserId);
 				await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.MUTED);
-				await sendTelegramMessage(chatId, `✅ 已在群内禁言 <a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>\n📌 本群状态: 禁言`);
+				// 群内禁言通知:有 reply_to_message.from 用户对象,用 formatUserLabel 展示 "用户名(TGID)"
+				// 比裸 TGID 链接更直观;无 reply(理论上不会走到这里,前置已校验)时回退到 ID 链接。
+				const muteUserLabel = message.reply_to_message?.from
+					? formatUserLabel(message.reply_to_message.from)
+					: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
+				await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本群状态: 禁言`);
 			} catch (error) {
 				await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
 			}
@@ -1957,17 +1963,22 @@ async function handleMessage(message, env) {
 		}
 
 		const result = await addToBlacklist(repliedUserId, env, 'spam', message.from.id);
-		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
+		// 群内禁言/拉黑通知:reply 触发下 message.reply_to_message.from 可拿到被处理用户对象,
+		// 用 formatUserLabel 输出 "用户名(TGID)" 比裸 TGID 链接更直观;addToBlacklist success 文案沿用
+		// 同样格式;禁言子消息也复用同一变量避免风格不一致。
+		const spamUserLabel = message.reply_to_message?.from
+			? formatUserLabel(message.reply_to_message.from)
+			: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success) {
-			let responseMessage = `✅ 已将用户 ${linkedUserId} 添加到黑名单`;
+			let responseMessage = `✅ 已将用户 ${spamUserLabel} 添加到黑名单`;
 			// 主群(任一)内 /spam = 拉黑 + 群内即时禁言(与 /ban 一致):
 			// 禁言成功后同步本群状态"禁言",避免"已拉黑(is_blacklisted=1)却仍在主群自由发言"的漏洞。
 			if (isManagedGroupMessage(message)) {
 				try {
 					await muteChatMember(chatId, repliedUserId);
 					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
-					responseMessage += `\n✅ 已在群内禁言 <a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
+					responseMessage += `\n✅ 已在群内禁言 ${spamUserLabel}`;
 				} catch (error) {
 					console.error('群内禁言失败:', error);
 					if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
@@ -1979,7 +1990,7 @@ async function handleMessage(message, env) {
 			}
 			await sendTelegramMessage(chatId, responseMessage);
 		} else {
-			await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${linkedUserId}`);
+			await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}`);
 		}
 		return;
 	}
@@ -2361,23 +2372,25 @@ async function handleMessage(message, env) {
 
 		// 恢复用户在全部主群的群内状态(逐主群 getChatMember → unban/restrict → 回写"健康"):
 		// 旧单群版按单一 GROUP_ID 的 kicked/restricted/left/member 分支处理;
-		// 多主群版遍历 GROUP_ID_SET,各群动作与失败明细由 restoreUserInAllMainGroups 聚合。
+// 多主群版遍历 GROUP_ID_SET,各群动作与失败明细由 restoreUserInAllMainGroups 聚合。
+	try {
+		const restoreResult = await restoreUserInAllMainGroups(userId, env);
+		await sendTelegramMessage(chatId, restoreResult.message);
+		// 系统后台通知(实际执行过恢复动作或存在失败)→ 广播到所有主群,任一主群管理员可见
+		if (restoreResult.notifyMainGroups) {
+			// 私聊自助解封场景:message.from 即发起解封的用户本人,用 formatUserLabel 输出
+			// "用户名(TGID)" 格式,比裸 TGID 更直观(用户反馈);getChatMember 之类的额外 API 不需要。
+			await broadcastToMainGroups(env, `用户 ${formatUserLabel(message.from)} 已通过自助解封\n${restoreResult.message}`);
+		}
+	} catch (error) {
+		console.error('自助解封恢复失败:', error);
+		// 兜底:尽力再逐主群恢复一次;仍失败则提示联系管理员
 		try {
 			const restoreResult = await restoreUserInAllMainGroups(userId, env);
 			await sendTelegramMessage(chatId, restoreResult.message);
-			// 系统后台通知(实际执行过恢复动作或存在失败)→ 广播到所有主群,任一主群管理员可见
 			if (restoreResult.notifyMainGroups) {
-				await broadcastToMainGroups(env, `用户 <a href="tg://user?id=${userId}">${userId}</a> 已通过自助解封\n${restoreResult.message}`);
+				await broadcastToMainGroups(env, `用户 ${formatUserLabel(message.from)} 已通过自助解封(降级路径)\n${restoreResult.message}`);
 			}
-		} catch (error) {
-			console.error('自助解封恢复失败:', error);
-			// 兜底:尽力再逐主群恢复一次;仍失败则提示联系管理员
-			try {
-				const restoreResult = await restoreUserInAllMainGroups(userId, env);
-				await sendTelegramMessage(chatId, restoreResult.message);
-				if (restoreResult.notifyMainGroups) {
-					await broadcastToMainGroups(env, `用户 <a href="tg://user?id=${userId}">${userId}</a> 已通过自助解封(降级路径)\n${restoreResult.message}`);
-				}
 			} catch (restoreError) {
 				console.error('自助解封降级恢复失败:', restoreError);
 				await sendTelegramMessage(
