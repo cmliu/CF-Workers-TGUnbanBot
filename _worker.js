@@ -1,19 +1,20 @@
 // Telegram Bot Token
 let BOT_TOKEN;
-// 群组ID
+// 群组ID(原始配置串,保留作日志/兼容别名;权威数据源为下方 GROUP_ID_SET)
 let GROUP_ID;
+// 多主群 chatId 字符串数组(权威数据源):由 GROUP_ID 按英文逗号拆分、trim、去空、Set 去重保序得到。
+// 数组内所有主群完全对等处理;解析后为空集合 → 启动即拒(与缺失 GROUP_ID 报错一致)。
+let GROUP_ID_SET = [];
 // 机器人用户名缓存
 let BOT_USERNAME = null;
 let BOT_ID = null;
-// 群组信息缓存
-let GROUP_TITLE = null;
-let GROUP_USERNAME = null;
 
 // ========================================================
 // 隐藏 /ad 举报投票功能
 // ========================================================
 // 概要:
-// - 管理员在 GROUP_ID 群内回复消息(或带参数)发送 /ad,发起一次隐藏的举报投票。
+// - 任一主群(GROUP_ID_SET 内)管理员回复消息(或带参数)发送 /ad,发起一次隐藏的举报投票。
+//   /ad 动作只在其发起的主群内生效/展示,不跨群广播。
 // - 回复场景:把被举报内容发给 Workers AI(模型由 AD_AI_MODEL 配置,默认 @cf/openai/gpt-oss-20b),
 //   由 AI 按群规判断威胁评级(0~100 分),评级决定本次投票的生效阈值:
 //     🔴A 高危 = 2 票  🟠B 危险 = 4 票  🟡C 可疑 = 6 票  🔵D 未知 = 8 票
@@ -127,7 +128,7 @@ let groupAdminChecker = null;
 function setGroupAdminChecker(fn) {
 	groupAdminChecker = typeof fn === 'function' ? fn : null;
 }
-// 同步判断某 tgid 是否为 GROUP_ID 群管理员(钩子未注入时恒 false,不抛错)
+// 同步判断某 tgid 是否为任一主群(GROUP_ID_SET)的管理员(钩子未注入时恒 false,不抛错)
 async function isGroupAdmin(tgid) {
 	if (!groupAdminChecker) return false;
 	try {
@@ -522,7 +523,7 @@ async function recordUserActivity(message, env) {
 		}
 		const existingGroup = groupIds.find((g) => g.id === chatIdStr);
 		// 管理员在群内发言 → 标记"管理员";普通成员 → "健康"
-		// (管理员豁免:即使 DB 中残留禁言/封禁标记,发言时也回正为"管理员")
+		// (管理员豁免:任一主群管理员即使 DB 中残留禁言/封禁标记,发言时也回正为"管理员")
 		const isAdmin = await isGroupAdmin(tgid);
 		// 白名单豁免保持:被管理员显式加入本群白名单的用户,其"白名单"状态不因发言回正为"健康",
 		// 否则下一条消息会被"联网黑名单自动查杀"再次禁言(白名单 = 本群免查杀豁免)。
@@ -576,7 +577,7 @@ async function recordUserActivity(message, env) {
 }
 
 // 管理员黑名单数据修复:将 is_blacklisted 清 0(保留 ban_reason/banned_at/banned_by 作审计痕迹)。
-// 识别到 GROUP_ID 群管理员时调用,保证数据层与查询层一致(管理员 is_blacklisted 恒为 0,
+// 识别到任一主群管理员时调用,保证数据层与查询层一致(主群管理员 is_blacklisted 恒为 0,
 // D1 控制台/任何直接读库的路径看到的都是 0,而非仅查询层豁免)。
 // 与 /unban 不同:不写 last_unban_at/unbanned_by(这是系统自动豁免,不是管理员的解封动作)。
 // 返回 true 表示实际清除了脏数据,false 表示无需处理(本就为 0 或用户不存在或失败)。
@@ -599,7 +600,7 @@ async function dbClearBlacklistStatus(env, tgid) {
 }
 
 // D1 版黑名单查询(带 5s 实例级缓存);无 D1 绑定直接返回未命中(上层 hasDb 已分流,此处为防御)
-// 管理员豁免:即使 DB 中 is_blacklisted=1,GROUP_ID 群管理员也永远视为未拉黑(查询结果恒为 0)。
+// 管理员豁免:即使 DB 中 is_blacklisted=1,任一主群管理员也永远视为未拉黑(查询结果恒为 0)。
 // 豁免在写入层(dbAddToBlacklist)已拒绝管理员入库,这里兜底历史数据/绕过写入层的存量脏数据,
 // 并在命中时顺手把数据层 is_blacklisted 清 0(一次查询即修复,下次控制台刷新即见 0)。
 async function dbCheckBlacklist(env, userId) {
@@ -617,7 +618,7 @@ async function dbCheckBlacklist(env, userId) {
 		let isBlacklisted = Boolean(row?.is_blacklisted);
 		const banReason = row?.ban_reason || '';
 		const bannedAt = row?.banned_at || 0;
-		// 命中黑名单 → 复核是否为 GROUP_ID 群管理员,是则视为未拉黑并修复数据层(管理员 is_blacklisted 永远为 0)
+		// 命中黑名单 → 复核是否为任一主群管理员,是则视为未拉黑并修复数据层(主群管理员 is_blacklisted 永远为 0)
 		if (isBlacklisted && await isGroupAdmin(tgid)) {
 			console.log(`[DB] 黑名单豁免: tgid=${tgid} 是群组管理员,视为未拉黑`);
 			isBlacklisted = false;
@@ -635,7 +636,7 @@ async function dbCheckBlacklist(env, userId) {
 
 // D1 版添加黑名单:source ∈ ad/spam/ban,映射 ban_reason 并记录封禁时间与处理人 tgid
 // operatorId: 处理人 tgid(溯源)——/ad 传举报发起人, /spam、/ban 传操作管理员
-// 管理员豁免:GROUP_ID 群管理员(含群主)一律拒绝加入黑名单(写入层保证 is_blacklisted 恒为 0)
+// 管理员豁免:任一主群管理员(含群主)一律拒绝加入黑名单(写入层保证 is_blacklisted 恒为 0)
 async function dbAddToBlacklist(env, userId, source, operatorId) {
 	if (!hasDb(env)) return { success: false, message: '❌ 未绑定D1数据库' };
 	const tgid = String(userId);
@@ -755,6 +756,345 @@ async function dbIsAdAllowlisted(env, userId) {
 }
 // [DB-LAYER-END]
 
+// ========================================================
+// 多主群核心辅助(纯逻辑/系统广播/群信息聚合;供业务层与 QA 静态切片)
+// ========================================================
+// 概要:
+// - GROUP_ID_SET 为唯一权威主群数据源,数组内所有主群完全对等;
+// - 管理员豁免 = 任一主群管理员;命令权限口径 = 任一主群管理员;
+// - 系统后台通知(如自助解封后向主群上报、GKY 二次审核上报)→ 广播到所有主群;
+// - /ad 投票等"动作发生在哪个主群就只在哪个主群处理",不跨群广播。
+
+// 解析 GROUP_ID 环境变量(英文逗号分隔的多主群数组)为规范化 chatId 字符串数组:
+// - 按英文逗号拆分,trim 每段,跳过空段,Set 去重并保持首次出现顺序;
+// - 无逗号的单值完全兼容;全角逗号/中文逗号等非英文逗号不参与拆分(视为单值的一部分)。
+function parseGroupIdSet(raw) {
+	if (raw === undefined || raw === null) return [];
+	const seen = new Set();
+	const result = [];
+	for (const part of String(raw).split(',')) {
+		const trimmed = part.trim();
+		if (trimmed === '') continue;
+		if (seen.has(trimmed)) continue;
+		seen.add(trimmed);
+		result.push(trimmed);
+	}
+	return result;
+}
+
+// 判断 id(或含 id 的 chat 对象)是否属于任一主群(GROUP_ID_SET)。
+// 集合为空时恒 false(配置层保证解析后非空才会运行,此处仅为防御)。
+function isMainGroup(idOrChat) {
+	if (idOrChat === undefined || idOrChat === null) return false;
+	const id = typeof idOrChat === 'object' ? idOrChat?.id : idOrChat;
+	if (id === undefined || id === null) return false;
+	return GROUP_ID_SET.includes(String(id));
+}
+
+// 系统后台通知广播到所有主群(如私聊自助解封后的处理结果上报、GKY 二次审核上报):
+// for-of GROUP_ID_SET 逐个 sendTelegramMessage;单群失败仅记日志,不抛错、不中断后续群。
+async function broadcastToMainGroups(env, text, replyMarkup, replyToMessageId) {
+	const sentChatIds = [];
+	for (const chatId of GROUP_ID_SET) {
+		try {
+			await sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId);
+			sentChatIds.push(chatId);
+		} catch (error) {
+			console.error(`[广播] 向主群 ${chatId} 发送系统通知失败(不中断后续主群):`, error.message);
+		}
+	}
+	return sentChatIds;
+}
+
+// 查询某用户在指定群的 getChatMember 原始结果(取代单群固定 GROUP_ID 的 checkUserStatus)。
+// 与旧 checkUserStatus 语义一致:HTTP 非 2xx / result.ok=false 时抛错,由调用方决定降级策略。
+async function checkUserStatusInChat(chatId, userId) {
+	const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`;
+	const body = {
+		chat_id: chatId,
+		user_id: userId
+	};
+
+	const response = await fetch(url, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+
+	const result = await response.json();
+
+	if (!response.ok) {
+		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
+	}
+
+	return result;
+}
+
+// 检查用户是否助推过指定群(getUserChatBoosts 需要机器人是该群管理员;失败返回 false,不抛错)
+async function checkIfUserBoostedInChat(chatId, userId) {
+	try {
+		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUserChatBoosts`;
+		const body = {
+			chat_id: chatId,
+			user_id: userId
+		};
+
+		console.log(`[/ad] getUserChatBoosts 请求: chat_id=${chatId}, user_id=${userId}`);
+
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+
+		const result = await response.json();
+		console.log(`[/ad] getUserChatBoosts 响应: HTTP=${response.status}, ok=${result.ok}, result=${JSON.stringify(result.result)}`);
+
+		if (!response.ok || !result.ok) {
+			console.error('[/ad] getUserChatBoosts 失败:', JSON.stringify(result));
+			return false;
+		}
+
+		const boostCount = Array.isArray(result.result?.boosts) ? result.result.boosts.length : 0;
+		console.log(`[/ad] 用户 ${userId} 当前有效助推数: ${boostCount}`);
+		return boostCount > 0;
+	} catch (error) {
+		console.error('[/ad] 检查用户助推状态时出错:', error.message, error.stack);
+		return false;
+	}
+}
+
+// 任一主群管理员名单缓存(按主群 chatId 缓存,每主群 60s TTL):
+// getChatAdministrators(chat_id=各主群)取 creator/administrator 的 user.id 入 Set;
+// 成本 = 每主群每 60s 1 次 Telegram API,与用户/消息数量无关(防 API 配额放大)。
+// 失效 = 纯 TTL;获取失败 → 按空名单 + 记日志降级(fail-closed:该群视为无管理员,不抛错中断)。
+const MAIN_GROUP_ADMIN_CACHE_TTL_MS = 60000;
+const mainGroupAdminCache = new Map(); // chatId(string) -> { admins:Set<string>, fetchedAt:number }
+async function getMainGroupAdminSet(chatId) {
+	const key = String(chatId);
+	const now = Date.now();
+	const cached = mainGroupAdminCache.get(key);
+	if (cached && (now - cached.fetchedAt) < MAIN_GROUP_ADMIN_CACHE_TTL_MS) {
+		return cached.admins;
+	}
+	const admins = new Set();
+	try {
+		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`;
+		const body = { chat_id: chatId };
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		if (response.ok && result.ok && Array.isArray(result.result)) {
+			for (const admin of result.result) {
+				const uid = admin?.user?.id;
+				if (uid === undefined || uid === null) continue;
+				if (admin.status === 'creator' || admin.status === 'administrator') {
+					admins.add(String(uid));
+				}
+			}
+		} else {
+			// 获取失败 → 空名单 + 记日志降级(fail-closed,不抛错中断)
+			console.error(`[管理员判定] 获取主群 ${chatId} 管理员名单失败(按空名单降级): HTTP=${response.status}, body=${JSON.stringify(result)}`);
+		}
+	} catch (error) {
+		console.error(`[管理员判定] 获取主群 ${chatId} 管理员名单异常(按空名单降级):`, error.message);
+	}
+	mainGroupAdminCache.set(key, { admins, fetchedAt: now });
+	return admins;
+}
+
+// 用户是否为任一主群的群主/管理员(遍历 GROUP_ID_SET 各取名单 Set.has)。
+async function checkIfUserIsAdminInAnyMainGroup(userId) {
+	const tgid = String(userId);
+	for (const chatId of GROUP_ID_SET) {
+		const admins = await getMainGroupAdminSet(chatId);
+		if (admins.has(tgid)) return true;
+	}
+	return false;
+}
+
+// 群组信息实例级缓存(按 chatId):title 取群名,username 带 @ 前缀(与既有 getGroupInfo 格式一致)。
+// 获取失败回退默认文案(与旧行为一致:不因 getChat 失败阻断业务流程)。
+const groupInfoCache = new Map(); // chatId(string) -> { chatId, title, username }
+async function getChatInfoCached(chatId) {
+	const key = String(chatId);
+	if (groupInfoCache.has(key)) {
+		return groupInfoCache.get(key);
+	}
+	try {
+		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChat`;
+		const body = { chat_id: chatId };
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+		const result = await response.json();
+		if (response.ok && result.ok && result.result) {
+			const info = {
+				chatId: key,
+				title: result.result.title || 'CM技术交流群',
+				username: result.result.username ? `@${result.result.username}` : '@CMLiussss'
+			};
+			groupInfoCache.set(key, info);
+			return info;
+		}
+		console.error('获取群组信息失败:', result);
+	} catch (error) {
+		console.error('获取群组信息时出错:', error.message);
+	}
+	const fallback = { chatId: key, title: 'CM技术交流群', username: '@CMLiussss' };
+	groupInfoCache.set(key, fallback);
+	return fallback;
+}
+
+// 获取群组信息(默认首个主群;兼容旧调用方无参;返回 { title, username })
+async function getGroupInfo(chatId) {
+	const target = chatId === undefined || chatId === null ? (GROUP_ID_SET[0] ?? GROUP_ID) : chatId;
+	if (target === undefined || target === null) {
+		return { title: 'CM技术交流群', username: '@CMLiussss' };
+	}
+	return await getChatInfoCached(target);
+}
+
+// 列出全部主群信息(私聊 DM 文案 / 多群提示用):逐主群 getChat → [{chatId,title,username}]
+async function listMainGroupInfos(env) {
+	const infos = [];
+	for (const chatId of GROUP_ID_SET) {
+		infos.push(await getChatInfoCached(chatId));
+	}
+	return infos;
+}
+
+// 把主群列表渲染为可读文案:单群返回 `@username`,多群返回 `@a、@b、@c`;失败回退 chatId。
+function formatMainGroupsHint(infos) {
+	if (!Array.isArray(infos) || infos.length === 0) return '';
+	const parts = infos.map((info) => info?.username || (info?.chatId ? `<code>${escapeHtml(info.chatId)}</code>` : ''));
+	return parts.filter(Boolean).join('、');
+}
+
+// 恢复单个主群中用户的群内状态(查状态 → 解封/解禁 → 状态回写"健康"),返回动作/失败明细。
+// 状态语义与旧单群 restoreUserInManagedGroup 完全一致(kicked/restricted/left/member/admin 分支)。
+async function restoreUserInSingleMainGroup(chatId, userId, env) {
+	const actions = [];
+	const failures = [];
+	let status = null;
+	let isMember = null;
+
+	try {
+		const statusResult = await checkUserStatusInChat(chatId, userId);
+		status = statusResult.result?.status || null;
+		isMember = statusResult.result?.is_member;
+	} catch (error) {
+		console.error(`查询主群 ${chatId} 群内状态失败:`, error.message);
+	}
+
+	if (status === 'kicked' || !status) {
+		try {
+			await unbanUserInChat(chatId, userId);
+			actions.push(`已解除群封禁`);
+			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY, chatId);
+		} catch (error) {
+			console.error('群内解除封禁失败:', error.message);
+			failures.push(`解除封禁失败: ${escapeHtml(error.message)}`);
+		}
+	}
+
+	if (status === 'restricted' && isMember !== false) {
+		try {
+			await restrictUserInChat(chatId, userId);
+			actions.push(`已恢复发言权限`);
+			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY, chatId);
+		} catch (error) {
+			console.error('群内恢复权限失败:', error.message);
+			failures.push(`恢复发言权限失败: ${escapeHtml(error.message)}`);
+		}
+	}
+
+	if (status === 'left') {
+		actions.push(`用户当前不在群内，且未处于封禁状态`);
+	}
+
+	if (status === 'member') {
+		actions.push(`用户当前未被封禁或禁言`);
+	}
+
+	if (status === 'administrator' || status === 'creator') {
+		actions.push(`用户是群管理员，未调整群权限`);
+	}
+
+	if (status === 'restricted' && isMember === false) {
+		try {
+			await unbanUserInChat(chatId, userId);
+			actions.push(`已解除群封禁`);
+			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY, chatId);
+		} catch (error) {
+			console.error('群内解除封禁失败:', error.message);
+			failures.push(`解除封禁失败: ${escapeHtml(error.message)}`);
+		}
+	}
+
+	if (!status) {
+		try {
+			await restrictUserInChat(chatId, userId);
+			actions.push(`已尝试恢复发言权限`);
+			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY, chatId);
+		} catch (error) {
+			console.error('群内恢复权限失败:', error.message);
+			failures.push(`恢复发言权限失败: ${escapeHtml(error.message)}`);
+		}
+	}
+
+	return { chatId: String(chatId), actions, failures };
+}
+
+// 恢复用户在全部主群的状态(unban 解封 / restrict 解除禁言):逐主群处理 + 聚合文案。
+// 返回 { success, notifyMainGroups, message };notifyMainGroups=是否实际执行过恢复动作/存在失败
+// (供"自助解封处理后是否需要向主群广播系统通知"判断);message 汇总各群动作与失败明细。
+async function restoreUserInAllMainGroups(userId, env) {
+	const allActions = [];
+	const allFailures = [];
+	for (const chatId of GROUP_ID_SET) {
+		const result = await restoreUserInSingleMainGroup(chatId, userId, env);
+		if (result.actions.length > 0) {
+			allActions.push(`主群 ${result.chatId}: ${result.actions.join('，')}`);
+		}
+		if (result.failures.length > 0) {
+			allFailures.push(`主群 ${result.chatId}: ${result.failures.join('；')}`);
+		}
+	}
+
+	if (allFailures.length > 0 && allActions.length === 0) {
+		return {
+			success: false,
+			notifyMainGroups: true,
+			message: `⚠️ 群内解封禁失败：${allFailures.join('；')}`
+		};
+	}
+	if (allFailures.length > 0) {
+		return {
+			success: false,
+			notifyMainGroups: true,
+			message: `⚠️ ${allActions.join('，')}；但${allFailures.join('；')}`
+		};
+	}
+	if (allActions.length === 0) {
+		return {
+			success: true,
+			notifyMainGroups: false,
+			message: `✅ 已确认全部主群权限无需调整：<a href="tg://user?id=${userId}">${userId}</a>`
+		};
+	}
+	return {
+		success: true,
+		notifyMainGroups: true,
+		message: `✅ ${allActions.join('；')}：<a href="tg://user?id=${userId}">${userId}</a>`
+	};
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
@@ -769,7 +1109,8 @@ export default {
 			const config = loadRequiredConfig(env);
 			TOKEN = config.TOKEN;
 			BOT_TOKEN = config.BOT_TOKEN;
-			GROUP_ID = config.GROUP_ID;
+			GROUP_ID = config.GROUP_ID; // 原始配置串(日志/兼容别名)
+			GROUP_ID_SET = config.GROUP_ID_SET; // 权威主群集合
 		} catch (error) {
 			return jsonResponse({
 				success: false,
@@ -841,10 +1182,18 @@ function loadRequiredConfig(env) {
 		throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
 	}
 
+	const rawGroupId = String(env.GROUP_ID).trim();
+	// 解析多主群集合:空集合(如纯逗号/空白输入)→ 与缺失 GROUP_ID 同等拒绝,启动即报错。
+	const groupIdSet = parseGroupIdSet(rawGroupId);
+	if (groupIdSet.length === 0) {
+		throw new Error('Invalid required environment variable: GROUP_ID (至少配置一个主群 chatId,多个用英文逗号分隔)');
+	}
+
 	return {
 		TOKEN: String(env.TOKEN).trim(),
 		BOT_TOKEN: String(env.BOT_TOKEN).trim(),
-		GROUP_ID: String(env.GROUP_ID).trim()
+		GROUP_ID: rawGroupId,
+		GROUP_ID_SET: groupIdSet
 	};
 }
 
@@ -1115,8 +1464,10 @@ function parseCommand(text, command) {
 	};
 }
 
+// 是否"被管理消息":消息发生在任一主群(GROUP_ID_SET)。
+// 函数名保留(外部 QA 源码锚点依赖);判断来源已从单一 GROUP_ID 改为多主群集合语义。
 function isManagedGroupMessage(message) {
-	return message.chat.id.toString() === GROUP_ID.toString();
+	return isMainGroup(message?.chat?.id);
 }
 
 function isPrivateOrManagedGroup(message) {
@@ -1128,7 +1479,7 @@ function getCommandTargetUserId(command, message) {
 		return command.firstArg;
 	}
 
-	// 群聊(含 GROUP_ID 与其他群)支持回复取目标用户;私聊无回复目标返回空
+	// 群聊(含主群(任一)与其他群)支持回复取目标用户;私聊无回复目标返回空
 	if (!message.chat || (message.chat.type !== 'group' && message.chat.type !== 'supergroup')) {
 		return '';
 	}
@@ -1137,123 +1488,38 @@ function getCommandTargetUserId(command, message) {
 	return repliedUserId ? repliedUserId.toString() : '';
 }
 
-// 业务层辅助:成功执行群内操作后,同步标记该用户在 GROUP_ID 群的状态(仅 DB 模式生效)。
-// 传入的 status 必须是 GROUP_MEMBER_STATUS 四态之一;标记失败仅记日志,不阻塞主流程。
-async function markUserGroupStatus(env, userId, status) {
+// 业务层辅助:成功执行群内操作后,同步标记该用户在指定群(chatId)的状态(仅 DB 模式生效)。
+// 传入的 status 必须是 GROUP_MEMBER_STATUS 四态之一;chatId 必传(标记发生在哪个群就写哪个群);
+// 标记失败仅记日志,不阻塞主流程。
+async function markUserGroupStatus(env, userId, status, chatId) {
 	if (!isDbReady(env)) return;
+	if (chatId === undefined || chatId === null) return;
 	try {
-		await dbSetUserGroupStatus(env, userId, GROUP_ID, status);
+		await dbSetUserGroupStatus(env, userId, chatId, status);
 	} catch (error) {
 		console.error('[DB] 标记群状态失败:', error.message);
 	}
 }
 
+// 尽力获取某用户在任一主群的 user 对象(用于 /check 等场景展示资料):
+// 逐主群 getChatMember,取第一个能返回 user 的群;查询失败/用户不在群则继续尝试下一个主群。
 async function getManagedGroupUser(userId) {
-	try {
-		const statusResult = await checkUserStatus(userId);
-		return statusResult.result?.user || null;
-	} catch (error) {
-		console.error('获取群成员用户信息失败:', error);
-		return null;
+	for (const chatId of GROUP_ID_SET) {
+		try {
+			const statusResult = await checkUserStatusInChat(chatId, userId);
+			if (statusResult?.result?.user) {
+				return statusResult.result.user;
+			}
+		} catch (error) {
+			// 用户不在该主群(getChatMember 400)或网络异常 → 尝试下一个主群
+			console.log(`获取群成员用户信息失败(主群 ${chatId}):`, error.message);
+		}
 	}
+	return null;
 }
 
-// 恢复用户在 GROUP_ID 群的状态(unban 解封 / restrict 解除禁言)。
-// env:每次成功执行恢复操作后,同步把该用户在本群状态标记为"健康"。
-async function restoreUserInManagedGroup(userId, env) {
-	let status = null;
-	let isMember = null;
-	const actions = [];
-	const failures = [];
-
-	try {
-		const statusResult = await checkUserStatus(userId);
-		status = statusResult.result?.status || null;
-		isMember = statusResult.result?.is_member;
-	} catch (error) {
-		console.error('查询群内状态失败:', error);
-	}
-
-	if (status === 'kicked' || !status) {
-		try {
-			await unbanUser(userId);
-			actions.push(`已解除群封禁`);
-			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
-		} catch (error) {
-			console.error('群内解除封禁失败:', error);
-			failures.push(`解除封禁失败: ${escapeHtml(error.message)}`);
-		}
-	}
-
-	if (status === 'restricted' && isMember !== false) {
-		try {
-			await restrictUser(userId);
-			actions.push(`已恢复发言权限`);
-			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
-		} catch (error) {
-			console.error('群内恢复权限失败:', error);
-			failures.push(`恢复发言权限失败: ${escapeHtml(error.message)}`);
-		}
-	}
-
-	if (status === 'left') {
-		actions.push(`用户当前不在群内，且未处于封禁状态`);
-	}
-
-	if (status === 'member') {
-		actions.push(`用户当前未被封禁或禁言`);
-	}
-
-	if (status === 'administrator' || status === 'creator') {
-		actions.push(`用户是群管理员，未调整群权限`);
-	}
-
-	if (status === 'restricted' && isMember === false) {
-		try {
-			await unbanUser(userId);
-			actions.push(`已解除群封禁`);
-			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
-		} catch (error) {
-			console.error('群内解除封禁失败:', error);
-			failures.push(`解除封禁失败: ${escapeHtml(error.message)}`);
-		}
-	}
-
-	if (!status) {
-		try {
-			await restrictUser(userId);
-			actions.push(`已尝试恢复发言权限`);
-			await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
-		} catch (error) {
-			console.error('群内恢复权限失败:', error);
-			failures.push(`恢复发言权限失败: ${escapeHtml(error.message)}`);
-		}
-	}
-
-	if (actions.length === 0 && failures.length === 0) {
-		actions.push(`已确认群权限无需调整`);
-	}
-
-	if (failures.length > 0 && actions.length === 0) {
-		return {
-			success: false,
-			message: `⚠️ 群内解封禁失败：${failures.join('；')}`
-		};
-	}
-
-	if (failures.length > 0) {
-		return {
-			success: false,
-			message: `⚠️ ${actions.join('，')}；但${failures.join('；')}`
-		};
-	}
-
-	return {
-		success: true,
-		message: `✅ ${actions.join('，')}：<a href="tg://user?id=${userId}">${userId}</a>`
-	};
-}
-
+// 恢复用户在全部主群的状态(restoreUserInAllMainGroups)已在多主群核心辅助区定义,
+// 旧单群版 restoreUserInManagedGroup 已废弃删除(调用点统一改走逐主群恢复)。
 function escapeHtml(value) {
 	return String(value ?? '')
 		.replace(/&/g, '&amp;')
@@ -1372,7 +1638,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 	// GKYbot 解封操作
 	if (banlistData.success && banlistData.banned) {
-		const 黑白名单 = banlistData.chatId == GROUP_ID ? '移出黑名单' : '添加白名单';
+		const 黑白名单 = GROUP_ID_SET.includes(String(banlistData.chatId)) ? '移出黑名单' : '添加白名单';
 		const copyText = `GKYbotSave\n${banlistData.tgid}`;
 		if (options.actionInCurrentChat) {
 			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请在本群发送下方复制的代码。`;
@@ -1399,7 +1665,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 const BOT_MODERATION_LOG_LABELS = {
 	'new-members:found': '检测到新成员入群消息',
-	'skip:new-members-not-target-chat': '跳过：新成员消息不在配置的 GROUP_ID 群',
+	'skip:new-members-not-target-chat': '跳过：新成员消息不在任一主群',
 	'skip:new-member-without-id': '跳过：新成员缺少用户 ID，无法处理',
 	'skip:new-member-not-blacklisted': '跳过：新入群普通用户不在本地黑名单，正常放行',
 	'skip:new-member-self': '跳过：新成员是当前机器人自己',
@@ -1436,6 +1702,7 @@ function getMessageLogInfo(message) {
 		聊天ID: chat?.id,
 		聊天类型: chat?.type,
 		配置GROUP_ID: GROUP_ID,
+		配置GROUP_ID_SET: GROUP_ID_SET,
 		发送者ID: sender?.id,
 		发送者用户名: sender?.username,
 		发送者昵称: sender?.first_name,
@@ -1467,9 +1734,9 @@ async function handleNewChatMemberBots(message, env) {
 		新成员数量: newMembers.length
 	});
 
-	if (!chat || chat.id.toString() !== GROUP_ID.toString()) {
+	if (!chat || !isMainGroup(chat.id)) {
 		logBotModeration('skip:new-members-not-target-chat', getMessageLogInfo(message));
-		// 非 GROUP_ID 群:若 bot 是当前群管理员(且具备限制成员权限)→ 对入群真人成员执行
+		// 非主群群聊:若 bot 是当前群管理员(且具备限制成员权限)→ 对入群真人成员执行
 		// "联网黑名单自动查杀"(bot 身份/权限在函数内部判断,不满足则整群跳过,不误伤)。
 		try {
 			await handleNetworkBlacklistKill(chat, newMembers, env);
@@ -1501,8 +1768,8 @@ async function handleNewChatMemberBots(message, env) {
 					logBotModeration('action:ban-blacklisted-new-member:start', logInfo);
 					await banUserPermanently(chat.id, member.id);
 					logBotModeration('action:ban-blacklisted-new-member:success', logInfo);
-					// 入群拦截封禁成功 → 标记该用户在本群状态为"封禁"
-					await markUserGroupStatus(env, member.id, GROUP_MEMBER_STATUS.BANNED);
+					// 入群拦截封禁成功 → 标记该用户在本群(当前主群)状态为"封禁"
+					await markUserGroupStatus(env, member.id, GROUP_MEMBER_STATUS.BANNED, chat.id);
 				} else {
 					logBotModeration('skip:new-member-not-blacklisted', logInfo);
 				}
@@ -1525,12 +1792,10 @@ async function handleNewChatMemberBots(message, env) {
 
 		let isAdmin = false;
 		try {
-			const statusResult = await checkUserStatus(member.id);
-			const status = statusResult.result.status;
-			isAdmin = status === 'creator' || status === 'administrator';
+			// 新入群 bot 在"当前主群"的身份(per-chat 查询,不再依赖单一 GROUP_ID 单群封装)
+			isAdmin = await checkIfUserIsAdminInChat(member.id, chat.id);
 			logBotModeration('new-member-admin-status', {
 				...logInfo,
-				群成员状态: status,
 				是否管理员: isAdmin
 			});
 		} catch (error) {
@@ -1576,11 +1841,11 @@ async function handleMessage(message, env) {
 	const text = message.text;
 	const username = message.from.username || message.from.first_name || '用户';
 
-	// 联网黑名单自动查杀(消息路径):真人发送的每条消息(任意聊天,含 GROUP_ID 主群与其他群/私聊)
+	// 联网黑名单自动查杀(消息路径):真人发送的每条消息(任意聊天,含任一主群与其他群/私聊)
 	// 都过一遍查杀;是否真正触发由函数内部守卫决定(群聊类型 + 绑定 D1 + bot 是群管理员)。
 	// - 命令消息也会走到这里:命令发送者通常为本群管理员(不在 联网黑名单)或已被 TG API
 	//   拒绝禁言(管理员不可被 restrict),不会误杀;
-	// - 私聊/频道在函数内部按 chat.type 直接跳过;GROUP_ID 主群现在同样纳入查杀,命中即禁言。
+	// - 私聊/频道在函数内部按 chat.type 直接跳过;任一主群现在同样纳入查杀,命中即禁言。
 	try {
 		await handleNetworkBlacklistKill(message.chat, [message.from], env, message.message_id);
 	} catch (error) {
@@ -1588,13 +1853,13 @@ async function handleMessage(message, env) {
 	}
 
 	// 处理管理员 /spam:
-	// - GROUP_ID 群:添加被回复用户到 联网黑名单(可同步修改 is_blacklisted),并在群内即时禁言 +
+	// - 任一主群:添加被回复用户到 联网黑名单(可同步修改 is_blacklisted),并在该群即时禁言 +
 	//   状态"禁言"(与 /ban 行为一致,封堵"已拉黑却仍在主群自由发言"漏洞);
-	// - 非 GROUP_ID 群(bot 为该群管理员):仅本群禁言 + 状态"禁言",不修改 is_blacklisted。
+	// - 非主群(bot 为该群管理员):仅本群禁言 + 状态"禁言",不修改 is_blacklisted。
 	if (isSpamCommand(text)) {
-		const isGroupIdChat = chatId.toString() === GROUP_ID.toString();
+		const isGroupIdChat = isMainGroup(chatId);
 		if (!isGroupIdChat) {
-			// 非 GROUP_ID 群:模式触发条件 = bot 是该群管理员;仅维护本群状态,不同步 联网黑名单
+			// 非主群:模式触发条件 = bot 是该群管理员;仅维护本群状态,不同步 联网黑名单
 			if (message.chat.type !== 'group' && message.chat.type !== 'supergroup') {
 				return;
 			}
@@ -1627,8 +1892,8 @@ async function handleMessage(message, env) {
 
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
-			// 备用通道:非管理员但拥有 /ad 权限(群助推者或 /ad 白名单)→ 按 /ad 举报投票逻辑处理
-			const isBoosted = await checkIfUserBoosted(userId);
+			// 备用通道:非管理员但拥有 /ad 权限(当前所在主群助推者或 /ad 白名单)→ 按 /ad 举报投票逻辑处理
+			const isBoosted = await checkIfUserBoostedInChat(chatId, userId);
 			const isAllowed = await isAdAllowlisted(env, userId);
 			if (!isBoosted && !isAllowed) {
 				// 两者都不是→完全静默
@@ -1651,12 +1916,12 @@ async function handleMessage(message, env) {
 
 		if (result.success) {
 			let responseMessage = `✅ 已将用户 ${linkedUserId} 添加到黑名单`;
-			// GROUP_ID 主群内 /spam = 拉黑 + 群内即时禁言(与 /ban 一致):
+			// 主群(任一)内 /spam = 拉黑 + 群内即时禁言(与 /ban 一致):
 			// 禁言成功后同步本群状态"禁言",避免"已拉黑(is_blacklisted=1)却仍在主群自由发言"的漏洞。
 			if (isManagedGroupMessage(message)) {
 				try {
 					await muteChatMember(chatId, repliedUserId);
-					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.MUTED);
+					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
 					responseMessage += `\n✅ 已在群内禁言 <a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 				} catch (error) {
 					console.error('群内禁言失败:', error);
@@ -1674,15 +1939,15 @@ async function handleMessage(message, env) {
 		return;
 	}
 
-	// 处理 GROUP_ID 群内管理员 /ad - 发起隐藏的举报投票
+	// 处理任一主群内管理员 /ad - 发起隐藏的举报投票(动作只在该主群内生效,不跨群广播)
 	if (isAdCommand(text)) {
-		if (chatId.toString() !== GROUP_ID.toString()) {
+		if (!isMainGroup(chatId)) {
 			return;
 		}
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
-			// 非管理员→检查助推者 / 白名单
-			const isBoosted = await checkIfUserBoosted(userId);
+			// 非管理员→检查助推者(当前主群) / 白名单
+			const isBoosted = await checkIfUserBoostedInChat(chatId, userId);
 			const isAllowed = await isAdAllowlisted(env, userId);
 			if (!isBoosted && !isAllowed) {
 				// 普通用户举报通道:回复消息 + /ad → 内容交 AI 评级,仅 A/B 才弹投票,其余完全静默
@@ -1804,7 +2069,7 @@ async function handleMessage(message, env) {
 		// 检查是否有参数 (例如: /start check_8435016129)
 		const parts = text.split(' ');
 		if (parts.length > 1 && parts[1].startsWith('check_')) {
-			// 验证用户是否是群组管理员
+			// 验证用户是否是任一主群的管理员
 			const isAdmin = await checkIfUserIsAdmin(userId);
 
 			if (!isAdmin) {
@@ -1827,13 +2092,13 @@ async function handleMessage(message, env) {
 
 	const banCommand = parseCommand(text, 'ban');
 	// 处理 /ban 命令:
-	// - GROUP_ID 群/私聊:添加用户到 联网黑名单(可同步修改 is_blacklisted);
-	// - 非 GROUP_ID 群(bot 为该群管理员):仅本群封禁踢出 + 状态"封禁",不修改 is_blacklisted。
+	// - 主群(任一)/私聊:添加用户到 联网黑名单(可同步修改 is_blacklisted);
+	// - 非主群(bot 为该群管理员):仅本群封禁踢出 + 状态"封禁",不修改 is_blacklisted。
 	if (banCommand) {
-		const isGroupIdChat = chatId.toString() === GROUP_ID.toString();
+		const isGroupIdChat = isMainGroup(chatId);
 		const isGroupChat = message.chat.type === 'group' || message.chat.type === 'supergroup';
 
-		// 非 GROUP_ID 群:模式触发条件 = bot 是该群管理员;仅维护本群状态,不同步 联网黑名单
+		// 非主群:模式触发条件 = bot 是该群管理员;仅维护本群状态,不同步 联网黑名单
 		if (isGroupChat && !isGroupIdChat) {
 			if (!isDbReady(env)) {
 				return;
@@ -1866,7 +2131,7 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-		// 仅允许私聊或被管理的 GROUP_ID 群组内使用
+		// 仅允许私聊或主群(任一)内使用
 		if (!isPrivateOrManagedGroup(message)) {
 			return;
 		}
@@ -1874,8 +2139,8 @@ async function handleMessage(message, env) {
 		// 检查是否是群组管理员
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
-			// 备用通道:非管理员但拥有 /ad 权限(群助推者或 /ad 白名单)→ 按 /ad 举报投票逻辑处理
-			const isBoosted = await checkIfUserBoosted(userId);
+			// 备用通道:非管理员但拥有 /ad 权限(当前所在主群助推者或 /ad 白名单)→ 按 /ad 举报投票逻辑处理
+			const isBoosted = await checkIfUserBoostedInChat(chatId, userId);
 			const isAllowed = await isAdAllowlisted(env, userId);
 			if (isBoosted || isAllowed) {
 				// 按 /ad 举报投票逻辑处理;若为私聊,handleAdCommand 内部会静默 return(符合预期)
@@ -1908,8 +2173,8 @@ async function handleMessage(message, env) {
 			try {
 				await muteChatMember(chatId, targetUserId);
 				responseMessage += `\n✅ 已在群内禁言用户 <a href="tg://user?id=${targetUserId}">${targetUserId}</a>`;
-				// 群内禁言成功 → 标记该用户在本群状态为"禁言"
-				await markUserGroupStatus(env, targetUserId, GROUP_MEMBER_STATUS.MUTED);
+				// 群内禁言成功 → 标记该用户在本群(当前主群)状态为"禁言"
+				await markUserGroupStatus(env, targetUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
 			} catch (error) {
 				console.error('群内禁言失败:', error);
 				if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
@@ -1928,14 +2193,14 @@ async function handleMessage(message, env) {
 
 	const unbanCommand = parseCommand(text, 'unban');
 	// 处理 /unban 命令:
-	// - GROUP_ID 群/私聊:从 联网黑名单移除(可同步修改 is_blacklisted);
-	// - 非 GROUP_ID 群(bot 为该群管理员):本群白名单 + 解除封禁/禁言,不修改 is_blacklisted。
+	// - 主群(任一)/私聊:从 联网黑名单移除(可同步修改 is_blacklisted);
+	// - 非主群(bot 为该群管理员):本群白名单 + 解除封禁/禁言,不修改 is_blacklisted。
 	if (unbanCommand) {
 		const targetUserId = getCommandTargetUserId(unbanCommand, message);
-		const isGroupIdChat = chatId.toString() === GROUP_ID.toString();
+		const isGroupIdChat = isMainGroup(chatId);
 		const isGroupChat = message.chat.type === 'group' || message.chat.type === 'supergroup';
 
-		// 非 GROUP_ID 群:白名单模式(仅维护本群状态,不同步 联网黑名单)
+		// 非主群:白名单模式(仅维护本群状态,不同步 联网黑名单)
 		if (isGroupChat && !isGroupIdChat) {
 			if (!isDbReady(env)) {
 				return;
@@ -1978,7 +2243,7 @@ async function handleMessage(message, env) {
 
 		// 有参数或群内回复用户时，处理黑名单移除。
 		if (shouldHandleAdminUnban) {
-			// 仅允许私聊或被管理的 GROUP_ID 群组内使用
+			// 仅允许私聊或主群(任一)内使用
 			if (!isPrivateOrManagedGroup(message)) {
 				return;
 			}
@@ -2005,7 +2270,7 @@ async function handleMessage(message, env) {
 			let responseMessage = result.message;
 
 			if (result.success || result.notFound) {
-				const restoreResult = await restoreUserInManagedGroup(targetUserId, env);
+				const restoreResult = await restoreUserInAllMainGroups(targetUserId, env);
 				responseMessage += `\n${restoreResult.message}`;
 			}
 
@@ -2046,87 +2311,56 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-		// 发送确认消息
-		const groupInfo = await getGroupInfo();
-		await sendTelegramMessage(chatId, `✅ 已同意给予解封\n\n请点击 ${groupInfo.username} 返回群组\n\n⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`);
+		// 发送确认消息:列出全部主群入口,方便用户点击返回(旧单群版仅列固定 GROUP_ID)
+		const mainGroupInfos = await listMainGroupInfos(env);
+		const mainGroupsHint = formatMainGroupsHint(mainGroupInfos);
+		await sendTelegramMessage(chatId, `✅ 已同意给予解封\n\n请点击 ${mainGroupsHint} 返回群组\n\n⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`);
 
-		// 检查用户当前状态并采取相应操作
+		// 恢复用户在全部主群的群内状态(逐主群 getChatMember → unban/restrict → 回写"健康"):
+		// 旧单群版按单一 GROUP_ID 的 kicked/restricted/left/member 分支处理;
+		// 多主群版遍历 GROUP_ID_SET,各群动作与失败明细由 restoreUserInAllMainGroups 聚合。
 		try {
-			const statusResult = await checkUserStatus(userId);
-			const userStatus = statusResult.result.status;
-			const userPermissions = statusResult.result.permissions || {};
-
-			// 根据用户状态采取不同操作
-			if (userStatus === 'kicked') {
-				// 用户被封禁，需要解封
-				await unbanUser(userId);
-				await sendTelegramMessage(chatId, '✅ 您已被解封，可以重新加入群组。如果仍然无法发言，请联系管理员。');
-				await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
-				//await sendTelegramMessage(GROUP_ID, `${userId} 已通过自助解封`);
-			} else if (userStatus === 'restricted') {
-				// 用户被禁言，需要解除禁言
-				await restrictUser(userId);
-				await sendTelegramMessage(chatId, '✅ 您的禁言已解除，可以正常发言了。');
-				await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
-			} else if (userStatus === 'left' || userStatus === 'member') {
-				// 用户已离开群组或已是成员，检查权限
-				if (userPermissions.can_send_messages === false) {
-					// 用户有发言限制，解除限制
-					await restrictUser(userId);
-					await sendTelegramMessage(chatId, '✅ 您的发言限制已解除，可以正常发言了。');
-					await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
-					//await sendTelegramMessage(GROUP_ID, `${userId} 已通过自助解禁`);
-				} else {
-					// 用户没有明显的限制
-					await sendTelegramMessage(chatId, '✅ 检测到您的账号没有任何限制。如果仍然无法发言，请联系管理员。');
-				}
-			} else {
-				// 其他状态，提示用户联系管理员
-				await sendTelegramMessage(chatId, '❌ 无法确定您的账号状态。如果仍然无法发言，请联系管理员。');
+			const restoreResult = await restoreUserInAllMainGroups(userId, env);
+			await sendTelegramMessage(chatId, restoreResult.message);
+			// 系统后台通知(实际执行过恢复动作或存在失败)→ 广播到所有主群,任一主群管理员可见
+			if (restoreResult.notifyMainGroups) {
+				await broadcastToMainGroups(env, `用户 <a href="tg://user?id=${userId}">${userId}</a> 已通过自助解封\n${restoreResult.message}`);
 			}
-			// 检查用户是否在封禁黑名单中
+		} catch (error) {
+			console.error('自助解封恢复失败:', error);
+			// 兜底:尽力再逐主群恢复一次;仍失败则提示联系管理员
+			try {
+				const restoreResult = await restoreUserInAllMainGroups(userId, env);
+				await sendTelegramMessage(chatId, restoreResult.message);
+				if (restoreResult.notifyMainGroups) {
+					await broadcastToMainGroups(env, `用户 <a href="tg://user?id=${userId}">${userId}</a> 已通过自助解封(降级路径)\n${restoreResult.message}`);
+				}
+			} catch (restoreError) {
+				console.error('自助解封降级恢复失败:', restoreError);
+				await sendTelegramMessage(
+					chatId,
+					`❌ 解封操作失败，请联系管理员\n\n` +
+					`错误详情：\n` +
+					`${escapeHtml(String(restoreError.message || restoreError))}`
+				);
+			}
+		}
+
+		// GKY 联网黑名单二次审核上报:命中 → 通知所有主群管理员进行二次审核
+		// (系统后台通知 → 广播到所有主群;旧单群版固定发送到 GROUP_ID)
+		try {
 			const TG黑名单 = await handleBanlist(userId);
-			// 解析返回的 JSON 字符串
 			const banlistData = JSON.parse(TG黑名单);
 			if (banlistData.banned) {
-				// 获取机器人用户名
 				const botUsername = await getBotUsername();
-
 				let infoMessage = `⚠️ 注意：您的账号存在封禁黑名单。\n`;
 				infoMessage += `- TGID: <a href="tg://user?id=${banlistData.tgid}">${banlistData.tgid}</a>\n`;
 				if (banlistData.reason) infoMessage += `- 封禁原因: ${banlistData.reason}\n`;
 				infoMessage += `\n需要群组管理员进行<b><a href="https://t.me/${botUsername}?start=check_${banlistData.tgid}">二次审核</a></b>。`;
-				await sendTelegramMessage(GROUP_ID, infoMessage);
+				await broadcastToMainGroups(env, infoMessage);
 			}
 		} catch (error) {
-			console.error('检查用户状态失败:', error);
-			// 如果检查状态失败，回退到原来的逻辑
-			try {
-				// 首先尝试解除禁言（恢复发言权限）
-				await restrictUser(userId);
-				await sendTelegramMessage(chatId, '✅ 您的禁言已解除，可以正常发言了。如果仍然无法发言，请联系管理员。');
-				await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
-				await sendTelegramMessage(GROUP_ID, `用户 ${userId} 已通过自助解禁`);
-			} catch (restrictError) {
-				console.error('解除禁言失败:', restrictError);
-				try {
-					await unbanUser(userId);
-					await sendTelegramMessage(chatId, '✅ 您已被解封，可以重新加入群组。如果仍然无法发言，请联系管理员。');
-					await markUserGroupStatus(env, userId, GROUP_MEMBER_STATUS.HEALTHY);
-					await sendTelegramMessage(GROUP_ID, `用户 ${userId} 已通过自助解禁`);
-				} catch (unbanError) {
-					console.error('解封失败:', unbanError);
-					// 如果仍然失败，通知用户
-					await sendTelegramMessage(
-						chatId,
-						`❌ 解封操作失败，请联系管理员\n\n` +
-						`错误详情：\n` +
-						`状态检查错误: ${error.message}\n` +
-						`禁言解除错误: ${restrictError.message}\n` +
-						`解封错误: ${unbanError.message}`
-					);
-				}
-			}
+			console.error('GKY 二次审核上报失败:', error.message);
 		}
 	}
 }
@@ -2295,11 +2529,6 @@ async function muteChatMember(chatId, userId) {
 	return result;
 }
 
-async function unbanUser(userId) {
-	// GROUP_ID 群专用封装:委托通用版 unbanUserInChat(支持任意群,本处固定 GROUP_ID)
-	return await unbanUserInChat(GROUP_ID, userId);
-}
-
 // 永久封禁用户(踢出群组并禁止重新加入)
 async function banUserPermanently(chatId, userId) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`;
@@ -2324,119 +2553,18 @@ async function banUserPermanently(chatId, userId) {
 	return result;
 }
 
-// 解除用户禁言（恢复发言权限）— GROUP_ID 群专用封装
-async function restrictUser(userId) {
-	return await restrictUserInChat(GROUP_ID, userId);
-}
-
-// 检查用户在群组中的状态
-async function checkUserStatus(userId) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`;
-	const body = {
-		chat_id: GROUP_ID,
-		user_id: userId
-	};
-
-	const response = await fetch(url, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(body)
-	});
-
-	const result = await response.json();
-
-	if (!response.ok) {
-		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
-	}
-
-	return result;
-}
-
-// 检查用户是否是群组管理员
+// 用户是否为任一主群的群主/管理员(代理到多主群辅助区 checkIfUserIsAdminInAnyMainGroup):
+// 函数名保留(命令入口/DB 钩子等大量调用点沿用);内部按主群 chatId 每 60s 拉一次
+// getChatAdministrators 名单缓存,判定成本与用户量无关;获取失败按空名单降级(恒 false,不抛错)。
 async function checkIfUserIsAdmin(userId) {
-	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`;
-		const body = {
-			chat_id: GROUP_ID,
-			user_id: userId
-		};
-
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body)
-		});
-
-		const result = await response.json();
-
-		if (!response.ok) {
-			console.error('检查管理员权限失败:', result);
-			return false;
-		}
-
-		// 检查用户状态是否为管理员或创建者
-		const status = result.result.status;
-		const isAdmin = status === 'creator' || status === 'administrator';
-
-		// 添加调试日志
-		console.log(`用户 ${userId} 的权限状态: ${status}, 是否为管理员: ${isAdmin}`);
-
-		return isAdmin;
-	} catch (error) {
-		console.error('检查管理员权限时出错:', error);
-		return false;
-	}
+	return await checkIfUserIsAdminInAnyMainGroup(userId);
 }
 
-// 管理员身份实例级缓存(带 TTL):供高频路径使用(recordUserActivity 每条群聊消息都调用,
-// 直接打 getChatMember 会成倍消耗 Telegram API 配额)。管理员身份变动不频繁,TTL 内不感知。
-// 60s 窗口内的身份变化(如刚被提升的管理员)最多延迟 60s 生效;降级同理,期间按旧身份处理。
-const ADMIN_CHECK_CACHE_TTL_MS = 60000;
-const groupAdminCache = new Map();
+// 管理员身份判定兼容别名(供 DB 层 setGroupAdminChecker 钩子使用):语义 = 任一主群管理员。
+// 旧版按单 tgid 缓存打固定 GROUP_ID 的 getChatMember,会造成 Telegram API 配额随用户量放大;
+// 多主群版统一走主群管理员名单缓存(见上方 getMainGroupAdminSet),本函数仅作转发,不额外缓存。
 async function checkIfUserIsAdminCached(userId) {
-	const tgid = String(userId);
-	const now = Date.now();
-	const cached = groupAdminCache.get(tgid);
-	if (cached && (now - cached.fetchedAt) < ADMIN_CHECK_CACHE_TTL_MS) {
-		return cached.isAdmin;
-	}
-	const isAdmin = await checkIfUserIsAdmin(tgid); // 内部已 catch 全部异常,失败返回 false
-	groupAdminCache.set(tgid, { isAdmin, fetchedAt: now });
-	return isAdmin;
-}
-
-// 检查用户是否助推过 GROUP_ID 群组(getUserChatBoosts 需要机器人是管理员)
-async function checkIfUserBoosted(userId) {
-	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUserChatBoosts`;
-		const body = {
-			chat_id: GROUP_ID,
-			user_id: userId
-		};
-
-		console.log(`[/ad] getUserChatBoosts 请求: chat_id=${GROUP_ID}, user_id=${userId}`);
-
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body)
-		});
-
-		const result = await response.json();
-		console.log(`[/ad] getUserChatBoosts 响应: HTTP=${response.status}, ok=${result.ok}, result=${JSON.stringify(result.result)}`);
-
-		if (!response.ok || !result.ok) {
-			console.error('[/ad] getUserChatBoosts 失败:', JSON.stringify(result));
-			return false;
-		}
-
-		const boostCount = Array.isArray(result.result?.boosts) ? result.result.boosts.length : 0;
-		console.log(`[/ad] 用户 ${userId} 当前有效助推数: ${boostCount}`);
-		return boostCount > 0;
-	} catch (error) {
-		console.error('[/ad] 检查用户助推状态时出错:', error.message, error.stack);
-		return false;
-	}
+	return await checkIfUserIsAdminInAnyMainGroup(userId);
 }
 
 // 获取机器人用户名
@@ -2494,55 +2622,9 @@ async function getBotUsername() {
 	}
 }
 
-// 获取群组信息
-async function getGroupInfo() {
-	// 如果已经缓存，直接返回
-	if (GROUP_TITLE && GROUP_USERNAME) {
-		return {
-			title: GROUP_TITLE,
-			username: GROUP_USERNAME
-		};
-	}
-
-	try {
-		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChat`;
-		const body = {
-			chat_id: GROUP_ID
-		};
-
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body)
-		});
-
-		const result = await response.json();
-
-		if (response.ok && result.result) {
-			GROUP_TITLE = result.result.title || 'CM技术交流群';
-			GROUP_USERNAME = result.result.username ? `@${result.result.username}` : '@CMLiussss';
-			console.log(`群组信息: 名称=${GROUP_TITLE}, 用户名=${GROUP_USERNAME}`);
-			return {
-				title: GROUP_TITLE,
-				username: GROUP_USERNAME
-			};
-		} else {
-			console.error('获取群组信息失败:', result);
-			// 失败时返回默认值
-			return {
-				title: 'CM技术交流群',
-				username: '@CMLiussss'
-			};
-		}
-	} catch (error) {
-		console.error('获取群组信息时出错:', error);
-		// 失败时返回默认值
-		return {
-			title: 'CM技术交流群',
-			username: '@CMLiussss'
-		};
-	}
-}
+// 获取群组信息:多主群参数化版定义于多主群核心辅助区(上方 getGroupInfo(chatId),
+// 默认首个主群,兼容旧调用方无参);此处旧单群固定 GROUP_ID + GROUP_TITLE/GROUP_USERNAME
+// 全局缓存版已废弃删除(避免同名函数后者覆盖前者导致 chatId 参数化失效)。
 
 async function handleBanlist(chatId) {
 	function parseBanlistHTML(html, tgid) {
@@ -3255,14 +3337,14 @@ async function assessThreatWithAI(env, content, groupRules) {
 	}
 }
 
-// 预检目标用户在本群(GROUP_ID)是否已被禁言或被 ban(mutedOrBanned)且已存在于本地 KV 黑名单(isBlacklisted)。
+// 预检目标用户在本群(当前主群 chatId)是否已被禁言或被 ban(mutedOrBanned)且已存在于本地 KV 黑名单(isBlacklisted)。
 // 仅当两者同时成立时判定为"重复操作"(shouldSkip=true),由调用方跳过本次举报投票。
-// 注意:checkUserStatus 调用 Telegram getChatMember,当用户不在群里(被踢/退群/从未入群)或网络异常时会抛异常;
+// 注意:checkUserStatusInChat 调用 Telegram getChatMember,当用户不在群里(被踢/退群/从未入群)或网络异常时会抛异常;
 // 异常时按 mutedOrBanned=false 处理(fail-open 放行,不阻断正常举报)。checkBlacklist 内部已兜底"未绑定 KV / 读取异常"两种情况。
-async function checkAdDuplicate(tgid, env) {
+async function checkAdDuplicate(chatId, tgid, env) {
 	let mutedOrBanned = false;
 	try {
-		const statusResult = await checkUserStatus(tgid);
+		const statusResult = await checkUserStatusInChat(chatId, tgid);
 		const status = statusResult?.result?.status;
 		const canSendMessages = statusResult?.result?.can_send_messages;
 		const isMuted = status === 'restricted' && canSendMessages === false; // 被禁言
@@ -3288,8 +3370,8 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 	const chatId = message.chat.id;
 	const userId = message.from.id;
 
-	// 1. 必须在 GROUP_ID 群内
-	if (chatId.toString() !== GROUP_ID.toString()) {
+	// 1. 必须在任一主群内(/ad 投票"动作发生在哪个主群就只在哪个主群处理",不跨群广播)
+	if (!isMainGroup(chatId)) {
 		return;
 	}
 
@@ -3323,17 +3405,17 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 	// 统一补充目标用户资料(昵称/简介):getChatMember 拿 user(含昵称),
 	// bio 在群内取不到时再用 getChat 兜底(仅当对方私聊过本机器人)。
 	try {
-		const statusResult = await checkUserStatus(targetUserId);
-		// 管理员豁免:不能对 GROUP_ID 群管理员发起举报投票
-		// (复用本次 getChatMember 的 status,零额外 API 调用;查询异常/不在群时 status 缺失 → 放行)
-		const targetStatus = statusResult?.result?.status;
-		if (targetStatus === 'administrator' || targetStatus === 'creator') {
+		// getChatMemberInfo 失败/用户不在群返回 null(不抛错),targetStatus 缺失 → 放行
+		const memberInfo = await getChatMemberInfo(chatId, targetUserId);
+		// 管理员豁免:不能对任一主群管理员发起举报投票(含本主群与其他主群的管理员;
+		// 走主群管理员名单缓存,不放大 Telegram API 配额)
+		if (await checkIfUserIsAdminInAnyMainGroup(targetUserId)) {
 			await sendTelegramMessage(chatId, `⚠️ 不能对群组管理员 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 发起举报投票`);
 			return;
 		}
-		if (statusResult?.result?.user) {
+		if (memberInfo?.user) {
 			// 以 getChatMember 返回的 user 为准(可能比回复快照多 bio 等字段)
-			targetUserSnapshot = snapshotTelegramUser(statusResult.result.user);
+			targetUserSnapshot = snapshotTelegramUser(memberInfo.user);
 		}
 	} catch (error) {
 		console.log('[/ad] 查询目标用户资料失败(不影响主流程):', error.message);
@@ -3354,8 +3436,8 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 		return;
 	}
 
-	// 重复操作预检:目标用户在本群既已被禁言或被 ban、又已存在于本地黑名单时,跳过本次举报投票。
-	const duplicateCheck = await checkAdDuplicate(targetUserId, env);
+	// 重复操作预检:目标用户在本群(当前主群)既已被禁言或被 ban、又已存在于本地黑名单时,跳过本次举报投票。
+	const duplicateCheck = await checkAdDuplicate(chatId, targetUserId, env);
 	console.log(`[/ad] 重复预检 tgid=${targetUserId} 已禁言或被ban=${duplicateCheck.mutedOrBanned} 本地黑名单=${duplicateCheck.localBlacklisted} 跳过=${duplicateCheck.shouldSkip}`);
 	if (duplicateCheck.shouldSkip) {
 		await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已在本群被禁言或被封禁，且已在黑名单中，无需重复发起举报投票`);
@@ -3508,12 +3590,12 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 		return;
 	}
 
-	// 群外投票直接忽略(按钮只能在消息所在群里点)
-	if (chatId.toString() !== GROUP_ID.toString()) {
+	// 非主群投票直接忽略(按钮只能在消息所在主群里点)
+	if (!isMainGroup(chatId)) {
 		return;
 	}
 
-	// 任何群成员都可以投票(只校验在 GROUP_ID 群内,已在上方检查)
+	// 任何群成员都可以投票(只校验在任一主群内,已在上方检查)
 
 	// 解析 callback_data: adv:A:<voteToken> 或 adv:R:<voteToken>
 	const tail = data.slice(AD_VOTE_BUTTON_PREFIX.length);
@@ -3571,10 +3653,12 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 	}
 
 	// 投票资格检查:仅"被禁言"或"不在群里"的用户不允许投票
+	// (资格判定在投票发生的主群 state.chatId 内查询;按钮只能在消息所在主群点击,
+	//  回调 chatId 与 state.chatId 一致,取 state.chatId 保证与投票上下文绑定)
 	let voterStatus = null;
 	let voterStatusError = null;
 	try {
-		voterStatus = await checkUserStatus(voterId);
+		voterStatus = await checkUserStatusInChat(state.chatId, voterId);
 	} catch (error) {
 		// getChatMember 对不在群里的用户(从未入群/被移除/主动退群)会返回 400,
 		// 这里把异常也视为"不在群里",拒绝投票(而不是放行)
@@ -3643,7 +3727,8 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 		return;
 	}
 
-	// 群管理员一票否决:管理员点"赞成"或"反对"立即结束
+	// 群管理员一票否决:任一主群管理员点"赞成"或"反对"立即结束
+	// (checkIfUserIsAdmin 已代理为任一主群管理员判定,走主群管理员名单缓存)
 	const voterIsAdmin = await checkIfUserIsAdmin(voterId);
 	if (voterIsAdmin) {
 		const adminResult = action === 'A' ? 'approved' : 'rejected';
@@ -3736,7 +3821,7 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 		// 本地黑名单,待其入群时由 handleNewChatMemberBots 入群拦截逻辑处理。
 		let userStatus = null;
 		try {
-			const statusResult = await checkUserStatus(state.targetUserId);
+			const statusResult = await checkUserStatusInChat(state.chatId, state.targetUserId);
 			userStatus = statusResult?.result?.status || null;
 		} catch (error) {
 			// 状态查询异常(如从未入群返回 400 USER_NOT_PARTICIPANT)→ 视为不在群,走永久封禁分支
@@ -3749,8 +3834,8 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 			try {
 				await muteChatMember(chatId, state.targetUserId);
 				console.log(`[/ad] 用户 ${state.targetUserId} 在群(${userStatus}),已在群 ${chatId} 内禁言`);
-				// 禁言成功 → 标记该用户在本群状态为"禁言"
-				await markUserGroupStatus(env, state.targetUserId, GROUP_MEMBER_STATUS.MUTED);
+				// 禁言成功 → 标记该用户在本群(state.chatId)状态为"禁言"
+				await markUserGroupStatus(env, state.targetUserId, GROUP_MEMBER_STATUS.MUTED, state.chatId);
 			} catch (muteError) {
 				console.error('[/ad] finalize 禁言失败:', muteError.message);
 			}
@@ -3759,8 +3844,8 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 			try {
 				await banUserPermanently(chatId, state.targetUserId);
 				console.log(`[/ad] 用户 ${state.targetUserId} 不在群内(${userStatus || '状态缺失/查询异常'}),已永久封禁`);
-				// 封禁成功 → 标记该用户在本群状态为"封禁"
-				await markUserGroupStatus(env, state.targetUserId, GROUP_MEMBER_STATUS.BANNED);
+				// 封禁成功 → 标记该用户在本群(state.chatId)状态为"封禁"
+				await markUserGroupStatus(env, state.targetUserId, GROUP_MEMBER_STATUS.BANNED, state.chatId);
 			} catch (banError) {
 				// 用户从未入群等场景,banChatMember 同样返回 400:不回退到禁言,
 				// 黑名单已写入,待用户入群时由入群拦截逻辑封禁
@@ -3781,26 +3866,26 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 }
 
 // ========================================================
-// 联网黑名单自动查杀(bot 为管理员且有限制成员权限的任意群,含 GROUP_ID 主群)
+// 联网黑名单自动查杀(bot 为管理员且有限制成员权限的任意群,含主群(任一))
 // ========================================================
 // 概要:
-// - 触发条件:事件发生在群聊(含 GROUP_ID 主群与其他群),且 bot 仍是该群管理员
+// - 触发条件:事件发生在群聊(含主群(任一)与其他群),且 bot 仍是该群管理员
 //   (administrator/creator;administrator 还需具备 can_restrict_members 权限,否则禁言/封禁
 //   无法执行,模式视为不可用);私聊/频道不触发。
-// - 触发事件:① 新成员入群(new_chat_members,仅非 GROUP_ID 群接线;GROUP_ID 主群入群仍走
-//   既有封禁级拦截 handleNewChatMemberBots,不接入本查杀) ② 真人发送消息(消息路径,含 GROUP_ID
-//   主群与其他群)。
+// - 触发事件:① 新成员入群(new_chat_members,仅非主群群聊接线;主群(任一)入群仍走
+//   既有封禁级拦截 handleNewChatMemberBots,不接入本查杀) ② 真人发送消息(消息路径,含主群(任一)
+//   与其他群)。
 // - 新 TGID(users 表无记录):自动建档,active_group_ids 记录本群 + 状态"健康",放行
 //   (新用户不可能在 联网黑名单)。
 // - 存量 TGID:本群状态为"健康"且 is_blacklisted=1(联网黑名单)→ 禁言 + 本群状态同步"禁言" +
-//   群内通知。GROUP_ID 主群命中→通知不带按钮(按钮回调在主群会被防御拦截),文案提示管理员用
+//   群内通知。主群(任一)命中→通知不带按钮(按钮回调在主群会被防御拦截),文案提示管理员用
 //   /ban、/unban 命令处置;其他群命中→通知附带"永久封禁 / 加入白名单"按钮(仅本群管理员可点)。
 // - 按钮"永久封禁"→ banChatMember 踢出 + 本群状态"封禁";"加入白名单"→ unban + 恢复发言 +
 //   状态"白名单"(白名单为本群豁免,不再触发查杀)。
-// - 消息路径查杀覆盖 GROUP_ID 主群:主群内 /spam、/ban 只 addToBlacklist(置 is_blacklisted=1)
+// - 消息路径查杀覆盖主群(任一):主群内 /spam、/ban 只 addToBlacklist(置 is_blacklisted=1)
 //   而群内状态仍为"健康"的用户,再次发言即被本查杀禁言并标记,封堵"已拉黑却仍在主群自由发言"漏洞。
-// - 非 GROUP_ID 群内的 /ban /spam /unban 仅维护本群状态,绝不修改 is_blacklisted;
-//   is_blacklisted 只代表"联网黑名单"(GROUP_ID 群黑名单),只能由 GROUP_ID 群内的
+// - 非主群内的 /ban /spam /unban 仅维护本群状态,绝不修改 is_blacklisted;
+//   is_blacklisted 只代表"联网黑名单"(主群黑名单,GROUP_ID_SET),只能由主群(任一)内的
 //   /ad /ban /spam /unban 修改。
 const NETKILL_BUTTON_PREFIX = 'cmk:';
 
@@ -3815,7 +3900,7 @@ const NETKILL_LOG_LABELS = {
 	'action:mute:success': '成功:已禁言并同步本群状态为"禁言"',
 	'action:mute:failed': '失败:禁言失败(不写状态、不通知)',
 	'status:admin-detected': '检测:目标用户实为本群管理员,禁言被 TG API 拒绝,记录状态"管理员"避免重复尝试',
-	'notify:sent': '已发送联网黑名单通知(GROUP_ID 主群无按钮,其他群带管理员按钮)',
+	'notify:sent': '已发送联网黑名单通知(主群(任一)无按钮,其他群带管理员按钮)',
 	'callback:ban:start': '按钮:本群管理员点击"永久封禁"',
 	'callback:ban:success': '按钮:已永久封禁并同步本群状态"封禁"',
 	'callback:ban:failed': '按钮:永久封禁失败',
@@ -3943,7 +4028,7 @@ async function restrictUserInChat(chatId, userId) {
 }
 
 // 构建联网查杀通知文案 + 操作按钮(仅本群管理员可点,业务侧校验)。
-// options.withButtons=false 用于 GROUP_ID 主群:主群内不带任何按钮(按钮回调在主群会被防御拦截),
+// options.withButtons=false 用于主群(任一):主群内不带任何按钮(按钮回调在主群会被防御拦截),
 // 文案末尾追加一行提示管理员可用 /ban、/unban 命令处置。
 function buildNetKillNotification(tgid, member, { withButtons = true } = {}) {
 	const mention = formatUserMention(member)
@@ -3975,9 +4060,9 @@ function buildNetKillNotification(tgid, member, { withButtons = true } = {}) {
 
 // 联网黑名单自动查杀主逻辑:
 // members 为待检查的 user 对象数组(入群事件取 new_chat_members,普通消息取 [message.from])。
-// 适用于 bot 为管理员的任意群聊(含 GROUP_ID 主群):内部守卫顺序为 chat.type 群聊 → 绑定 D1 →
+// 适用于 bot 为管理员的任意群聊(含主群(任一)):内部守卫顺序为 chat.type 群聊 → 绑定 D1 →
 // bot 是当前群管理员;命中 is_blacklisted 且本群状态"健康" → 禁言 + 本群状态"禁言" + 群内通知
-// (GROUP_ID 主群通知不带按钮,见 buildNetKillNotification);依赖 D1(active_group_ids / is_blacklisted)。
+// (主群(任一)通知不带按钮,见 buildNetKillNotification);依赖 D1(active_group_ids / is_blacklisted)。
 async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) {
 	if (!chat || !Array.isArray(members) || members.length === 0) return;
 	const chatId = chat.id;
@@ -4018,14 +4103,15 @@ async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) 
 		}
 
 		// action === 'mute':命中 联网黑名单 → 禁言 + 本群状态同步"禁言" + 群内通知
-		// (GROUP_ID 主群通知无按钮;其他群通知带管理员操作按钮,见 buildNetKillNotification)
+		// (主群(任一)通知无按钮;其他群通知带管理员操作按钮,见 buildNetKillNotification)
 		logNetKill('action:mute:start', { tgid, chatId: chatId.toString() });
 		try {
 			await muteChatMember(chatId, member.id);
 			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.MUTED);
 			logNetKill('action:mute:success', { tgid, chatId: chatId.toString() });
-			// GROUP_ID 主群通知不带按钮(按钮回调在主群会被防御拦截);其他群带管理员操作按钮
-			const inGroupId = chatId.toString() === GROUP_ID.toString();
+			// 主群(任一)通知不带按钮(按钮回调在主群会被防御拦截);其他群带管理员操作按钮。
+			// 变量名 inGroupId 保留(netkill QA 源码锚点依赖),判断来源已改为多主群集合语义
+			const inGroupId = isMainGroup(chatId);
 			const notification = buildNetKillNotification(tgid, member, { withButtons: !inGroupId });
 			await sendTelegramMessage(chatId, notification.text, notification.replyMarkup, replyToMessageId);
 			logNetKill('notify:sent', { tgid, chatId: chatId.toString(), inGroupId });
@@ -4053,8 +4139,8 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 		try { await answerCallbackQuery(callbackQuery.id); } catch (_) { }
 		return true;
 	}
-	if (chatId.toString() === GROUP_ID.toString()) {
-		// 防御:GROUP_ID 主群的查杀通知已不带按钮(见 buildNetKillNotification,withButtons=false),
+	if (isMainGroup(chatId)) {
+		// 防御:主群(任一)的查杀通知已不带按钮(见 buildNetKillNotification,withButtons=false),
 		// 此分支兜底拦截任何历史遗留/伪造的 cmk: 按钮回调,防止绕过命令通道在主群直接操作。
 		try { await answerCallbackQuery(callbackQuery.id, '无效操作', true); } catch (_) { }
 		return true;
@@ -4123,7 +4209,7 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 // 业务层注入 DB 层管理员判定钩子
 // ========================================================
 // DB 层(黑名单豁免 / recordUserActivity 管理员状态标记)通过 setGroupAdminChecker 注册的
-// 钩子判断"是否 GROUP_ID 群管理员",自身不直接调 Telegram API(保持 QA 沙箱可测)。
-// 此处注入缓存版检查器(60s TTL),高频路径不吃 getChatMember 配额。
+// 钩子判断"是否任一主群(GROUP_ID_SET)的管理员",自身不直接调 Telegram API(保持 QA 沙箱可测)。
+// 此处注入缓存版检查器(按主群 chatId 60s TTL 的管理员名单缓存),高频路径不吃 getChatMember 配额。
 // 模块加载时仅注册钩子,不触发任何 API 调用;QA 沙箱切片不含此行,DB 层按无钩子(非管理员)处理。
 setGroupAdminChecker(async (tgid) => checkIfUserIsAdminCached(tgid));
