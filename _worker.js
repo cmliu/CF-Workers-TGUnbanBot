@@ -926,7 +926,9 @@ async function checkIfUserIsAdminInAnyMainGroup(userId) {
 // 群组信息实例级缓存(按 chatId):title 取群名,username 带 @ 前缀(与既有 getGroupInfo 格式一致)。
 // 获取失败回退默认文案(与旧行为一致:不因 getChat 失败阻断业务流程)。
 // 返回对象新增 fromFallback 标志:true=API 失败使用默认文案;false=真实获取。调用方按需决定是否回退到 chatId(多主群场景避免都显示同一个 'CM技术交流群')。
-const groupInfoCache = new Map(); // chatId(string) -> { chatId, title, username, fromFallback }
+// publicUsername(2026-09-04 新增):不带 @ 前缀的真实 username(API 返回 result.result.username);无 username 或 fallback 时为 null。
+// 用于群组链接渲染(<a href="https://t.me/<publicUsername>">群名</a>),区分"真实有 username"vs"私有群/API 失败"。
+const groupInfoCache = new Map(); // chatId(string) -> { chatId, title, username, publicUsername, fromFallback }
 async function getChatInfoCached(chatId) {
 	const key = String(chatId);
 	if (groupInfoCache.has(key)) {
@@ -946,6 +948,7 @@ async function getChatInfoCached(chatId) {
 				chatId: key,
 				title: result.result.title || 'CM技术交流群',
 				username: result.result.username ? `@${result.result.username}` : '@CMLiussss',
+				publicUsername: result.result.username || null,
 				fromFallback: !result.result.title
 			};
 			groupInfoCache.set(key, info);
@@ -955,7 +958,7 @@ async function getChatInfoCached(chatId) {
 	} catch (error) {
 		console.error('获取群组信息时出错:', error.message);
 	}
-	const fallback = { chatId: key, title: 'CM技术交流群', username: '@CMLiussss', fromFallback: true };
+	const fallback = { chatId: key, title: 'CM技术交流群', username: '@CMLiussss', publicUsername: null, fromFallback: true };
 	groupInfoCache.set(key, fallback);
 	return fallback;
 }
@@ -985,13 +988,29 @@ function formatMainGroupsHint(infos) {
 	return parts.filter(Boolean).join('、');
 }
 
-// 把主群列表渲染为自我介绍中的群名串:多群返回 "群名1、群名2"(顿号分隔,纯群名,无 @/链接)。
-// 用法:与 formatMainGroupsHint 区分——前者面向"点击返回群组"的入口链接,后者面向"我是哪个群的机器人"自我介绍。
+// 把主群列表渲染为自我介绍中的群名串:多群返回 "群名1、群名2"(顿号分隔)。
+// 用法:与 formatMainGroupsHint 区分——前者面向"点击返回群组"的入口链接(@username),后者面向"我是哪个群的机器人"自我介绍。
+// 链接规则(2026-09-04 用户反馈):群名本身做成链接,点击跳转到群组;
+//   - 公开群(API 返回真实 publicUsername):<a href="https://t.me/<username>">群名</a>;
+//   - 私有群或 fallback(无 username):群名 + chatId 一起用 <code>(chatId)</code> 包裹,方便点击复制群 ID 后到 Telegram 搜索。
 function formatMainGroupsNamesHint(infos) {
 	if (!Array.isArray(infos) || infos.length === 0) return '主群';
-	const titles = infos.map((info) => info?.title).filter(Boolean);
-	if (titles.length === 0) return '主群';
-	return titles.map((t) => escapeHtml(t)).join('、');
+	const parts = [];
+	for (const info of infos) {
+		const title = info?.title;
+		if (!title) continue;
+		const safeTitle = escapeHtml(title);
+		const publicUsername = info?.publicUsername;
+		if (publicUsername) {
+			parts.push(`<a href="https://t.me/${escapeHtml(publicUsername)}">${safeTitle}</a>`);
+		} else if (info?.chatId) {
+			parts.push(`${safeTitle}<code>(${escapeHtml(info.chatId)})</code>`);
+		} else {
+			parts.push(safeTitle);
+		}
+	}
+	if (parts.length === 0) return '主群';
+	return parts.join('、');
 }
 
 // 恢复单个主群中用户的群内状态(查状态 → 解封/解禁 → 状态回写"健康"),返回动作/失败明细。
@@ -1574,10 +1593,25 @@ function formatUserMention(user) {
 // 与 formatUserMention(返回 <a> 链接,适合主群公开消息中"@提一下")的差异:
 //   - 私聊欢迎词不需要再做成链接(对方就在对话框里),纯文本更直观;
 //   - 名字在前、TGID 在括号内,符合日常"名字(ID)"的展示习惯,避免只看到一串数字。
+//
+// 2026-09-04 用户反馈:
+//   - 用户名部分做成 tg://user?id= 链接(点击展开用户信息);
+//   - TGID 部分用 <code> 包裹(方便点击直接复制 TGID);括号作为普通字符保留在 <code> 外,
+//     长按 <code> 内容仅复制纯 TGID 数字,不含括号。
 function formatUserLabel(user) {
 	if (!user?.id) return '';
 	const displayName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.id;
-	return `${escapeHtml(displayName)}(${escapeHtml(user.id)})`;
+	return `<a href="tg://user?id=${escapeHtml(user.id)}">${escapeHtml(displayName)}</a>(<code>${escapeHtml(user.id)}</code>)`;
+}
+
+// 封禁场景专用:在 formatUserLabel 基础上对用户名做脱敏(首尾保留、中间 ***),
+// 用于群内 /spam /ban 拉黑/禁言通知,避免广告/赌博/违规用户名被 bot 完整复读造成二次传播。
+// TGID 仍完整展示(便于管理员核对),括号/格式与 formatUserLabel 一致。
+function formatBannedUserLabel(user) {
+	if (!user?.id) return '';
+	const displayName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.id;
+	const maskedName = maskDisplayName(displayName);
+	return `<a href="tg://user?id=${escapeHtml(user.id)}">${escapeHtml(maskedName)}</a>(<code>${escapeHtml(user.id)}</code>)`;
 }
 
 async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
@@ -1929,10 +1963,11 @@ async function handleMessage(message, env) {
 			try {
 				await muteChatMember(chatId, repliedUserId);
 				await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.MUTED);
-				// 群内禁言通知:有 reply_to_message.from 用户对象,用 formatUserLabel 展示 "用户名(TGID)"
-				// 比裸 TGID 链接更直观;无 reply(理论上不会走到这里,前置已校验)时回退到 ID 链接。
+				// 群内禁言通知:有 reply_to_message.from 用户对象,用 formatBannedUserLabel 展示
+				// "脱敏用户名(TGID)" 避免广告用户名二次传播;无 reply(理论上不会走到这里,
+				// 前置已校验)时回退到 ID 链接(TGID 本身无广告内容)。
 				const muteUserLabel = message.reply_to_message?.from
-					? formatUserLabel(message.reply_to_message.from)
+					? formatBannedUserLabel(message.reply_to_message.from)
 					: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 				await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本群状态: 禁言`);
 			} catch (error) {
@@ -1964,10 +1999,10 @@ async function handleMessage(message, env) {
 
 		const result = await addToBlacklist(repliedUserId, env, 'spam', message.from.id);
 		// 群内禁言/拉黑通知:reply 触发下 message.reply_to_message.from 可拿到被处理用户对象,
-		// 用 formatUserLabel 输出 "用户名(TGID)" 比裸 TGID 链接更直观;addToBlacklist success 文案沿用
-		// 同样格式;禁言子消息也复用同一变量避免风格不一致。
+		// 用 formatBannedUserLabel 输出 "脱敏用户名(TGID)" —— 封禁场景要避免广告用户名二次传播;
+		// addToBlacklist success 文案沿用同样格式;禁言子消息也复用同一变量避免风格不一致。
 		const spamUserLabel = message.reply_to_message?.from
-			? formatUserLabel(message.reply_to_message.from)
+			? formatBannedUserLabel(message.reply_to_message.from)
 			: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success) {
@@ -2222,7 +2257,13 @@ async function handleMessage(message, env) {
 		if (isManagedGroupMessage(message) && (result.success || result.alreadyExists)) {
 			try {
 				await muteChatMember(chatId, targetUserId);
-				responseMessage += `\n✅ 已在群内禁言用户 <a href="tg://user?id=${targetUserId}">${targetUserId}</a>`;
+				// 群内禁言通知:reply 触发下 message.reply_to_message.from 可拿到用户对象,
+				// 用 formatBannedUserLabel 展示 "脱敏用户名(TGID)" 避免广告用户名二次传播;
+				// 参数化 /ban 12345 触发时无 reply,fallback 到纯 TGID 链接(TGID 无广告内容)。
+				const banUserLabel = message.reply_to_message?.from
+					? formatBannedUserLabel(message.reply_to_message.from)
+					: `<a href="tg://user?id=${targetUserId}">${targetUserId}</a>`;
+				responseMessage += `\n✅ 已在群内禁言用户 ${banUserLabel}`;
 				// 群内禁言成功 → 标记该用户在本群(当前主群)状态为"禁言"
 				await markUserGroupStatus(env, targetUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
 			} catch (error) {
