@@ -1656,7 +1656,9 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	if (options.targetUser) {
 		responseMessage += `👤 <b>用户:</b> ${formatUserMention(options.targetUser) || `<code>${escapeHtml(tgidToCheck)}</code>`}\n`;
 	}
-	responseMessage += `📋 <b>TGID:</b> <a href="tg://user?id=${escapeHtml(tgidToCheck)}">${escapeHtml(tgidToCheck)}</a>\n\n`;
+	// TGID 用 <code> 包裹(长按可复制纯数字),替代此前的 <a href="tg://user?id=..."> 链接;
+	// 用户反馈:管理员核对 TGID 时直接长按复制比"点击链接展开用户信息"更顺手。
+	responseMessage += `📋 <b>TGID:</b> <code>${escapeHtml(tgidToCheck)}</code>\n\n`;
 
 	// GKYbot 数据库状态
 	if (banlistData.success) {
@@ -1723,8 +1725,11 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		if (options.actionInCurrentChat) {
 			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请在本群发送下方复制的代码。`;
 		} else {
-			const groupInfo = await getGroupInfo();
-			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请返回 ${escapeHtml(groupInfo.username)} 群组发送下方复制的代码。`;
+			// 私聊场景:列出全部主群入口(多主群时用顿号分隔,如 @a、@b、@c),
+			// 替代旧版单群名(只列 GROUP_ID_SET[0] 一个)。listMainGroupInfos 复用 getChatInfoCached
+			// 永久缓存(0 额外请求);管理员点击 @username 即可跳转回任一主群发送代码。
+			const mainGroupInfos = await listMainGroupInfos(options.env);
+			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请返回 ${formatMainGroupsHint(mainGroupInfos)} 群组发送下方复制的代码。`;
 		}
 		inlineKeyboard.push([{ text: `📋 点击复制 ${黑白名单} 代码`, copy_text: { text: copyText } }]);
 	}
@@ -2139,23 +2144,36 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-		await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
-		let targetUser = null;
-		if (!checkCommand.firstArg && repliedUser?.id?.toString() === tgidToCheck) {
-			targetUser = repliedUser;
-		} else {
-			targetUser = await getManagedGroupUser(tgidToCheck);
-		}
-
-		const response = await buildBanlistCheckResponse(tgidToCheck, {
-			targetUser,
-			includeReviewAction: true,
-			actionInCurrentChat: isManagedGroupMessage(message),
-			env
-		});
-		await sendTelegramMessage(chatId, response.text, response.replyMarkup);
-		return;
+// 占位 + 编辑落定(用户反馈:之前占位与查询结果两条消息挤在一起不美观):
+	// 改为先发占位,捕获 messageId,最终结果用 editMessageText 替换占位,
+	// 对话上下文里只剩一条消息,管理员体验更清晰。
+	const placeholderSent = await sendTelegramMessage(chatId, `🔍 正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
+	const placeholderMessageId = placeholderSent?.ok ? placeholderSent.result?.message_id : null;
+	if (!placeholderMessageId) {
+		console.error('[/check] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
 	}
+
+	let targetUser = null;
+	if (!checkCommand.firstArg && repliedUser?.id?.toString() === tgidToCheck) {
+		targetUser = repliedUser;
+	} else {
+		targetUser = await getManagedGroupUser(tgidToCheck);
+	}
+
+	const response = await buildBanlistCheckResponse(tgidToCheck, {
+		targetUser,
+		includeReviewAction: true,
+		actionInCurrentChat: isManagedGroupMessage(message),
+		env
+	});
+	// 编辑占位为最终结果(失败兜底:fallback 另发一条)
+	if (placeholderMessageId) {
+		await editMessageText(chatId, placeholderMessageId, response.text, response.replyMarkup);
+	} else {
+		await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+	}
+	return;
+}
 
 	// 处理 /start 命令（包含 deep link 参数）
 	if (text && text.startsWith('/start')) {
@@ -2171,11 +2189,20 @@ async function handleMessage(message, env) {
 				return;
 			}
 
-			// 提取 TGID
+// 提取 TGID
 			const tgidToCheck = parts[1].replace('check_', '');
-			await sendTelegramMessage(chatId, `正在查询 TGID: <code>${tgidToCheck}</code> 的封禁状态...`);
+			// 占位 + 编辑落定(同 /check 命令):先发占位,再编辑为最终结果,避免两条独立消息挤一起
+			const placeholderSent = await sendTelegramMessage(chatId, `🔍 正在查询 TGID: <code>${escapeHtml(tgidToCheck)}</code> 的封禁状态...`);
+			const placeholderMessageId = placeholderSent?.ok ? placeholderSent.result?.message_id : null;
+			if (!placeholderMessageId) {
+				console.error('[/check deep-link] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
+			}
 			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true, env });
-			await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+			if (placeholderMessageId) {
+				await editMessageText(chatId, placeholderMessageId, response.text, response.replyMarkup);
+			} else {
+				await sendTelegramMessage(chatId, response.text, response.replyMarkup);
+			}
 
 			return;
 		}
