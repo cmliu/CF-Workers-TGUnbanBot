@@ -1960,19 +1960,22 @@ async function handleMessage(message, env) {
 				await sendTelegramMessage(chatId, '❌ 请回复要禁言的用户消息后再发送 <code>/spam</code>');
 				return;
 			}
-			try {
-				await muteChatMember(chatId, repliedUserId);
-				await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.MUTED);
-				// 群内禁言通知:有 reply_to_message.from 用户对象,用 formatBannedUserLabel 展示
-				// "脱敏用户名(TGID)" 避免广告用户名二次传播;无 reply(理论上不会走到这里,
-				// 前置已校验)时回退到 ID 链接(TGID 本身无广告内容)。
-				const muteUserLabel = message.reply_to_message?.from
-					? formatBannedUserLabel(message.reply_to_message.from)
-					: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
-				await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本群状态: 禁言`);
-			} catch (error) {
-				await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
-			}
+		try {
+			await muteChatMember(chatId, repliedUserId);
+			await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.MUTED);
+			// 群内禁言通知:有 reply_to_message.from 用户对象,用 formatBannedUserLabel 展示
+			// "脱敏用户名(TGID)" 避免广告用户名二次传播;无 reply(理论上不会走到这里,
+			// 前置已校验)时回退到 ID 链接(TGID 本身无广告内容)。
+			const muteUserLabel = message.reply_to_message?.from
+				? formatBannedUserLabel(message.reply_to_message.from)
+				: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
+			await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本群状态: 禁言`);
+			// 回复 /spam 场景:被回复的这条消息即违规内容,处理成功后同步删除
+			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
+			await deleteMessage(chatId, message.reply_to_message.message_id);
+		} catch (error) {
+			await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
+		}
 			return;
 		}
 
@@ -2022,6 +2025,11 @@ async function handleMessage(message, env) {
 						responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
 					}
 				}
+			}
+			// 回复 /spam 场景:被回复的这条消息即违规内容,拉黑处理成功后同步删除
+			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
+			if (message.reply_to_message) {
+				await deleteMessage(chatId, message.reply_to_message.message_id);
 			}
 			await sendTelegramMessage(chatId, responseMessage);
 		} else {
@@ -2206,13 +2214,18 @@ async function handleMessage(message, env) {
 				await sendTelegramMessage(chatId, '❌ 用户ID必须是数字');
 				return;
 			}
-			try {
-				await banUserPermanently(chatId, targetUserId);
-				await dbSetUserGroupStatus(env, targetUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
-				await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本群状态: 封禁`);
-			} catch (error) {
-				await sendTelegramMessage(chatId, `⚠️ 封禁失败: ${escapeHtml(error.message)}`);
+		try {
+			await banUserPermanently(chatId, targetUserId);
+			await dbSetUserGroupStatus(env, targetUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
+			await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本群状态: 封禁`);
+			// 回复 /ban 场景:被回复的这条消息即违规内容,封禁成功后同步删除
+			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
+			if (message.reply_to_message) {
+				await deleteMessage(chatId, message.reply_to_message.message_id);
 			}
+		} catch (error) {
+			await sendTelegramMessage(chatId, `⚠️ 封禁失败: ${escapeHtml(error.message)}`);
+		}
 			return;
 		}
 
@@ -2275,6 +2288,11 @@ async function handleMessage(message, env) {
 				} else {
 					responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
 				}
+			}
+			// 回复 /ban 场景:被回复的这条消息即违规内容,黑名单处理成功后同步删除
+			// (独立于群内禁言是否成功;deleteMessage 内部已 try-catch,失败仅记日志)。
+			if (message.reply_to_message) {
+				await deleteMessage(chatId, message.reply_to_message.message_id);
 			}
 		}
 
@@ -2569,7 +2587,7 @@ async function deleteMessage(chatId, messageId) {
 			console.error('deleteMessage 失败:', JSON.stringify(result));
 			return false;
 		}
-		console.log(`[/ad] 已删除被举报消息 ${messageId}`);
+		console.log(`[消息删除] 已删除消息 messageId=${messageId} (chatId=${chatId})`);
 		return true;
 	} catch (error) {
 		console.error('deleteMessage 调用失败:', error.message);
