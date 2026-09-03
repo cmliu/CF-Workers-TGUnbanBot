@@ -922,7 +922,8 @@ async function checkIfUserIsAdminInAnyMainGroup(userId) {
 
 // 群组信息实例级缓存(按 chatId):title 取群名,username 带 @ 前缀(与既有 getGroupInfo 格式一致)。
 // 获取失败回退默认文案(与旧行为一致:不因 getChat 失败阻断业务流程)。
-const groupInfoCache = new Map(); // chatId(string) -> { chatId, title, username }
+// 返回对象新增 fromFallback 标志:true=API 失败使用默认文案;false=真实获取。调用方按需决定是否回退到 chatId(多主群场景避免都显示同一个 'CM技术交流群')。
+const groupInfoCache = new Map(); // chatId(string) -> { chatId, title, username, fromFallback }
 async function getChatInfoCached(chatId) {
 	const key = String(chatId);
 	if (groupInfoCache.has(key)) {
@@ -941,7 +942,8 @@ async function getChatInfoCached(chatId) {
 			const info = {
 				chatId: key,
 				title: result.result.title || 'CM技术交流群',
-				username: result.result.username ? `@${result.result.username}` : '@CMLiussss'
+				username: result.result.username ? `@${result.result.username}` : '@CMLiussss',
+				fromFallback: !result.result.title
 			};
 			groupInfoCache.set(key, info);
 			return info;
@@ -950,7 +952,7 @@ async function getChatInfoCached(chatId) {
 	} catch (error) {
 		console.error('获取群组信息时出错:', error.message);
 	}
-	const fallback = { chatId: key, title: 'CM技术交流群', username: '@CMLiussss' };
+	const fallback = { chatId: key, title: 'CM技术交流群', username: '@CMLiussss', fromFallback: true };
 	groupInfoCache.set(key, fallback);
 	return fallback;
 }
@@ -1058,16 +1060,19 @@ async function restoreUserInSingleMainGroup(chatId, userId, env) {
 // 恢复用户在全部主群的状态(unban 解封 / restrict 解除禁言):逐主群处理 + 聚合文案。
 // 返回 { success, notifyMainGroups, message };notifyMainGroups=是否实际执行过恢复动作/存在失败
 // (供"自助解封处理后是否需要向主群广播系统通知"判断);message 汇总各群动作与失败明细。
+// 群名显示通过 getChatInfoCached 复用永久缓存(0 额外请求);fallback 场景回退 chatId 避免多主群同显示。
 async function restoreUserInAllMainGroups(userId, env) {
 	const allActions = [];
 	const allFailures = [];
 	for (const chatId of GROUP_ID_SET) {
 		const result = await restoreUserInSingleMainGroup(chatId, userId, env);
+		const info = await getChatInfoCached(chatId);
+		const label = info?.fromFallback ? result.chatId : info.title;
 		if (result.actions.length > 0) {
-			allActions.push(`主群 ${result.chatId}: ${result.actions.join('，')}`);
+			allActions.push(`主群 ${label}: ${result.actions.join('，')}`);
 		}
 		if (result.failures.length > 0) {
-			allFailures.push(`主群 ${result.chatId}: ${result.failures.join('；')}`);
+			allFailures.push(`主群 ${label}: ${result.failures.join('；')}`);
 		}
 	}
 
