@@ -1576,20 +1576,20 @@ async function handleMessage(message, env) {
 	const text = message.text;
 	const username = message.from.username || message.from.first_name || '用户';
 
-	// 联网黑名单自动查杀(消息路径):非 GROUP_ID 群内,真人发送的每条消息都过一遍查杀。
+	// 联网黑名单自动查杀(消息路径):真人发送的每条消息(任意聊天,含 GROUP_ID 主群与其他群/私聊)
+	// 都过一遍查杀;是否真正触发由函数内部守卫决定(群聊类型 + 绑定 D1 + bot 是群管理员)。
 	// - 命令消息也会走到这里:命令发送者通常为本群管理员(不在 联网黑名单)或已被 TG API
 	//   拒绝禁言(管理员不可被 restrict),不会误杀;
-	// - 触发条件(非 GROUP_ID 群 + bot 是群管理员且有限制成员权限 + 绑定 D1)在函数内部判断。
-	if (chatId.toString() !== GROUP_ID.toString()) {
-		try {
-			await handleNetworkBlacklistKill(message.chat, [message.from], env, message.message_id);
-		} catch (error) {
-			console.error('[联网查杀] 消息路径异常:', error.message);
-		}
+	// - 私聊/频道在函数内部按 chat.type 直接跳过;GROUP_ID 主群现在同样纳入查杀,命中即禁言。
+	try {
+		await handleNetworkBlacklistKill(message.chat, [message.from], env, message.message_id);
+	} catch (error) {
+		console.error('[联网查杀] 消息路径异常:', error.message);
 	}
 
 	// 处理管理员 /spam:
-	// - GROUP_ID 群:添加被回复用户到 联网黑名单(可同步修改 is_blacklisted);
+	// - GROUP_ID 群:添加被回复用户到 联网黑名单(可同步修改 is_blacklisted),并在群内即时禁言 +
+	//   状态"禁言"(与 /ban 行为一致,封堵"已拉黑却仍在主群自由发言"漏洞);
 	// - 非 GROUP_ID 群(bot 为该群管理员):仅本群禁言 + 状态"禁言",不修改 is_blacklisted。
 	if (isSpamCommand(text)) {
 		const isGroupIdChat = chatId.toString() === GROUP_ID.toString();
@@ -1650,7 +1650,24 @@ async function handleMessage(message, env) {
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success) {
-			await sendTelegramMessage(chatId, `✅ 已将用户 ${linkedUserId} 添加到黑名单`);
+			let responseMessage = `✅ 已将用户 ${linkedUserId} 添加到黑名单`;
+			// GROUP_ID 主群内 /spam = 拉黑 + 群内即时禁言(与 /ban 一致):
+			// 禁言成功后同步本群状态"禁言",避免"已拉黑(is_blacklisted=1)却仍在主群自由发言"的漏洞。
+			if (isManagedGroupMessage(message)) {
+				try {
+					await muteChatMember(chatId, repliedUserId);
+					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.MUTED);
+					responseMessage += `\n✅ 已在群内禁言 <a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
+				} catch (error) {
+					console.error('群内禁言失败:', error);
+					if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
+						responseMessage += '\nℹ️ 该用户当前不在群内，未执行禁言';
+					} else {
+						responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
+					}
+				}
+			}
+			await sendTelegramMessage(chatId, responseMessage);
 		} else {
 			await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${linkedUserId}`);
 		}
@@ -3764,25 +3781,30 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 }
 
 // ========================================================
-// 联网黑名单自动查杀(非 GROUP_ID 群, bot 为群管理员时启用)
+// 联网黑名单自动查杀(bot 为管理员且有限制成员权限的任意群,含 GROUP_ID 主群)
 // ========================================================
 // 概要:
-// - 触发条件:事件发生在非 GROUP_ID 的群聊,且 bot 仍是该群管理员(administrator/creator;
-//   administrator 还需具备 can_restrict_members 权限,否则禁言/封禁无法执行,模式视为不可用)。
-// - 触发事件:① 新成员入群(new_chat_members) ② 真人发送消息(消息路径)。
+// - 触发条件:事件发生在群聊(含 GROUP_ID 主群与其他群),且 bot 仍是该群管理员
+//   (administrator/creator;administrator 还需具备 can_restrict_members 权限,否则禁言/封禁
+//   无法执行,模式视为不可用);私聊/频道不触发。
+// - 触发事件:① 新成员入群(new_chat_members,仅非 GROUP_ID 群接线;GROUP_ID 主群入群仍走
+//   既有封禁级拦截 handleNewChatMemberBots,不接入本查杀) ② 真人发送消息(消息路径,含 GROUP_ID
+//   主群与其他群)。
 // - 新 TGID(users 表无记录):自动建档,active_group_ids 记录本群 + 状态"健康",放行
 //   (新用户不可能在 联网黑名单)。
 // - 存量 TGID:本群状态为"健康"且 is_blacklisted=1(联网黑名单)→ 禁言 + 本群状态同步"禁言" +
-//   群内通知,通知附带"永久封禁 / 加入白名单"按钮(仅本群管理员可点)。
+//   群内通知。GROUP_ID 主群命中→通知不带按钮(按钮回调在主群会被防御拦截),文案提示管理员用
+//   /ban、/unban 命令处置;其他群命中→通知附带"永久封禁 / 加入白名单"按钮(仅本群管理员可点)。
 // - 按钮"永久封禁"→ banChatMember 踢出 + 本群状态"封禁";"加入白名单"→ unban + 恢复发言 +
 //   状态"白名单"(白名单为本群豁免,不再触发查杀)。
+// - 消息路径查杀覆盖 GROUP_ID 主群:主群内 /spam、/ban 只 addToBlacklist(置 is_blacklisted=1)
+//   而群内状态仍为"健康"的用户,再次发言即被本查杀禁言并标记,封堵"已拉黑却仍在主群自由发言"漏洞。
 // - 非 GROUP_ID 群内的 /ban /spam /unban 仅维护本群状态,绝不修改 is_blacklisted;
 //   is_blacklisted 只代表"联网黑名单"(GROUP_ID 群黑名单),只能由 GROUP_ID 群内的
 //   /ad /ban /spam /unban 修改。
 const NETKILL_BUTTON_PREFIX = 'cmk:';
 
 const NETKILL_LOG_LABELS = {
-	'trigger:skip-group-id': '跳过:消息来自 GROUP_ID 主群,不启用联网查杀',
 	'trigger:skip-not-group-chat': '跳过:非群聊(私聊/频道),不启用联网查杀',
 	'trigger:skip-no-db': '跳过:未绑定 D1,无法维护 active_group_ids 群组状态',
 	'trigger:skip-bot-not-admin': '跳过:bot 不是当前群管理员(或缺少限制成员权限),联网查杀模式未启用',
@@ -3793,7 +3815,7 @@ const NETKILL_LOG_LABELS = {
 	'action:mute:success': '成功:已禁言并同步本群状态为"禁言"',
 	'action:mute:failed': '失败:禁言失败(不写状态、不通知)',
 	'status:admin-detected': '检测:目标用户实为本群管理员,禁言被 TG API 拒绝,记录状态"管理员"避免重复尝试',
-	'notify:sent': '已发送联网黑名单通知与管理员操作按钮',
+	'notify:sent': '已发送联网黑名单通知(GROUP_ID 主群无按钮,其他群带管理员按钮)',
 	'callback:ban:start': '按钮:本群管理员点击"永久封禁"',
 	'callback:ban:success': '按钮:已永久封禁并同步本群状态"封禁"',
 	'callback:ban:failed': '按钮:永久封禁失败',
@@ -3920,38 +3942,46 @@ async function restrictUserInChat(chatId, userId) {
 	return result;
 }
 
-// 构建联网查杀通知文案 + 操作按钮(仅本群管理员可点,业务侧校验)
-function buildNetKillNotification(tgid, member) {
+// 构建联网查杀通知文案 + 操作按钮(仅本群管理员可点,业务侧校验)。
+// options.withButtons=false 用于 GROUP_ID 主群:主群内不带任何按钮(按钮回调在主群会被防御拦截),
+// 文案末尾追加一行提示管理员可用 /ban、/unban 命令处置。
+function buildNetKillNotification(tgid, member, { withButtons = true } = {}) {
 	const mention = formatUserMention(member)
 		|| `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
-	const text = `⚠️ <b>#黑名单用户检测</b>
+	let text = `⚠️ <b>#黑名单用户检测</b>
 
 🚫 该用户存在于 <b>联网黑名单</b> 中，已在本群禁言处理。
 
 👤 用户: ${mention}
-📋 TGID: <code>${escapeHtml(tgid)}</code>
+📋 TGID: <code>${escapeHtml(tgid)}</code>`;
+	let replyMarkup;
+	if (withButtons) {
+		text += `
 
 👇 仅限本群管理员操作：`;
-	const replyMarkup = {
-		inline_keyboard: [[
-			{ text: '🔨 永久封禁', callback_data: `${NETKILL_BUTTON_PREFIX}ban:${tgid}` },
-			{ text: '✅ 加入白名单', callback_data: `${NETKILL_BUTTON_PREFIX}wl:${tgid}` }
-		]]
-	};
+		replyMarkup = {
+			inline_keyboard: [[
+				{ text: '🔨 永久封禁', callback_data: `${NETKILL_BUTTON_PREFIX}ban:${tgid}` },
+				{ text: '✅ 加入白名单', callback_data: `${NETKILL_BUTTON_PREFIX}wl:${tgid}` }
+			]]
+		};
+	} else {
+		text += `
+
+💡 本群为主群：管理员可用 <code>/ban</code> 永久封禁，或 <code>/unban</code> 将其移出联网黑名单。`;
+	}
 	return { text, replyMarkup };
 }
 
 // 联网黑名单自动查杀主逻辑:
 // members 为待检查的 user 对象数组(入群事件取 new_chat_members,普通消息取 [message.from])。
-// 仅在非 GROUP_ID 群 + bot 为该群管理员时生效;依赖 D1(active_group_ids / is_blacklisted)。
+// 适用于 bot 为管理员的任意群聊(含 GROUP_ID 主群):内部守卫顺序为 chat.type 群聊 → 绑定 D1 →
+// bot 是当前群管理员;命中 is_blacklisted 且本群状态"健康" → 禁言 + 本群状态"禁言" + 群内通知
+// (GROUP_ID 主群通知不带按钮,见 buildNetKillNotification);依赖 D1(active_group_ids / is_blacklisted)。
 async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) {
 	if (!chat || !Array.isArray(members) || members.length === 0) return;
 	const chatId = chat.id;
 	if (chatId === undefined || chatId === null) return;
-	if (chatId.toString() === GROUP_ID.toString()) {
-		logNetKill('trigger:skip-group-id', { chatId: chatId.toString() });
-		return;
-	}
 	if (chat.type !== 'group' && chat.type !== 'supergroup') {
 		logNetKill('trigger:skip-not-group-chat', { chatId: chatId.toString(), type: chat.type });
 		return;
@@ -3987,15 +4017,18 @@ async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) 
 			continue;
 		}
 
-		// action === 'mute':命中 联网黑名单 → 禁言 + 本群状态同步"禁言" + 通知按钮
+		// action === 'mute':命中 联网黑名单 → 禁言 + 本群状态同步"禁言" + 群内通知
+		// (GROUP_ID 主群通知无按钮;其他群通知带管理员操作按钮,见 buildNetKillNotification)
 		logNetKill('action:mute:start', { tgid, chatId: chatId.toString() });
 		try {
 			await muteChatMember(chatId, member.id);
 			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.MUTED);
 			logNetKill('action:mute:success', { tgid, chatId: chatId.toString() });
-			const notification = buildNetKillNotification(tgid, member);
+			// GROUP_ID 主群通知不带按钮(按钮回调在主群会被防御拦截);其他群带管理员操作按钮
+			const inGroupId = chatId.toString() === GROUP_ID.toString();
+			const notification = buildNetKillNotification(tgid, member, { withButtons: !inGroupId });
 			await sendTelegramMessage(chatId, notification.text, notification.replyMarkup, replyToMessageId);
-			logNetKill('notify:sent', { tgid, chatId: chatId.toString() });
+			logNetKill('notify:sent', { tgid, chatId: chatId.toString(), inGroupId });
 		} catch (error) {
 			const errMsg = String(error?.message || '');
 			// 目标实为本群管理员/群主时 TG API 拒绝 restrict → 记录"管理员"避免每条消息重复尝试
@@ -4021,7 +4054,8 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 		return true;
 	}
 	if (chatId.toString() === GROUP_ID.toString()) {
-		// 防御:该按钮只应出现在非 GROUP_ID 群的通知里
+		// 防御:GROUP_ID 主群的查杀通知已不带按钮(见 buildNetKillNotification,withButtons=false),
+		// 此分支兜底拦截任何历史遗留/伪造的 cmk: 按钮回调,防止绕过命令通道在主群直接操作。
 		try { await answerCallbackQuery(callbackQuery.id, '无效操作', true); } catch (_) { }
 		return true;
 	}
