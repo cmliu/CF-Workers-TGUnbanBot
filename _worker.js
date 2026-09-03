@@ -1649,9 +1649,9 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	let responseMessage = '';
 	if (isBannedAnywhere) {
 		// #封禁查询 作为话题标签(Telegram 中 #+连续字符即 tag),管理员可按标签检索历史封禁查询记录
-		responseMessage += `🔍 <b>#封禁查询</b>\n\n`;
+		responseMessage += `🔍 <b>#封禁查询结果</b>\n\n`;
 	} else {
-		responseMessage += `✅ <b>查询结果</b>\n\n`;
+		responseMessage += `✅ <b>#封禁查询结果</b>\n\n`;
 	}
 
 	if (options.targetUser) {
