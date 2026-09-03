@@ -25,7 +25,10 @@ let BOT_ID = null;
 // - 投票状态持久化到 env.KV: key = ad_vote:<vote_token>, TTL 7 天。
 // - 结束时调用 editMessageText 移除按钮,若赞成胜出则触发封禁(写入 KV 黑名单 + 群内禁言)。
 // - /ad 不出现在 setMyCommands 命令菜单中(保持隐藏)。
-// - 非管理员(含普通用户)触发 /ad:助推者/白名单直接发起投票;普通用户回复消息 + /ad 时内容交 AI 评级,仅 A/B 弹投票,C/D 或 AI 失败完全静默,均不发权限提示。
+// - 非管理员(含普通用户)触发 /ad:助推者/白名单直接发起投票;普通用户回复消息 + /ad 时先发占位
+//   "AI 正在评级",评级 A/B 把占位编辑为投票,C/D 或 AI 失败把占位编辑为"未触发投票"收尾,均不发权限提示。
+// - 主群内 /ad 命令消息发送后即被删除(隐藏命令痕迹);需要 await AI 的场景均先发占位消息再编辑落定,
+//   避免"等待 AI 期间群内无任何回应"的失效观感;纯 /ad <tgid> 无内容直接 C 级投票时不发占位。
 // ========================================================
 
 // 回退阈值:AI 不可用 / 直接传 tgid / 无文字内容时使用(默认 C 可疑 6 票)
@@ -1939,37 +1942,30 @@ async function handleMessage(message, env) {
 		return;
 	}
 
-	// 处理任一主群内管理员 /ad - 发起隐藏的举报投票(动作只在该主群内生效,不跨群广播)
+	// 处理任一主群内 /ad - 发起隐藏的举报投票(动作只在该主群内生效,不跨群广播)
 	if (isAdCommand(text)) {
 		if (!isMainGroup(chatId)) {
 			return;
 		}
+		// 删除 /ad 命令消息,隐藏命令痕迹(bot 非群管理员时删除失败仅打日志,不阻断后续流程)
+		await deleteMessage(chatId, message.message_id);
 		const isAdmin = await checkIfUserIsAdmin(userId);
 		if (!isAdmin) {
 			// 非管理员→检查助推者(当前主群) / 白名单
 			const isBoosted = await checkIfUserBoostedInChat(chatId, userId);
 			const isAllowed = await isAdAllowlisted(env, userId);
 			if (!isBoosted && !isAllowed) {
-				// 普通用户举报通道:回复消息 + /ad → 内容交 AI 评级,仅 A/B 才弹投票,其余完全静默
+				// 普通用户举报通道:回复消息 + /ad → 评级逻辑已收敛进 handleAdCommand(userReport 模式:
+				// 先发占位消息,AI 评级 A/B 编辑为投票;C/D 或 AI 无法评级编辑为"未触发投票"收尾)。
+				// 此处仅做"有无可评内容"门槛:非回复或无文字(caption 也算)→ 命令消息已删除,静默。
 				const replyMsg = message.reply_to_message;
 				const src = (typeof replyMsg?.text === 'string' && replyMsg.text.length > 0)
 					? replyMsg.text
 					: (typeof replyMsg?.caption === 'string' && replyMsg.caption.length > 0 ? replyMsg.caption : '');
 				if (!src) {
-					return; // 非回复方式或无文字内容 → 静默
+					return; // 非回复方式或无文字内容 → 命令消息已删除,静默
 				}
-				const userReportAssessment = await assessThreatWithAI(env, src.slice(0, AD_AI_MAX_CONTENT_CHARS), AD_GROUP_RULES);
-				console.log('[ad-user-report] 普通用户举报评级结果:', JSON.stringify(userReportAssessment ? {
-					ok: userReportAssessment.ok, level: userReportAssessment.level, score: userReportAssessment.score
-				} : null));
-				if (!userReportAssessment?.ok) {
-					return; // AI 失败/无法识别 → 静默
-				}
-				if (userReportAssessment.level !== 'A' && userReportAssessment.level !== 'B') {
-					return; // C/D → 静默
-				}
-				// A/B → 按 /ad 逻辑弹投票(传入预评级,避免 handleAdCommand 内重复调用 AI)
-				await handleAdCommand(message, env, userReportAssessment);
+				await handleAdCommand(message, env, null, { userReport: true });
 				return;
 			}
 		}
@@ -3366,9 +3362,13 @@ async function checkAdDuplicate(chatId, tgid, env) {
 	};
 }
 
-async function handleAdCommand(message, env, preAssessedThreat = null) {
+async function handleAdCommand(message, env, preAssessedThreat = null, options = {}) {
 	const chatId = message.chat.id;
 	const userId = message.from.id;
+	// options.userReport=true → 普通用户举报通道(无举报权限):
+	// AI 评级明确 A/B 才把占位消息编辑为投票;评级 C/D 或 AI 无法评级 → 把占位编辑为
+	// "未触发投票"收尾文案,不建投票 state、不写 KV(取代旧"外层预评级+非A/B完全静默")。
+	const userReportMode = Boolean(options && options.userReport);
 
 	// 1. 必须在任一主群内(/ad 投票"动作发生在哪个主群就只在哪个主群处理",不跨群广播)
 	if (!isMainGroup(chatId)) {
@@ -3459,29 +3459,80 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 		reportContent = src.slice(0, AD_AI_MAX_CONTENT_CHARS);
 	}
 
-	// 被举报用户资料(昵称/用户名/简介):广告常把内容藏匿于其中,一并发给 AI 判断
+	// 被举报用户资料(昵称/用户名/简介):广告常把内容藏匿于其中,一并发给 AI 判断。
+	// 注意:普通用户举报通道(userReportMode)保持旧评级口径——只评被举报消息的
+	// 文字内容(与旧"外层预评级"一致),不把目标用户资料纳入评级输入,避免因昵称/简介
+	// 额外触发普通用户举报投票(评级输入变化会扩大"谁能触发投票"的边界)。
 	const profileText = buildUserProfileText(targetUserSnapshot);
 	const aiContentParts = [];
 	if (reportContent) {
 		aiContentParts.push(`被举报消息内容:\n${reportContent}`);
 	}
-	if (profileText) {
+	if (!userReportMode && profileText) {
 		aiContentParts.push(`被举报用户资料:\n${profileText}`);
 	}
 	const aiContent = aiContentParts.join('\n\n');
 
-	// 5. AI 威胁评级:有可判断内容(消息或用户资料)→ 调用 Workers AI 判断;
-	//    完全无可判断内容(纯 tgid 且未取到资料)→ 回退 C 可疑(AD_VOTE_THRESHOLD 票);
-	//    AI 基础设施失败(未绑定/超时/异常)→ 回退 🟡C 可疑 6 票;有响应但无法识别/拒绝答复 → 按 🟠B 危险 4 票;
-	//    普通用户举报通道(preAssessedThreat 非空)→ 直接采用预评级,不再调用 AI
-	let threatAssessment = null;
-	if (!preAssessedThreat && aiContent) {
-		threatAssessment = await assessThreatWithAI(env, aiContent, AD_GROUP_RULES);
+	// 5. 交互占位 + AI 威胁评级(本次交互增强核心):
+	//    - 需要 await AI 的场景先发占位消息,让"等待评级"期间群内有可见回执;评级完成后
+	//      再把占位消息编辑为终态(投票消息 或 普通用户的无害/未触发投票收尾),全程无空窗。
+	//    - 完全无可评内容的普通用户举报(上游 handleMessage 已拦截,此处防御性兜底)→ 静默收尾。
+	if (userReportMode && !preAssessedThreat && !aiContent) {
+		console.log('[ad-user-report] 普通用户举报无可评内容,静默收尾');
+		return;
 	}
-	let threat;
+
+	// 是否将调用 AI:preAssessedThreat 非空表示外部已评级完毕(兼容旧调用点),不再调用 AI
+	const willRunAi = !preAssessedThreat && Boolean(aiContent);
+
+	// 先发占位消息(带 reply_to_message_id=被举报消息,确保编辑后上下文引用仍在)
+	let placeholderMessageId = null;
+	if (willRunAi) {
+		const placeholderText = '🔍 举报已收到，AI 正在对举报内容进行评级，请稍候…';
+		const placeholderSent = await sendTelegramMessage(chatId, placeholderText, null, replyToMessageId);
+		if (placeholderSent && placeholderSent.ok && placeholderSent.result?.message_id) {
+			placeholderMessageId = placeholderSent.result.message_id;
+			console.log(`[ad-user-report] 占位消息已发送 messageId=${placeholderMessageId}`);
+		} else {
+			// 占位发送失败:不阻断,后续投票路径走"另发投票消息"兜底 / 无害路径仅打日志静默收尾
+			console.error('[/ad] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
+		}
+	}
+
+	// 6. 调用 Workers AI 判断威胁评级(普通用户通道的评级也收敛至此,不再在 handleMessage 外层预评级)。
+	let threatAssessment = null;
+	if (willRunAi) {
+		threatAssessment = await assessThreatWithAI(env, aiContent, AD_GROUP_RULES);
+		if (userReportMode) {
+			console.log('[ad-user-report] 普通用户举报评级结果:', JSON.stringify(threatAssessment ? {
+				ok: threatAssessment.ok,
+				level: threatAssessment.level,
+				score: threatAssessment.score,
+				code: threatAssessment.code || null
+			} : null));
+		}
+	}
+
+	// 7. 评级决策:
+	//    - preAssessedThreat(兼容旧调用点:外部已评级)→ 直接采用,不再调 AI;
+	//    - 普通用户通道 → 仅 AI 明确 A/B 弹投票;C/D → 无害收尾;AI 失败/无法识别/拒答 → 未评级收尾
+	//      (与旧"仅 A/B 弹投票,其余完全静默"的触发口径一致,区别是现在通过编辑占位给出可见反馈);
+	//    - 有举报权限通道 → 评级只决定门槛,一律弹投票(AI成功按评级 / unrecognized→B / 失败→C / 无内容→C)。
+	let threat = null;
+	let closeKind = null; // 'harmless'=明确无害 | 'unassessable'=AI无法评级 | null=弹投票
 	if (preAssessedThreat) {
-		// 普通用户举报通道预评级路径:直接采用,不再调用 AI
 		threat = preAssessedThreat;
+		if (userReportMode && threat.level !== 'A' && threat.level !== 'B') {
+			closeKind = 'harmless'; // 外部预评级已明确 C/D → 无害收尾
+		}
+	} else if (userReportMode) {
+		if (threatAssessment?.ok && (threatAssessment.level === 'A' || threatAssessment.level === 'B')) {
+			threat = threatAssessment; // 明确 A/B → 弹投票
+		} else if (threatAssessment?.ok) {
+			closeKind = 'harmless'; // 明确 C/D → 无害收尾
+		} else {
+			closeKind = 'unassessable'; // AI 失败/无法识别/拒答 → 未评级收尾,不弹投票
+		}
 	} else if (threatAssessment?.ok) {
 		threat = threatAssessment;
 	} else if (threatAssessment?.code === 'unrecognized') {
@@ -3503,7 +3554,7 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 			threshold: AD_THREAT_RATINGS.C.votes
 		};
 	} else {
-		// 完全无可判断内容 → 中性 C 可疑
+		// 完全无可判断内容 → 中性 C 可疑(不 await AI 的纯 tgid 直接投票场景也走这里)
 		threat = {
 			level: 'C',
 			label: AD_THREAT_RATINGS.C.label,
@@ -3513,7 +3564,27 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 		};
 	}
 
-	// 最终评级决策日志:诊断哪条路径生效(预评级 / 无内容 / AI成功 / AI拒答-unrecognized / AI异常-null)
+	// 8. 无需投票 → 把占位消息编辑为收尾文案后结束(不建投票 state、不写 KV)。
+	//    占位发送失败/未发占位 → 仅打日志静默收尾(不补发,避免向普通用户暴露隐藏举报通道)。
+	if (closeKind) {
+		const closeText = closeKind === 'harmless'
+			? '✅ 举报内容无害，未触发投票'
+			: '⚠️ AI 暂时无法完成评级，未触发投票（可联系管理员处理）';
+		console.log(`[ad-user-report] 普通用户举报无需投票 closeKind=${closeKind} placeholderMessageId=${placeholderMessageId}`);
+		if (placeholderMessageId) {
+			const closeResult = await editMessageText(chatId, placeholderMessageId, closeText);
+			if (!closeResult || !closeResult.ok) {
+				// 编辑失败 → 尽力删除占位,避免群内残留"AI 评级中"的悬空消息
+				console.error('[ad-user-report] 编辑占位为收尾文案失败,尝试删除占位:', JSON.stringify(closeResult));
+				await deleteMessage(chatId, placeholderMessageId);
+			}
+		} else {
+			console.log('[ad-user-report] 无占位可编辑,静默收尾 closeKind=', closeKind);
+		}
+		return;
+	}
+
+	// 9. 弹投票:最终评级决策日志(诊断哪条路径生效:预评级 / 无内容 / AI成功 / AI拒答-unrecognized / AI异常-null)
 	const path = preAssessedThreat
 		? 'preassessed-user-report'
 		: !aiContent
@@ -3529,13 +3600,14 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 		label: threat.label,
 		score: threat.score,
 		threshold: threat.threshold,
-		reason: threat.reason
+		reason: threat.reason,
+		userReportMode
 	}));
 
 	const now = Math.floor(Date.now() / 1000);
 	const voteToken = Math.random().toString(36).slice(2, 10); // 8字符随机 token
 
-	// 6. 构造初始投票状态,发起人自动算 1 票赞成;阈值由 AI 威胁评级决定
+	// 10. 构造初始投票状态,发起人自动算 1 票赞成;阈值由 AI 威胁评级决定(字段语义保持不变)
 	const state = {
 		voteToken,
 		messageId: null,
@@ -3562,18 +3634,44 @@ async function handleAdCommand(message, env, preAssessedThreat = null) {
 
 	const initialText = buildAdVoteMessageText(state);
 
-	// 先用 token 存 KV(确保按钮点击时 state 已存在),再发消息
+	// 先用 token 存 KV(确保按钮点击时 state 已存在),再把占位编辑为投票 / 或另发投票消息
 	await saveAdVoteState(env, state);
 
 	const initialMarkup = buildAdVoteInlineKeyboard(voteToken, state);
-	const sentMessage = await sendTelegramMessage(chatId, initialText, initialMarkup, replyToMessageId);
-	if (!sentMessage || !sentMessage.ok || !sentMessage.result?.message_id) {
-		console.error('[/ad] 发送投票消息失败:', JSON.stringify(sentMessage));
-		return;
+
+	// 11. 投票消息落地:
+	//     - 有占位 → 优先把占位消息编辑为投票文本+键盘(编辑保留对被举报消息的 reply 引用,
+	//       messageId 不变 → state.messageId=占位 id,按钮回调/刷新/finalize 全部复用既有状态机);
+	//     - 无占位(如纯 tgid 直接 C 级投票)或占位编辑失败 → 回退为另发一条投票消息(既有路径)。
+	let voteMessageId = null;
+	if (placeholderMessageId) {
+		const editResult = await editMessageText(chatId, placeholderMessageId, initialText, initialMarkup);
+		if (editResult && editResult.ok) {
+			// 编辑成功后 Telegram 保持原 message_id 不变,仍等于占位消息 id
+			voteMessageId = editResult.result?.message_id || placeholderMessageId;
+			console.log(`[/ad] 已把占位消息编辑为投票消息 messageId=${voteMessageId}`);
+		} else {
+			console.error('[/ad] 编辑占位为投票失败,回退为另发一条投票消息:', JSON.stringify(editResult));
+		}
+	}
+	if (!voteMessageId) {
+		const sentMessage = await sendTelegramMessage(chatId, initialText, initialMarkup, replyToMessageId);
+		if (!sentMessage || !sentMessage.ok || !sentMessage.result?.message_id) {
+			console.error('[/ad] 发送投票消息失败:', JSON.stringify(sentMessage));
+			if (placeholderMessageId) {
+				await deleteMessage(chatId, placeholderMessageId); // 尽力清理占位,避免残留"评级中"消息
+			}
+			return;
+		}
+		voteMessageId = sentMessage.result.message_id;
+		if (placeholderMessageId) {
+			// 占位编辑失败已另发投票 → 尽力删除占位,避免群内出现两条 /ad 相关消息
+			await deleteMessage(chatId, placeholderMessageId);
+		}
 	}
 
-	// 回填 messageId,用于后续 editMessageText
-	state.messageId = sentMessage.result.message_id;
+	// 回填 messageId,用于后续 editMessageText(投票按钮回调 / 刷新 / finalize 复用既有状态机)
+	state.messageId = voteMessageId;
 	await saveAdVoteState(env, state);
 }
 
