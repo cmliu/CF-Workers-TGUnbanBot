@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS users (
   created_at INTEGER NOT NULL DEFAULT 0,
   last_unban_at INTEGER NOT NULL DEFAULT 0,
   unbanned_by TEXT NOT NULL DEFAULT '',
+  last_self_unban_at INTEGER NOT NULL DEFAULT 0,
   message_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -343,7 +344,8 @@ async function ensureDbSchema(env) {
 	const upgradeCols = [
 		['is_gky_blacklisted', 'INTEGER NOT NULL DEFAULT 0'],
 		['banned_by', "TEXT NOT NULL DEFAULT ''"],
-		['unbanned_by', "TEXT NOT NULL DEFAULT ''"]
+		['unbanned_by', "TEXT NOT NULL DEFAULT ''"],
+		['last_self_unban_at', 'INTEGER NOT NULL DEFAULT 0']
 	];
 	for (const [name, def] of upgradeCols) {
 		if (!cols.includes(name)) {
@@ -617,7 +619,7 @@ async function dbCheckBlacklist(env, userId) {
 	const cached = dbUserCache.get(tgid);
 	if (cached && (now - cached.fetchedAt) < DB_USER_CACHE_TTL_MS) {
 		return cached.isBlacklisted
-			? { isBlacklisted: true, message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。', banReason: cached.banReason, bannedAt: cached.bannedAt }
+			? { isBlacklisted: true, message: '❌ 您的TGID在联网黑名单中，请自行联系管理员解封。', banReason: cached.banReason, bannedAt: cached.bannedAt }
 			: { isBlacklisted: false, message: null };
 	}
 	try {
@@ -633,7 +635,7 @@ async function dbCheckBlacklist(env, userId) {
 		}
 		dbUserCache.set(tgid, { isBlacklisted, banReason, bannedAt, fetchedAt: now });
 		return isBlacklisted
-			? { isBlacklisted: true, message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。', banReason, bannedAt }
+			? { isBlacklisted: true, message: '❌ 您的TGID在联网黑名单中，请自行联系管理员解封。', banReason, bannedAt }
 			: { isBlacklisted: false, message: null };
 	} catch (error) {
 		console.error('检查黑名单时出错:', error);
@@ -656,11 +658,11 @@ async function dbAddToBlacklist(env, userId, source, operatorId) {
 			console.log(`[DB] 黑名单写入拒绝: tgid=${tgid} 是群组管理员,不允许加入黑名单`);
 			// 顺手修复存量脏数据(历史遗留的 is_blacklisted=1 管理员行)
 			await dbClearBlacklistStatus(env, tgid);
-			return { success: false, adminExempt: true, message: '⚠️ 该用户是群组管理员，不能加入黑名单' };
+			return { success: false, adminExempt: true, message: '⚠️ 该用户是群组管理员，不能加入联网黑名单' };
 		}
 		const existing = await env.DB.prepare('SELECT is_blacklisted FROM users WHERE tgid = ?').bind(tgid).first();
 		if (existing?.is_blacklisted) {
-			return { success: false, alreadyExists: true, message: '⚠️ 该用户已在黑名单中' };
+			return { success: false, alreadyExists: true, message: '⚠️ 该用户已在联网黑名单中' };
 		}
 		await env.DB.prepare(
 			`INSERT INTO users (tgid, is_blacklisted, ban_reason, banned_at, banned_by, created_at)
@@ -672,7 +674,7 @@ async function dbAddToBlacklist(env, userId, source, operatorId) {
 			   banned_by = excluded.banned_by`
 		).bind(tgid, banReason, now, operator, now).run();
 		invalidateDbUserCache(tgid);
-		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单` };
+		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 添加到联网黑名单` };
 	} catch (error) {
 		console.error('添加黑名单时出错:', error);
 		return { success: false, message: '❌ 添加黑名单失败: ' + error.message };
@@ -688,17 +690,108 @@ async function dbRemoveFromBlacklist(env, userId, operatorId) {
 	try {
 		const row = await env.DB.prepare('SELECT is_blacklisted FROM users WHERE tgid = ?').bind(tgid).first();
 		if (!row?.is_blacklisted) {
-			return { success: false, notFound: true, message: `⚠️ 用户 <code>${tgid}</code> 不在黑名单中` };
+			return { success: false, notFound: true, message: `⚠️ 用户 <code>${tgid}</code> 不在联网黑名单中` };
 		}
 		await env.DB.prepare(
 			'UPDATE users SET is_blacklisted = 0, ban_reason = ?, banned_at = ?, last_unban_at = ?, unbanned_by = ? WHERE tgid = ?'
 		).bind('', DB_DEFAULT_UNKNOWN_TIME, Math.floor(Date.now() / 1000), operator, tgid).run();
 		invalidateDbUserCache(tgid);
-		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 从黑名单中移除` };
+		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 从联网黑名单中移除` };
 	} catch (error) {
 		console.error('移除黑名单时出错:', error);
 		return { success: false, message: '❌ 移除黑名单失败: ' + error.message };
 	}
+}
+
+// ========================================================
+// 自助解封防刷冷却(10 分钟):
+// - 背景:用户狂发解封口令("我不是广告狗…")会反复触发解封流程并向主群广播解封通知;
+// - 处理口令前先"抢占冷却名额":10 分钟内已触发过 → 拒绝本次请求并告知可重试时间,
+//   不执行解封、不向主群广播;放行则冷却时间戳原子刷新,本次解封流程继续;
+// - 名额抢占是原子的:INSERT ON CONFLICT DO UPDATE ... WHERE 上次触发已超冷却时长,
+//   并发到达的多条口令只有一条放行(读-改-写两段式会被并发击穿,故不用);
+// - 冷却时间戳存 users.last_self_unban_at(D1);未绑定 D1 回退 KV(selfunban_cd:<tgid>,
+//   键 TTL 与冷却时长一致,到期自动消失即恢复资格);
+// - DB/KV 故障 fail-open 放行,不因基础设施问题阻断正常解封(与 checkBlacklist 容错策略一致);
+// - 时间展示:Telegram Bot API 的 message.from 不提供用户时区字段,无法可靠获知用户时区,
+//   按需求回退为同时展示 UTC 标准时间与东八区(北京时间)时间,用户可自行换算。
+// ========================================================
+const SELF_UNBAN_COOLDOWN_SECONDS = 600;
+// KV 回退方案的冷却键前缀;值 = 上次触发时间(epoch 秒),键带 TTL 自动过期
+const SELF_UNBAN_KV_KEY_PREFIX = 'selfunban_cd:';
+
+// (D1)原子抢占自助解封冷却名额,返回 { allowed, lastAt }:
+// - allowed=true:名额已抢占(last_self_unban_at 已刷新为 now),本次解封流程放行;
+// - allowed=false:仍在冷却期,lastAt = 上次触发时间(epoch 秒,供计算可重试时间);
+// - nowTs 可注入(epoch 秒,测试用),缺省取当前时间。
+// SQL 语义:行不存在 → INSERT(changes=1 放行);行存在且 last_self_unban_at <= now-冷却时长
+// (从未触发/已超冷却)→ UPDATE(changes=1 放行);仍在冷却期内 → WHERE 不满足(changes=0 拒绝)。
+async function dbTryAcquireSelfUnban(env, tgid, nowTs) {
+	if (!hasDb(env)) return { allowed: true, lastAt: 0 };
+	const tgidStr = String(tgid);
+	const now = Number.isFinite(nowTs) ? Math.floor(nowTs) : Math.floor(Date.now() / 1000);
+	const threshold = now - SELF_UNBAN_COOLDOWN_SECONDS;
+	try {
+		const info = await env.DB.prepare(
+			`INSERT INTO users (tgid, last_self_unban_at, created_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(tgid) DO UPDATE SET last_self_unban_at = ?
+			 WHERE users.last_self_unban_at <= ?`
+		).bind(tgidStr, now, now, now, threshold).run();
+		if (info?.meta?.changes === 1) {
+			return { allowed: true, lastAt: now };
+		}
+		const row = await env.DB.prepare('SELECT last_self_unban_at FROM users WHERE tgid = ?').bind(tgidStr).first();
+		return { allowed: false, lastAt: row?.last_self_unban_at || 0 };
+	} catch (error) {
+		console.error('[DB] 自助解封冷却判断失败(fail-open 放行):', error.message);
+		return { allowed: true, lastAt: 0 };
+	}
+}
+
+// 自助解封冷却名额抢占统一入口:D1 优先;未绑定 D1(或未就绪)回退 KV;两者皆无直接放行。
+async function tryAcquireSelfUnbanSlot(env, userId) {
+	if (isDbReady(env)) {
+		return await dbTryAcquireSelfUnban(env, userId);
+	}
+	if (env.KV) {
+		try {
+			const key = SELF_UNBAN_KV_KEY_PREFIX + String(userId);
+			const now = Math.floor(Date.now() / 1000);
+			const raw = await env.KV.get(key);
+			if (raw !== null && raw !== undefined) {
+				const lastAt = parseInt(raw, 10) || 0;
+				if (now - lastAt < SELF_UNBAN_COOLDOWN_SECONDS) {
+					return { allowed: false, lastAt };
+				}
+			}
+			await env.KV.put(key, String(now), { expiration_ttl: SELF_UNBAN_COOLDOWN_SECONDS });
+			return { allowed: true, lastAt: now };
+		} catch (error) {
+			console.error('[自助解封] KV 冷却判断失败(fail-open 放行):', error.message);
+			return { allowed: true, lastAt: 0 };
+		}
+	}
+	return { allowed: true, lastAt: 0 };
+}
+
+// 时间戳(epoch 秒)→ UTC 标准时间字符串;0/缺失 → "未知"
+function formatUtcTimestamp(ts) {
+	if (!ts || ts <= 0) return '未知';
+	const d = new Date(ts * 1000);
+	const pad = (n) => String(n).padStart(2, '0');
+	return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+// 自助解封可重试时间文案:Telegram 不提供用户时区 → UTC 标准时间 + 东八区(北京时间)双行展示
+function formatSelfUnbanRetryTime(ts) {
+	if (!ts || ts <= 0) return '未知';
+	return `🌍 UTC 标准时间:${formatUtcTimestamp(ts)}\n🇨🇳 东八区(北京时间):${formatTimestamp(ts)}`;
+}
+
+// 自助解封冷却提示文案(HTML;retryAtTs = 可再次使用自助解封的起始时间 epoch 秒)
+function buildSelfUnbanCooldownMessage(retryAtTs) {
+	return `⏳ <b>操作过于频繁</b>\n\n由于您近期已使用过自助解封，将不再处理您的自助解封。\n\n⏰ 请在以下时间之后再次使用自助解封：\n${formatSelfUnbanRetryTime(retryAtTs)}`;
 }
 
 // D1 版同步 GKY 黑名单状态(/check 查到 GKY 封禁记录时调用,后期可直接按此字段筛选)
@@ -1368,7 +1461,7 @@ async function checkBlacklist(userId, env) {
 		if (blacklistCache.data.includes(userId.toString()) || blacklistCache.data.includes(userId)) {
 			return {
 				isBlacklisted: true,
-				message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。'
+				message: '❌ 您的TGID在联网黑名单中，请自行联系管理员解封。'
 			};
 		}
 		return { isBlacklisted: false, message: null };
@@ -1391,7 +1484,7 @@ async function checkBlacklist(userId, env) {
 		if (blacklist.includes(userId.toString()) || blacklist.includes(userId)) {
 			return {
 				isBlacklisted: true,
-				message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。'
+				message: '❌ 您的TGID在联网黑名单中，请自行联系管理员解封。'
 			};
 		}
 
@@ -1429,7 +1522,7 @@ async function addToBlacklist(userId, env, source = 'ban', operatorId) {
 
 		// 检查是否已在黑名单中
 		if (blacklist.includes(userIdStr) || blacklist.includes(userId)) {
-			return { success: false, alreadyExists: true, message: '⚠️ 该用户已在黑名单中' };
+			return { success: false, alreadyExists: true, message: '⚠️ 该用户已在联网黑名单中' };
 		}
 
 		// 添加到黑名单
@@ -1437,7 +1530,7 @@ async function addToBlacklist(userId, env, source = 'ban', operatorId) {
 		await env.KV.put('blacklist', JSON.stringify(blacklist));
 		invalidateBlacklistCache(); // 黑名单已写入,立即失效实例级缓存,保证封禁即时生效
 
-		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单` };
+		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 添加到联网黑名单` };
 	} catch (error) {
 		console.error('添加黑名单时出错:', error);
 		return { success: false, message: '❌ 添加黑名单失败: ' + error.message };
@@ -1473,14 +1566,14 @@ async function removeFromBlacklist(userId, env, operatorId) {
 
 		// 检查是否有移除
 		if (blacklist.length === originalLength) {
-			return { success: false, notFound: true, message: `⚠️ 用户 <code>${userIdStr}</code> 不在黑名单中` };
+			return { success: false, notFound: true, message: `⚠️ 用户 <code>${userIdStr}</code> 不在联网黑名单中` };
 		}
 
 		// 保存更新后的黑名单
 		await env.KV.put('blacklist', JSON.stringify(blacklist));
 		invalidateBlacklistCache(); // 黑名单已写入,立即失效实例级缓存,保证解封即时生效
 
-		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 从黑名单中移除` };
+		return { success: true, message: `✅ 已将用户 <code>${userId}</code> 从联网黑名单中移除` };
 	} catch (error) {
 		console.error('移除黑名单时出错:', error);
 		return { success: false, message: '❌ 移除黑名单失败: ' + error.message };
@@ -1630,7 +1723,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		await dbSetGkyBlacklistStatus(options.env, tgidToCheck, Boolean(banlistData.banned));
 	}
 
-	// 2. 查询本地黑名单(数据库版可返回封禁原因/时间,供下方展示)
+	// 2. 查询联网黑名单(主群事件写入的 is_blacklisted;数据库版可返回封禁原因/时间,供下方展示)
 	let isLocalBlacklisted = false;
 	let localBlacklistInfo = null;
 	if (options.env) {
@@ -1672,7 +1765,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		responseMessage += `🌐 <b>GKYbot 库:</b> ⚠️ 查询失败 (${escapeHtml(banlistData.error || '未知错误')})\n`;
 	}
 
-	// 本地黑名单状态(数据库版可附带封禁原因与时间;KV 版仅 ID 数组,无原因字段)
+	// 联网黑名单状态(数据库版可附带封禁原因与时间;KV 版仅 ID 数组,无原因字段)
 	if (options.env) {
 		if (isLocalBlacklisted) {
 			// 兼容旧数据中可能残留的命令后缀(如 '管理员封禁(/ban)'/'管理员封禁(/spam)'),
@@ -1684,12 +1777,12 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 			const tsStr = ts && ts > 0 ? formatTimestamp(ts).slice(0, 16) : ''; // YYYY-MM-DD HH:MM
 			const detail = [reason, tsStr].filter(Boolean).join(', ');
 			const suffix = detail ? ` (${detail})` : '';
-			responseMessage += `💾 <b>本地黑名单:</b> 🚫 <b>已封禁</b>${suffix}\n`;
+			responseMessage += `🛡️ <b>联网黑名单:</b> 🚫 <b>已封禁</b>${suffix}\n`;
 		} else {
-			responseMessage += `💾 <b>本地黑名单:</b> ✅ 正常\n`;
+			responseMessage += `🛡️ <b>联网黑名单:</b> ✅ 正常\n`;
 		}
 	} else {
-		responseMessage += `💾 <b>本地黑名单:</b> ⚠️ 未检查 (未配置KV/D1存储)\n`;
+		responseMessage += `🛡️ <b>联网黑名单:</b> ⚠️ 未检查 (未配置KV/D1存储)\n`;
 	}
 
 	// 3. 输出 GKYbot 详细封禁信息
@@ -1737,8 +1830,8 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 	// 本地 KV 解封操作
 	if (isLocalBlacklisted) {
-		responseMessage += `\n👉 若同意 <b>解除本地黑名单</b>，请发送下方复制的解封命令。`;
-		inlineKeyboard.push([{ text: `📋 点击复制 本地解封 命令`, copy_text: { text: `/unban ${tgidToCheck}` } }]);
+		responseMessage += `\n👉 若同意 <b>解除联网黑名单</b>，请发送下方复制的解封命令。`;
+		inlineKeyboard.push([{ text: `📋 点击复制 联网解封 命令`, copy_text: { text: `/unban ${tgidToCheck}` } }]);
 	}
 
 	const replyMarkup = inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined;
@@ -1753,7 +1846,7 @@ const BOT_MODERATION_LOG_LABELS = {
 	'new-members:found': '检测到新成员入群消息',
 	'skip:new-members-not-target-chat': '跳过：新成员消息不在任一主群',
 	'skip:new-member-without-id': '跳过：新成员缺少用户 ID，无法处理',
-	'skip:new-member-not-blacklisted': '跳过：新入群普通用户不在本地黑名单，正常放行',
+	'skip:new-member-not-blacklisted': '跳过：新入群普通用户不在联网黑名单，正常放行',
 	'skip:new-member-self': '跳过：新成员是当前机器人自己',
 	'new-member-admin-status': '已查询新入群机器人在群里的身份',
 	'skip:new-member-admin-status-check-failed': '跳过：无法确认新入群机器人是否为管理员，为避免误伤不处理',
@@ -1975,7 +2068,7 @@ async function handleMessage(message, env) {
 			const muteUserLabel = message.reply_to_message?.from
 				? formatBannedUserLabel(message.reply_to_message.from)
 				: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
-			await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本群状态: 禁言`);
+			await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本地黑名单: 禁言`);
 			// 回复 /spam 场景:被回复的这条消息即违规内容,处理成功后同步删除
 			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
 			await deleteMessage(chatId, message.reply_to_message.message_id);
@@ -2002,7 +2095,7 @@ async function handleMessage(message, env) {
 
 		const repliedUserId = message.reply_to_message?.from?.id;
 		if (!repliedUserId) {
-			await sendTelegramMessage(chatId, '❌ 请回复要加入黑名单的用户消息后再发送 <code>/spam</code>');
+			await sendTelegramMessage(chatId, '❌ 请回复要加入联网黑名单的用户消息后再发送 <code>/spam</code>');
 			return;
 		}
 
@@ -2015,7 +2108,7 @@ async function handleMessage(message, env) {
 			: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success) {
-			let responseMessage = `✅ 已将用户 ${spamUserLabel} 添加到黑名单`;
+			let responseMessage = `✅ 已将用户 ${spamUserLabel} 添加到联网黑名单`;
 			// 主群(任一)内 /spam = 拉黑 + 群内即时禁言(与 /ban 一致):
 			// 禁言成功后同步本群状态"禁言",避免"已拉黑(is_blacklisted=1)却仍在主群自由发言"的漏洞。
 			if (isManagedGroupMessage(message)) {
@@ -2245,7 +2338,7 @@ async function handleMessage(message, env) {
 		try {
 			await banUserPermanently(chatId, targetUserId);
 			await dbSetUserGroupStatus(env, targetUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
-			await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本群状态: 封禁`);
+			await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本地黑名单: 封禁`);
 			// 回复 /ban 场景:被回复的这条消息即违规内容,封禁成功后同步删除
 			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
 			if (message.reply_to_message) {
@@ -2311,7 +2404,7 @@ async function handleMessage(message, env) {
 				console.error('群内禁言失败:', error);
 				if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
 					responseMessage = result.success
-						? '✅ 已将用户加入黑名单\nℹ️ 该用户当前不在群内，未执行禁言'
+						? '✅ 已将用户加入联网黑名单\nℹ️ 该用户当前不在群内，未执行禁言'
 						: `${responseMessage}\nℹ️ 该用户当前不在群内，未执行禁言`;
 				} else {
 					responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
@@ -2445,6 +2538,15 @@ async function handleMessage(message, env) {
 	}
 	// 检查用户回复是否包含必要内容
 	else if (text && text.includes('我不是广告狗') && text.includes('我是误封的') && text.includes('希望可以解封')) {
+		// 自助解封防刷冷却闸(10 分钟):狂发口令会反复触发解封流程并向主群广播解封通知。
+		// 撞闸(10 分钟内已触发过)→ 只回复"近期已使用过 + 可重试时间",不执行解封、不向主群广播;
+		// 放行 → 冷却时间戳已原子刷新,本次解封流程继续;DB/KV 故障 fail-open 放行,不阻断正常解封。
+		const unbanSlot = await tryAcquireSelfUnbanSlot(env, userId);
+		if (!unbanSlot.allowed) {
+			const lastTriggerAt = unbanSlot.lastAt > 0 ? unbanSlot.lastAt : Math.floor(Date.now() / 1000);
+			await sendTelegramMessage(chatId, buildSelfUnbanCooldownMessage(lastTriggerAt + SELF_UNBAN_COOLDOWN_SECONDS));
+			return;
+		}
 		// KV 异常时保持放行策略：checkBlacklist 内部出错会返回 isBlacklisted=false
 		const blacklistCheck = await checkBlacklist(userId, env);
 		if (blacklistCheck.isBlacklisted) {
@@ -2496,7 +2598,7 @@ async function handleMessage(message, env) {
 			const banlistData = JSON.parse(TG黑名单);
 			if (banlistData.banned) {
 				const botUsername = await getBotUsername();
-				let infoMessage = `⚠️ 注意：您的账号存在封禁黑名单。\n`;
+				let infoMessage = `⚠️ 注意：您的账号在 GKYbot 联网黑名单中存在封禁记录。\n`;
 				infoMessage += `- TGID: <a href="tg://user?id=${banlistData.tgid}">${banlistData.tgid}</a>\n`;
 				if (banlistData.reason) infoMessage += `- 封禁原因: ${banlistData.reason}\n`;
 				infoMessage += `\n需要群组管理员进行<b><a href="https://t.me/${botUsername}?start=check_${banlistData.tgid}">二次审核</a></b>。`;
@@ -3585,11 +3687,11 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		return;
 	}
 
-	// 重复操作预检:目标用户在本群(当前主群)既已被禁言或被 ban、又已存在于本地黑名单时,跳过本次举报投票。
+	// 重复操作预检:目标用户在本群(当前主群)既已被禁言或被 ban、又已存在于联网黑名单时,跳过本次举报投票。
 	const duplicateCheck = await checkAdDuplicate(chatId, targetUserId, env);
-	console.log(`[/ad] 重复预检 tgid=${targetUserId} 已禁言或被ban=${duplicateCheck.mutedOrBanned} 本地黑名单=${duplicateCheck.localBlacklisted} 跳过=${duplicateCheck.shouldSkip}`);
+	console.log(`[/ad] 重复预检 tgid=${targetUserId} 已禁言或被ban=${duplicateCheck.mutedOrBanned} 联网黑名单=${duplicateCheck.localBlacklisted} 跳过=${duplicateCheck.shouldSkip}`);
 	if (duplicateCheck.shouldSkip) {
-		await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已在本群被禁言或被封禁，且已在黑名单中，无需重复发起举报投票`);
+		await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已在本群被禁言或被封禁，且已在联网黑名单中，无需重复发起举报投票`);
 		return;
 	}
 
@@ -4107,7 +4209,7 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 			} catch (banError) {
 				// 用户从未入群等场景,banChatMember 同样返回 400:不回退到禁言,
 				// 黑名单已写入,待用户入群时由入群拦截逻辑封禁
-				console.error('[/ad] finalize 永久封禁失败(用户不在群无法通过 API 封禁),已记入本地黑名单,待其入群时由入群拦截逻辑处理:', banError.message);
+				console.error('[/ad] finalize 永久封禁失败(用户不在群无法通过 API 封禁),已记入联网黑名单,待其入群时由入群拦截逻辑处理:', banError.message);
 			}
 		}
 		// 回复场景:删除被举报的广告消息
@@ -4430,7 +4532,7 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 			await banUserPermanently(chatId, tgid);
 			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.BANNED);
 			await editMessageText(chatId, messageId,
-				`🔨 <b>已永久封禁</b>\n\n${mention} 已移出本群。\n📌 本群状态: 封禁`, removeButtons);
+				`🔨 <b>已永久封禁</b>\n\n${mention} 已移出本群。\n📌 本地黑名单: 封禁`, removeButtons);
 			logNetKill('callback:ban:success', { tgid, chatId: chatId.toString(), operatorId });
 			try { await answerCallbackQuery(callbackQuery.id, '已永久封禁该用户'); } catch (_) { }
 		} catch (error) {
