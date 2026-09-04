@@ -2108,7 +2108,15 @@ async function handleMessage(message, env) {
 			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
 			await deleteMessage(chatId, message.reply_to_message.message_id);
 		} catch (error) {
-			await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
+			// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁",提示后照旧删除被回复消息
+			if (error && error.code === 'TARGET_ALREADY_BANNED') {
+				await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
+				await sendTelegramMessage(chatId, 'ℹ️ 该用户已被封禁，无需禁言');
+				// deleteMessage 内部已 try-catch,独立于禁言成败
+				await deleteMessage(chatId, message.reply_to_message.message_id);
+			} else {
+				await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
+			}
 		}
 			return;
 		}
@@ -2151,14 +2159,18 @@ async function handleMessage(message, env) {
 					await muteChatMember(chatId, repliedUserId);
 					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
 					responseMessage += `\n✅ 已在群内禁言 ${spamUserLabel}`;
-				} catch (error) {
-					console.error('群内禁言失败:', error);
-					if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
-						responseMessage += '\nℹ️ 该用户当前不在群内，未执行禁言';
-					} else {
-						responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
-					}
+			} catch (error) {
+				console.error('群内禁言失败:', error);
+				// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁"并提示
+				if (error && error.code === 'TARGET_ALREADY_BANNED') {
+					await markUserGroupStatus(env, repliedUserId, GROUP_MEMBER_STATUS.BANNED, chatId);
+					responseMessage += '\nℹ️ 该用户已被封禁，未执行禁言';
+				} else if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
+					responseMessage += '\nℹ️ 该用户当前不在群内，未执行禁言';
+				} else {
+					responseMessage += `\n⚠️ 黑名单已处理，但群内禁言失败: ${escapeHtml(error.message)}`;
 				}
+			}
 			}
 			// 回复 /spam 场景:被回复的这条消息即违规内容,拉黑处理成功后同步删除
 			// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
@@ -2437,7 +2449,11 @@ async function handleMessage(message, env) {
 				await markUserGroupStatus(env, targetUserId, GROUP_MEMBER_STATUS.MUTED, chatId);
 			} catch (error) {
 				console.error('群内禁言失败:', error);
-				if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
+				// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁"并提示
+				if (error && error.code === 'TARGET_ALREADY_BANNED') {
+					await markUserGroupStatus(env, targetUserId, GROUP_MEMBER_STATUS.BANNED, chatId);
+					responseMessage += '\nℹ️ 该用户已被封禁，未执行禁言';
+				} else if (String(error.message).includes('PARTICIPANT_ID_INVALID')) {
 					responseMessage = result.success
 						? '✅ 已将用户加入联网黑名单\nℹ️ 该用户当前不在群内，未执行禁言'
 						: `${responseMessage}\nℹ️ 该用户当前不在群内，未执行禁言`;
@@ -2776,6 +2792,19 @@ async function deleteMessage(chatId, messageId) {
 
 // Telegram moderation helpers
 async function muteChatMember(chatId, userId) {
+	// 预检:目标已被封禁(kicked)时禁止禁言——对已封禁用户执行 restrictChatMember 会把
+	// "封禁"降级为"受限"(归还查看消息权限,且可重新入群,等于变相解封)。
+	// getChatMemberInfo 查询失败/用户从未入群返回 null → 放行走原逻辑
+	// (从未入群时 restrictChatMember 会报 PARTICIPANT_ID_INVALID,由调用方既有分支处理)。
+	// 注:预检与 restrict 之间存在极小竞态窗口(其他 bot 恰在两步之间封禁),无法完全消除,
+	// 但覆盖了确定性场景(nmBot 等已封禁后本 bot 再禁言)。
+	const memberInfo = await getChatMemberInfo(chatId, userId);
+	if (memberInfo?.status === 'kicked') {
+		const error = new Error('TARGET_ALREADY_BANNED: 用户已被封禁,跳过禁言(避免封禁被降级为受限)');
+		error.code = 'TARGET_ALREADY_BANNED';
+		throw error;
+	}
+
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/restrictChatMember`;
 	const body = {
 		chat_id: chatId,
@@ -4246,7 +4275,14 @@ async function finalizeAdVote(env, state, chatId, messageId, result) {
 				// 禁言成功 → 标记该用户在本群(state.chatId)状态为"禁言"
 				await markUserGroupStatus(env, state.targetUserId, GROUP_MEMBER_STATUS.MUTED, state.chatId);
 			} catch (muteError) {
-				console.error('[/ad] finalize 禁言失败:', muteError.message);
+				// 禁言预检发现目标已被封禁(竞态窗口兜底:checkUserStatusInChat 预检之后、
+				// restrict 之前恰被其他 bot 封禁):不降级封禁状态,如实记录"封禁"状态
+				if (muteError && muteError.code === 'TARGET_ALREADY_BANNED') {
+					await markUserGroupStatus(env, state.targetUserId, GROUP_MEMBER_STATUS.BANNED, state.chatId);
+					console.log(`[/ad] finalize 预检发现用户 ${state.targetUserId} 已被封禁,跳过禁言并记封禁状态(避免封禁降级为受限)`);
+				} else {
+					console.error('[/ad] finalize 禁言失败:', muteError.message);
+				}
 			}
 		} else {
 			// 不在群:永久封禁为主动作
@@ -4308,6 +4344,7 @@ const NETKILL_LOG_LABELS = {
 	'action:mute:start': '开始:命中联网黑名单,执行禁言',
 	'action:mute:success': '成功:已禁言并同步本群状态为"禁言"',
 	'action:mute:failed': '失败:禁言失败(不写状态、不通知)',
+	'action:mute:skipped-banned': '跳过:目标已被封禁,不执行禁言(避免封禁降级为受限),本群状态记为"封禁"',
 	'status:admin-detected': '检测:目标用户实为本群管理员,禁言被 TG API 拒绝,记录状态"管理员"避免重复尝试',
 	'notify:sent': '已发送联网黑名单通知(主群(任一)无按钮,其他群带管理员按钮)',
 	'callback:ban:start': '按钮:本群管理员点击"永久封禁"',
@@ -4522,6 +4559,14 @@ async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) 
 			logNetKill('notify:sent', { tgid, chatId: chatId.toString(), inGroupId });
 		} catch (error) {
 			const errMsg = String(error?.message || '');
+			// 禁言预检发现目标已被封禁:不降级封禁状态。如实记本群状态"封禁"(决策矩阵对
+			// 封禁状态 skip,不会重复查杀);用户已被封禁不可见,不发送群内通知、不发
+			// answerCallbackQuery(无事发生不打扰,与既有"noops 不进通知"口径一致)。
+			if (error && error.code === 'TARGET_ALREADY_BANNED') {
+				await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.BANNED);
+				logNetKill('action:mute:skipped-banned', { tgid, chatId: chatId.toString() });
+				continue;
+			}
 			// 目标实为本群管理员/群主时 TG API 拒绝 restrict → 记录"管理员"避免每条消息重复尝试
 			if (/administrator|chat creator|creator of the chat/i.test(errMsg)) {
 				await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.ADMIN);
