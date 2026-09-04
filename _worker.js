@@ -1189,12 +1189,13 @@ async function restoreUserInSingleMainGroup(chatId, userId, env) {
 }
 
 // 恢复用户在全部主群的状态(unban 解封 / restrict 解除禁言):逐主群处理 + 聚合文案。
-// 返回 { success, notifyMainGroups, message, broadcastMessage }:
-//   - notifyMainGroups: 是否实际执行过恢复动作/存在失败(供"自助解封处理后是否需要向主群广播"判断);
+// 返回 { success, notifyMainGroups, message, broadcastPerGroup }:
+//   - notifyMainGroups: 是否存在任一主群需要广播(该群有真实动作或失败);
 //     纯信息性条目(用户不在群/本就是成员/是管理员,无任何副作用)不触发广播(2026-09-04 用户反馈)。
 //   - message:          全量明细(✅ 动作 + ℹ️ 信息 + ⚠️ 失败),面向用户本人私聊 DM / /unban 操作反馈;
-//   - broadcastMessage: 主群广播专用文案,仅含 ✅ 动作行与 ⚠️ 失败行——"无事发生"的群不出现在
-//     主群通知里(如"用户当前不在群内，且未处于封禁状态",这对该群管理员没有任何行动价值)。
+//   - broadcastPerGroup:按群定制的广播文案 [{ chatId, text }]——各主群只收本群相关的
+//     ✅ 动作行/⚠️ 失败行,不夹带其他主群的操作(2026-09-04 用户反馈:"不应把隔壁群的操作汇报到当前群组");
+//     无动作且无失败的群不出现在数组中(该群无事发生,不打扰)。标题行由调用方按需添加。
 // 群名显示通过 getChatInfoCached 复用永久缓存(0 额外请求);fallback 场景回退 chatId 避免多主群同显示。
 //
 // 多主群文案格式:每个主群独立一行(以 '\n' 分隔,不再是 ';'),成功/信息/失败分别用 ✅/ℹ️/⚠️ 前缀区分;
@@ -1211,35 +1212,45 @@ async function restoreUserInAllMainGroups(userId, env) {
 	const allActions = [];
 	const allFailures = [];
 	const allNoops = [];
+	const broadcastPerGroup = [];
 	for (const chatId of GROUP_ID_SET) {
 		const result = await restoreUserInSingleMainGroup(chatId, userId, env);
 		const info = await getChatInfoCached(chatId);
 		const label = info?.fromFallback ? result.chatId : info.title;
+		const groupLines = [];
 		if (result.actions.length > 0) {
-			allActions.push(`✅ ${label}: ${result.actions.join('，')}`);
+			const line = `✅ ${label}: ${result.actions.join('，')}`;
+			allActions.push(line);
+			groupLines.push(line);
 		}
 		if (result.failures.length > 0) {
-			allFailures.push(`⚠️ ${label}: ${result.failures.join('；')}`);
+			const line = `⚠️ ${label}: ${result.failures.join('；')}`;
+			allFailures.push(line);
+			groupLines.push(line);
 		}
 		if (result.noops.length > 0) {
 			allNoops.push(`ℹ️ ${label}: ${result.noops.join('，')}`);
+		}
+		// 该群有真实动作或失败 → 该群需要收到广播(只含本群明细);纯信息性条目不打扰该群。
+		if (groupLines.length > 0) {
+			broadcastPerGroup.push({ chatId: String(chatId), text: groupLines.join('\n') });
 		}
 	}
 
 	if (allFailures.length > 0 && allActions.length === 0) {
 		return {
 			success: false,
-			notifyMainGroups: true,
+			notifyMainGroups: broadcastPerGroup.length > 0,
 			message: `⚠️ 群内解封禁失败：\n${[...allNoops, ...allFailures].join('\n')}`,
-			broadcastMessage: `⚠️ 群内解封禁失败：\n${allFailures.join('\n')}`
+			broadcastPerGroup
 		};
 	}
 	if (allFailures.length > 0) {
 		return {
 			success: false,
-			notifyMainGroups: true,
+			notifyMainGroups: broadcastPerGroup.length > 0,
 			message: `⚠️ 部分主群处理成功，但仍有失败：\n${[...allActions, ...allNoops, ...allFailures].join('\n')}`,
-			broadcastMessage: `⚠️ 部分主群处理成功，但仍有失败：\n${[...allActions, ...allFailures].join('\n')}`
+			broadcastPerGroup
 		};
 	}
 	if (allActions.length === 0) {
@@ -1251,14 +1262,14 @@ async function restoreUserInAllMainGroups(userId, env) {
 			message: allNoops.length > 0
 				? `✅ 已确认全部主群权限无需调整\n${allNoops.join('\n')}`
 				: '✅ 已确认全部主群权限无需调整',
-			broadcastMessage: ''
+			broadcastPerGroup
 		};
 	}
 	return {
 		success: true,
-		notifyMainGroups: true,
+		notifyMainGroups: broadcastPerGroup.length > 0,
 		message: [...allActions, ...allNoops].join('\n'),
-		broadcastMessage: allActions.join('\n')
+		broadcastPerGroup
 	};
 }
 
@@ -2588,12 +2599,19 @@ async function handleMessage(message, env) {
 	try {
 		const restoreResult = await restoreUserInAllMainGroups(userId, env);
 		await sendTelegramMessage(chatId, restoreResult.message);
-		// 系统后台通知(实际执行过恢复动作或存在失败)→ 广播到所有主群,任一主群管理员可见;
-		// 广播只带真实动作/失败明细(broadcastMessage),"用户不在群内"等信息性条目不进主群通知。
+		// 系统后台通知 → 按群定向发送:各主群只收本群相关的动作/失败明细(broadcastPerGroup),
+		// "用户不在群内"等信息性条目与隔壁主群的操作不进该群通知(2026-09-04 用户反馈)。
 		if (restoreResult.notifyMainGroups) {
 			// 私聊自助解封场景:message.from 即发起解封的用户本人,用 formatUserLabel 输出
 			// "用户名(TGID)" 格式,比裸 TGID 更直观(用户反馈);getChatMember 之类的额外 API 不需要。
-			await broadcastToMainGroups(env, `用户 ${formatUserLabel(message.from)} 已通过自助解封\n${restoreResult.broadcastMessage}`);
+			for (const { chatId, text } of restoreResult.broadcastPerGroup) {
+				try {
+					await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封\n${text}`);
+				} catch (error) {
+					// 单群发送失败仅记日志,不中断其余主群的定向通知(与 broadcastToMainGroups 同策略)。
+					console.error(`[自助解封广播] 向主群 ${chatId} 发送通知失败:`, error.message);
+				}
+			}
 		}
 	} catch (error) {
 		console.error('自助解封恢复失败:', error);
@@ -2602,7 +2620,13 @@ async function handleMessage(message, env) {
 			const restoreResult = await restoreUserInAllMainGroups(userId, env);
 			await sendTelegramMessage(chatId, restoreResult.message);
 		if (restoreResult.notifyMainGroups) {
-			await broadcastToMainGroups(env, `用户 ${formatUserLabel(message.from)} 已通过自助解封(降级路径)\n${restoreResult.broadcastMessage}`);
+			for (const { chatId, text } of restoreResult.broadcastPerGroup) {
+				try {
+					await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封(降级路径)\n${text}`);
+				} catch (error) {
+					console.error(`[自助解封广播-降级] 向主群 ${chatId} 发送通知失败:`, error.message);
+				}
+			}
 		}
 			} catch (restoreError) {
 				console.error('自助解封降级恢复失败:', restoreError);
