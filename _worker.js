@@ -108,12 +108,13 @@ const DB_MIGRATE_LOCK_TTL_SECONDS = 120;
 const DB_MIGRATE_WAIT_MS = 2000;
 // KV 导入黑名单时缺失的时间字段默认值:0 表示"未知",避免 NULL 造成数据错误
 const DB_DEFAULT_UNKNOWN_TIME = 0;
-// 黑名单原因映射:source → ban_reason(/ad=举报,/spam 与 /ban=管理员封禁,细分来源便于追溯)
+// 黑名单原因映射:source → ban_reason(/ad=群众举报,/spam 与 /ban=管理员封禁,细分来源便于追溯)
 // 注意:此处保留命令名(/ban /spam)是为了数据层语义精细化(便于审计追溯与未来按来源统计);
 // 实际在公开消息(/check 等主群回复)展示时,会通过正则把命令后缀剥掉,避免普通成员误以为是
 // 命令提示并误点导致误导 bot;因此 DB 中存储的 '管理员封禁(/ban)' 落到 UI 是 '管理员封禁'。
+// /ad 原因展示 "群众举报"(2026-09-04 用户反馈):单写 "举报" 主语不明,管理员看到以为要自己去操作。
 const DB_BAN_REASON_MAP = {
-	ad: '举报',
+	ad: '群众举报',
 	spam: '管理员封禁(/spam)',
 	ban: '管理员封禁(/ban)'
 };
