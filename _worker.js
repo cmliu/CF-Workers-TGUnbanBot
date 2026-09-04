@@ -4437,9 +4437,10 @@ async function restrictUserInChat(chatId, userId) {
 }
 
 // 构建联网查杀通知文案 + 操作按钮(仅本群管理员可点,业务侧校验)。
-// options.withButtons=false 用于主群(任一):主群内不带任何按钮(按钮回调在主群会被防御拦截),
-// 文案末尾追加一行提示管理员可用 /ban、/unban 命令处置。
-function buildNetKillNotification(tgid, member, { withButtons = true } = {}) {
+// 主群与非主群均带按钮,按钮集与语义按群类型区分(isMain 参数):
+// - 主群: 🔨 永久封禁 → 加入联网黑名单(等价主群 /ban)、♻️ 移除黑名单 → 移出联网黑名单并恢复全部主群状态(等价主群 /unban)。
+// - 非主群: 🔨 永久封禁 → 本地黑名单封禁、✅ 加入白名单 → 本群白名单(仅维护本群状态)。
+function buildNetKillNotification(tgid, member, { isMain = false } = {}) {
 	const mention = formatUserMention(member)
 		|| `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
 	let text = `⚠️ <b>#黑名单用户检测</b>
@@ -4448,22 +4449,17 @@ function buildNetKillNotification(tgid, member, { withButtons = true } = {}) {
 
 👤 用户: ${mention}
 📋 TGID: <code>${escapeHtml(tgid)}</code>`;
-	let replyMarkup;
-	if (withButtons) {
-		text += `
+	text += `
 
 👇 仅限本群管理员操作：`;
-		replyMarkup = {
-			inline_keyboard: [[
-				{ text: '🔨 永久封禁', callback_data: `${NETKILL_BUTTON_PREFIX}ban:${tgid}` },
-				{ text: '✅ 加入白名单', callback_data: `${NETKILL_BUTTON_PREFIX}wl:${tgid}` }
-			]]
-		};
-	} else {
-		text += `
-
-💡 本群为主群：管理员可用 <code>/ban</code> 永久封禁，或 <code>/unban</code> 将其移出联网黑名单。`;
-	}
+	const replyMarkup = {
+		inline_keyboard: [[
+			{ text: '🔨 永久封禁', callback_data: `${NETKILL_BUTTON_PREFIX}ban:${tgid}` },
+			isMain
+				? { text: '♻️ 移除黑名单', callback_data: `${NETKILL_BUTTON_PREFIX}rm:${tgid}` }
+				: { text: '✅ 加入白名单', callback_data: `${NETKILL_BUTTON_PREFIX}wl:${tgid}` }
+		]]
+	};
 	return { text, replyMarkup };
 }
 
@@ -4471,7 +4467,7 @@ function buildNetKillNotification(tgid, member, { withButtons = true } = {}) {
 // members 为待检查的 user 对象数组(入群事件取 new_chat_members,普通消息取 [message.from])。
 // 适用于 bot 为管理员的任意群聊(含主群(任一)):内部守卫顺序为 chat.type 群聊 → 绑定 D1 →
 // bot 是当前群管理员;命中 is_blacklisted 且本群状态"健康" → 禁言 + 本群状态"禁言" + 群内通知
-// (主群(任一)通知不带按钮,见 buildNetKillNotification);依赖 D1(active_group_ids / is_blacklisted)。
+// (主群与非主群均带按钮,按钮集与语义按群类型区分,见 buildNetKillNotification);依赖 D1(active_group_ids / is_blacklisted)。
 async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) {
 	if (!chat || !Array.isArray(members) || members.length === 0) return;
 	const chatId = chat.id;
@@ -4512,16 +4508,16 @@ async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) 
 		}
 
 		// action === 'mute':命中 联网黑名单 → 禁言 + 本群状态同步"禁言" + 群内通知
-		// (主群(任一)通知无按钮;其他群通知带管理员操作按钮,见 buildNetKillNotification)
+		// (主群与非主群均带管理员操作按钮,按钮集按群类型区分,见 buildNetKillNotification)
 		logNetKill('action:mute:start', { tgid, chatId: chatId.toString() });
 		try {
 			await muteChatMember(chatId, member.id);
 			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.MUTED);
 			logNetKill('action:mute:success', { tgid, chatId: chatId.toString() });
-			// 主群(任一)通知不带按钮(按钮回调在主群会被防御拦截);其他群带管理员操作按钮。
+			// 主群与非主群均带按钮,按钮集与语义按群类型区分(主群: ban+rm;非主群: ban+wl)。
 			// 变量名 inGroupId 保留(netkill QA 源码锚点依赖),判断来源已改为多主群集合语义
 			const inGroupId = isMainGroup(chatId);
-			const notification = buildNetKillNotification(tgid, member, { withButtons: !inGroupId });
+			const notification = buildNetKillNotification(tgid, member, { isMain: inGroupId });
 			await sendTelegramMessage(chatId, notification.text, notification.replyMarkup, replyToMessageId);
 			logNetKill('notify:sent', { tgid, chatId: chatId.toString(), inGroupId });
 		} catch (error) {
@@ -4536,7 +4532,9 @@ async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) 
 	}
 }
 
-// 处理联网查杀通知的按钮回调("永久封禁" / "加入白名单")。
+// 处理联网查杀通知的按钮回调。
+// 按钮集与语义按群类型区分:主群(任一)允许 ban(加入联网黑名单)/rm(移出联网黑名单并恢复全部主群状态),
+// 非主群允许 ban(本地黑名单封禁)/wl(本群白名单);越权组合直接拒绝。
 // 返回 true 表示已消费该回调(无论成败),false 表示不是本功能回调(交由 /ad 投票处理)。
 async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 	const data = callbackQuery.data || '';
@@ -4548,17 +4546,16 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 		try { await answerCallbackQuery(callbackQuery.id); } catch (_) { }
 		return true;
 	}
-	if (isMainGroup(chatId)) {
-		// 防御:主群(任一)的查杀通知已不带按钮(见 buildNetKillNotification,withButtons=false),
-		// 此分支兜底拦截任何历史遗留/伪造的 cmk: 按钮回调,防止绕过命令通道在主群直接操作。
-		try { await answerCallbackQuery(callbackQuery.id, '无效操作', true); } catch (_) { }
-		return true;
-	}
+	const inGroupId = isMainGroup(chatId);
 
 	const parts = data.split(':');
 	const action = parts[1];
 	const tgid = parts.slice(2).join(':');
-	if ((action !== 'ban' && action !== 'wl') || !/^\d+$/.test(tgid)) {
+	// 按群类型校验 action:主群允许 ban|rm,非主群允许 ban|wl;越权组合按无效操作处理
+	const actionAllowed = inGroupId
+		? (action === 'ban' || action === 'rm')
+		: (action === 'ban' || action === 'wl');
+	if (!actionAllowed || !/^\d+$/.test(tgid)) {
 		try { await answerCallbackQuery(callbackQuery.id, '无效操作', true); } catch (_) { }
 		return true;
 	}
@@ -4576,14 +4573,29 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 	const mention = `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
 
 	if (action === 'ban') {
-		logNetKill('callback:ban:start', { tgid, chatId: chatId.toString(), operatorId });
+		logNetKill('callback:ban:start', { tgid, chatId: chatId.toString(), operatorId, inGroupId });
 		try {
-			await banUserPermanently(chatId, tgid);
-			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.BANNED);
-			await editMessageText(chatId, messageId,
-				`🔨 <b>已永久封禁</b>\n\n${mention} 已移出本群。\n📌 本地黑名单: 封禁`, removeButtons);
-			logNetKill('callback:ban:success', { tgid, chatId: chatId.toString(), operatorId });
-			try { await answerCallbackQuery(callbackQuery.id, '已永久封禁该用户'); } catch (_) { }
+			if (inGroupId) {
+				// 主群语义(等价 /ban):加入联网黑名单。通知发出即意味着禁言已成功,无需重复禁言/改本群状态
+				const result = await addToBlacklist(tgid, env, 'ban', operatorId);
+				if (result.success || result.alreadyExists) {
+					await editMessageText(chatId, messageId,
+						`🔨 <b>已永久封禁</b>\n\n${mention} 已加入联网黑名单。\n📌 联网黑名单: 已加入`, removeButtons);
+					logNetKill('callback:ban:success', { tgid, chatId: chatId.toString(), operatorId, alreadyExists: Boolean(result.alreadyExists) });
+					try { await answerCallbackQuery(callbackQuery.id, result.alreadyExists ? '该用户已在联网黑名单中' : '已永久封禁该用户'); } catch (_) { }
+				} else {
+					logNetKill('callback:ban:failed', { tgid, chatId: chatId.toString(), operatorId, 错误: result.message });
+					try { await answerCallbackQuery(callbackQuery.id, `封禁失败: ${String(result.message).slice(0, 80)}`, true); } catch (_) { }
+				}
+			} else {
+				// 非主群语义:本地黑名单封禁 + 本群状态"封禁"
+				await banUserPermanently(chatId, tgid);
+				await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.BANNED);
+				await editMessageText(chatId, messageId,
+					`🔨 <b>已永久封禁</b>\n\n${mention} 已移出本群。\n📌 本地黑名单: 封禁`, removeButtons);
+				logNetKill('callback:ban:success', { tgid, chatId: chatId.toString(), operatorId });
+				try { await answerCallbackQuery(callbackQuery.id, '已永久封禁该用户'); } catch (_) { }
+			}
 		} catch (error) {
 			logNetKill('callback:ban:failed', { tgid, chatId: chatId.toString(), 错误: error.message });
 			try { await answerCallbackQuery(callbackQuery.id, `封禁失败: ${String(error.message).slice(0, 80)}`, true); } catch (_) { }
@@ -4591,7 +4603,36 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 		return true;
 	}
 
-	// action === 'wl':加入本群白名单 + 解除封禁/禁言
+	if (action === 'rm') {
+		// 主群语义(等价 /unban):移出联网黑名单 + 恢复用户在全部主群的群内状态
+		logNetKill('callback:rm:start', { tgid, chatId: chatId.toString(), operatorId });
+		try {
+			const result = await removeFromBlacklist(tgid, env, operatorId);
+			if (result.success || result.notFound) {
+				try {
+					await restoreUserInAllMainGroups(tgid, env);
+				} catch (restoreError) {
+					// restoreUserInAllMainGroups 内部已逐群 try-catch,此处兜底防意外抛错
+					logNetKill('callback:rm:restore:failed', { tgid, 错误: String(restoreError?.message || '') });
+					try { await answerCallbackQuery(callbackQuery.id, `操作失败: ${String(restoreError?.message || '').slice(0, 80)}`, true); } catch (_) { }
+					return true;
+				}
+				await editMessageText(chatId, messageId,
+					`✅ <b>已移出联网黑名单</b>\n\n${mention} 已解除全部主群限制。\n📌 联网黑名单: 已移除`, removeButtons);
+				logNetKill('callback:rm:success', { tgid, chatId: chatId.toString(), operatorId, notFound: Boolean(result.notFound) });
+				try { await answerCallbackQuery(callbackQuery.id, '已移出联网黑名单'); } catch (_) { }
+			} else {
+				logNetKill('callback:rm:failed', { tgid, chatId: chatId.toString(), operatorId, 错误: result.message });
+				try { await answerCallbackQuery(callbackQuery.id, `操作失败: ${String(result.message).slice(0, 80)}`, true); } catch (_) { }
+			}
+		} catch (error) {
+			logNetKill('callback:rm:failed', { tgid, chatId: chatId.toString(), 错误: error.message });
+			try { await answerCallbackQuery(callbackQuery.id, `操作失败: ${String(error.message).slice(0, 80)}`, true); } catch (_) { }
+		}
+		return true;
+	}
+
+	// action === 'wl'(仅非主群):加入本群白名单 + 解除封禁/禁言
 	logNetKill('callback:wl:start', { tgid, chatId: chatId.toString(), operatorId });
 	try {
 		await unbanUserInChat(chatId, tgid);
