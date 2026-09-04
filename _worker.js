@@ -786,12 +786,12 @@ function formatUtcTimestamp(ts) {
 // 自助解封可重试时间文案:Telegram 不提供用户时区 → UTC 标准时间 + 东八区(北京时间)双行展示
 function formatSelfUnbanRetryTime(ts) {
 	if (!ts || ts <= 0) return '未知';
-	return `🌍 UTC 标准时间:${formatUtcTimestamp(ts)}\n🇨🇳 东八区(北京时间):${formatTimestamp(ts)}`;
+	return `🌍 标准时间: <code>${formatUtcTimestamp(ts)}</code>\n🇨🇳 北京时间: <code>${formatTimestamp(ts)}</code>`;
 }
 
 // 自助解封冷却提示文案(HTML;retryAtTs = 可再次使用自助解封的起始时间 epoch 秒)
 function buildSelfUnbanCooldownMessage(retryAtTs) {
-	return `⏳ <b>操作过于频繁</b>\n\n由于您近期已使用过自助解封，将不再处理您的自助解封。\n\n⏰ 请在以下时间之后再次使用自助解封：\n${formatSelfUnbanRetryTime(retryAtTs)}`;
+	return `⏳ <b>操作过于频繁</b>\n\n由于您近期已使用过自助解封，现将暂时不再处理您的自助解封请求。\n\n⏰ 请在以下时间之后再次使用自助解封：\n${formatSelfUnbanRetryTime(retryAtTs)}`;
 }
 
 // D1 版同步 GKY 黑名单状态(/check 查到 GKY 封禁记录时调用,后期可直接按此字段筛选)
