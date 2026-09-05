@@ -2561,7 +2561,15 @@ async function handleMessage(message, env) {
 	}
 
 	// 处理 /start 和 /unban 命令 - 显示欢迎消息
+	// 2026-09-05 用户反馈：群内发 /start 也会进入本分支，欢迎词把完整自助解封口令广播到群里，
+	// 等于扩散口令。欢迎词仅限私聊展示，群内命中一律静默忽略(仅记日志)。
+	// 注意：群内带参数/回复的 /unban 在上方 unbanCommand 分支(shouldHandleAdminUnban)处理并 return，
+	// 此处加私聊守卫不影响管理员解封路径。
 	if (text === '/start' || text === '/unban') {
+		if (message.chat.type !== 'private') {
+			console.log(`[自助解封] 忽略群聊(${message.chat.type}) ${chatId} 中的欢迎词命令: ${text}`);
+			return;
+		}
 		// 检查黑名单
 		const blacklistCheck = await checkBlacklist(userId, env);
 		if (blacklistCheck.isBlacklisted) {
@@ -2588,7 +2596,13 @@ async function handleMessage(message, env) {
 		await sendTelegramMessage(chatId, welcomeMessage);
 	}
 	// 检查用户回复是否包含必要内容
-	else if (text && text.includes('我不是广告狗') && text.includes('我是误封的') && text.includes('希望可以解封')) {
+	// 2026-09-05 用户反馈：群内发送口令也会命中本分支，直接在群里执行完整自助解封
+	// (回复"已同意解封"→ 恢复发言权限 → 向各主群广播 → GKY 二次审核上报)。
+	// 自助解封仅限私聊使用：把 chat.type === 'private' 并入口令匹配条件，群内口令直接跳过
+	// 整个分支并静默忽略(不回复，避免广告狗刷屏诱导 bot 刷屏)。守卫必须位于
+	// tryAcquireSelfUnbanSlot 之前生效，保证群内口令不消耗 10 分钟冷却名额。
+	else if (message.chat.type === 'private' && text && text.includes('我不是广告狗') && text.includes('我是误封的') && text.includes('希望可以解封')) {
+		console.log(`[自助解封] 私聊 ${chatId} 命中解封口令, userId: ${userId}`);
 		// 自助解封防刷冷却闸(10 分钟):狂发口令会反复触发解封流程并向主群广播解封通知。
 		// 撞闸(10 分钟内已触发过)→ 只回复"近期已使用过 + 可重试时间",不执行解封、不向主群广播;
 		// 放行 → 冷却时间戳已原子刷新,本次解封流程继续;DB/KV 故障 fail-open 放行,不阻断正常解封。
