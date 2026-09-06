@@ -1845,40 +1845,35 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	// 用户反馈:管理员核对 TGID 时直接长按复制比"点击链接展开用户信息"更顺手。
 	responseMessage += `📋 <b>TGID:</b> <code>${escapeHtml(tgidToCheck)}</code>\n\n`;
 
-	// GKYbot 数据库状态
-	if (banlistData.success) {
-		if (banlistData.banned) {
-			responseMessage += `🌐 <b>GKYbot 库:</b> 🚫 <b>已封禁</b>\n`;
-		} else {
-			responseMessage += `🌐 <b>GKYbot 库:</b> ✅ 正常\n`;
-		}
-	} else {
-		responseMessage += `🌐 <b>GKYbot 库:</b> ⚠️ 查询失败 (${escapeHtml(banlistData.error || '未知错误')})\n`;
-	}
-
 	// 联网黑名单状态(数据库版可附带封禁原因与时间;KV 版仅 ID 数组,无原因字段)
+	// 2026-09-06 用户定版:联网黑名单区块排在 GKY黑名单 之前
 	if (options.env) {
 		if (isLocalBlacklisted) {
 			responseMessage += `🛡️ <b>联网黑名单:</b> 🚫 <b>已封禁</b>\n`;
-			// 明细三行(操作人/方式/日期),每行仅在对应数据存在时输出,全部缺失则不输出明细:
-			//   - 操作人:bannedBy(操作人 TGID)经 getChat 反查姓名(旧数据 bannedBy 为空 → 整行不输出);
+			// 树形层级排版:明细行先收集进数组再统一挂靠在"联网黑名单"状态行下,最后一行用 └ 收尾
+			// 明细行(操作人/方式/日期),每行仅在对应数据存在时收集,全部缺失则不输出任何树形行:
+			//   - 操作人:bannedBy(操作人 TGID)经 getChat 反查姓名(旧数据 bannedBy 为空 → 整行不收集);
 			//   - 封禁方式:兼容旧数据中可能残留的命令后缀(如 '管理员封禁(/ban)'/'管理员封禁(/spam)'),
 			//     展示前剥掉,确保在主群 /check 公开回复里普通成员看不到具体命令提示;
 			//     新写入通过 DB_BAN_REASON_MAP 已是干净文案;
 			//   - 封禁日期:formatTimestamp 取 "YYYY-MM-DD HH:MM"。
+			const detailLines = [];
 			if (localBlacklistInfo?.bannedBy) {
-				responseMessage += `👤 <b>封禁操作:</b> ${await getBanOperatorLabel(localBlacklistInfo.bannedBy)}\n`;
+				detailLines.push(`👤 <b>封禁操作:</b> ${await getBanOperatorLabel(localBlacklistInfo.bannedBy)}`);
 			}
 			const rawReason = localBlacklistInfo?.banReason ? escapeHtml(localBlacklistInfo.banReason) : '';
 			const reason = rawReason.replace(/\s*\(\/\w+\)\s*$/, '');
 			if (reason) {
-				responseMessage += `🚫 <b>封禁方式:</b> ${reason}\n`;
+				detailLines.push(`🚫 <b>封禁方式:</b> ${reason}`);
 			}
 			const ts = localBlacklistInfo?.bannedAt;
 			const tsStr = ts && ts > 0 ? formatTimestamp(ts).slice(0, 16) : ''; // YYYY-MM-DD HH:MM
 			if (tsStr) {
-				responseMessage += `📅 <b>封禁日期:</b> ${tsStr}\n`;
+				detailLines.push(`📅 <b>封禁日期:</b> ${tsStr}`);
 			}
+			detailLines.forEach((line, i) => {
+				responseMessage += `${i === detailLines.length - 1 ? ' └ ' : ' ├ '}${line}\n`;
+			});
 		} else {
 			responseMessage += `🛡️ <b>联网黑名单:</b> ✅ 正常\n`;
 		}
@@ -1886,27 +1881,39 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		responseMessage += `🛡️ <b>联网黑名单:</b> ⚠️ 未检查 (未配置KV/D1存储)\n`;
 	}
 
-	// 3. 输出 GKYbot 详细封禁信息
-	if (banlistData.success && banlistData.banned) {
-		responseMessage += `\n--- <b>GKYbot 详细封禁信息</b> ---\n`;
-		if (banlistData.chatId) {
-			const chatInfo = await getChatInfoFromId(banlistData.chatId);
-			responseMessage += `💬 <b>ChatID:</b> <code>${escapeHtml(banlistData.chatId)}</code>`;
-			if (chatInfo && chatInfo.title) {
-				if (chatInfo.link) {
-					responseMessage += ` (<a href="${escapeHtml(chatInfo.link)}">${escapeHtml(chatInfo.title)}</a>)`;
-				} else {
-					responseMessage += ` (${escapeHtml(chatInfo.title)})`;
+	// 联网黑名单区块与 GKY黑名单区块之间空行分隔(两棵树并列时视觉分组)
+	responseMessage += '\n';
+
+	// GKY黑名单状态(2026-09-06 用户定版:"GKYbot 库"更名"GKY黑名单";已封禁时明细树形挂靠在状态行下)
+	if (banlistData.success) {
+		if (banlistData.banned) {
+			responseMessage += `🌐 <b>GKY黑名单:</b> 🚫 <b>已封禁</b>\n`;
+			// 树形层级排版:明细行(ChatID/MsgID/日期/原因/内容)先收集进数组再统一挂靠,每行仅在对应数据存在时收集
+			const gkyDetailLines = [];
+			if (banlistData.chatId) {
+				const chatInfo = await getChatInfoFromId(banlistData.chatId);
+				let chatLine = `💬 <b>ChatID:</b> <code>${escapeHtml(banlistData.chatId)}</code>`;
+				if (chatInfo && chatInfo.title) {
+					chatLine += chatInfo.link
+						? ` (<a href="${escapeHtml(chatInfo.link)}">${escapeHtml(chatInfo.title)}</a>)`
+						: ` (${escapeHtml(chatInfo.title)})`;
 				}
+				gkyDetailLines.push(chatLine);
 			}
-			responseMessage += `\n`;
+			if (banlistData.msgId) gkyDetailLines.push(`📨 <b>MsgID:</b> <code>${escapeHtml(banlistData.msgId)}</code>`);
+			// recordedDate 规范化为 "YYYY-MM-DD HH:MM"(formatGkyRecordedDate 提取失败时原样返回原始串)
+			const gkyRecordedDate = formatGkyRecordedDate(banlistData.recordedDate);
+			if (gkyRecordedDate) gkyDetailLines.push(`📅 <b>封禁日期:</b> ${escapeHtml(gkyRecordedDate)}`);
+			if (banlistData.reason) gkyDetailLines.push(`⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}`);
+			if (banlistData.info) gkyDetailLines.push(`📝 <b>封禁内容:</b> <tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>`);
+			gkyDetailLines.forEach((line, i) => {
+				responseMessage += `${i === gkyDetailLines.length - 1 ? ' └ ' : ' ├ '}${line}\n`;
+			});
+		} else {
+			responseMessage += `🌐 <b>GKY黑名单:</b> ✅ 正常\n`;
 		}
-		if (banlistData.msgId) responseMessage += `📨 <b>MsgID:</b> <code>${escapeHtml(banlistData.msgId)}</code>\n`;
-		// recordedDate 规范化为 "YYYY-MM-DD HH:MM"(formatGkyRecordedDate 提取失败时原样返回原始串)
-		const gkyRecordedDate = formatGkyRecordedDate(banlistData.recordedDate);
-		if (gkyRecordedDate) responseMessage += `📅 <b>封禁日期:</b> ${escapeHtml(gkyRecordedDate)}\n`;
-		if (banlistData.reason) responseMessage += `⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}\n`;
-		if (banlistData.info) responseMessage += `📝 <b>封禁内容:</b>\n<tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>\n`;
+	} else {
+		responseMessage += `🌐 <b>GKY黑名单:</b> ⚠️ 查询失败 (${escapeHtml(banlistData.error || '未知错误')})\n`;
 	}
 
 	if (!options.includeReviewAction) {
@@ -1915,27 +1922,36 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 	const inlineKeyboard = [];
 
+	// 分组排版:解封入口文案先收集进 actionLines,最后统一输出"分组线 + 各行",任一存在才输出分组线
+	const actionLines = [];
+
 	// GKYbot 解封操作
 	if (banlistData.success && banlistData.banned) {
 		const 黑白名单 = GROUP_ID_SET.includes(String(banlistData.chatId)) ? '移出黑名单' : '添加白名单';
 		const copyText = `GKYbotSave\n${banlistData.tgid}`;
 		if (options.actionInCurrentChat) {
-			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请在本群发送下方复制的代码。`;
+			actionLines.push(`👉 <b>${黑白名单} (GKYbot)</b>：在本群发送下方复制的代码`);
 		} else {
 			// 私聊场景:列出全部主群入口(多主群时用顿号分隔)。
 			// 2026-09-04 用户定版:群名一律做成链接(formatMainGroupsNamesHint,公开群 <a href="https://t.me/xxx">群名</a>,
 			// 私有群/fallback 回退 群名<code>(chatId)</code>),替代旧版裸 @username 列表(formatMainGroupsHint)。
 			// listMainGroupInfos 复用 getChatInfoCached 永久缓存(0 额外请求);管理员点击群名即可跳转回任一主群发送代码。
 			const mainGroupInfos = await listMainGroupInfos(options.env);
-			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请返回 ${formatMainGroupsNamesHint(mainGroupInfos)} 群组发送下方复制的代码。`;
+			actionLines.push(`👉 <b>${黑白名单} (GKYbot)</b>：返回 ${formatMainGroupsNamesHint(mainGroupInfos)} 发送下方复制的代码`);
 		}
 		inlineKeyboard.push([{ text: `📋 点击复制 ${黑白名单} 代码`, copy_text: { text: copyText } }]);
 	}
 
 	// 本地 KV 解封操作
 	if (isLocalBlacklisted) {
-		responseMessage += `\n👉 若同意 <b>解除联网黑名单</b>，请发送下方复制的解封命令。`;
+		actionLines.push(`👉 解除<b>联网黑名单</b>：发送下方复制的解封命令`);
 		inlineKeyboard.push([{ text: `📋 点击复制 联网解封 命令`, copy_text: { text: `/unban ${tgidToCheck}` } }]);
+	}
+
+	// 统一输出解封操作分组(仅在有入口文案时拼分组线,避免空分组)
+	if (actionLines.length > 0) {
+		responseMessage += `\n━━━━━━ 解封操作 ━━━━━━\n`;
+		responseMessage += actionLines.join('\n') + '\n';
 	}
 
 	const replyMarkup = inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined;
