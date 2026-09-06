@@ -313,6 +313,15 @@ function formatTimestamp(ts) {
 	return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
+// GKYbot 返回的 recordedDate 原始格式形如 "2025-03-17T01:17:37 [UTC+08:00]",
+// /check 展示时规范化为 "2025-03-17 01:17"(与联网黑名单明细的日期格式保持一致)。
+// 提取失败(空值或未来格式变化)时原样返回原始字符串,不做硬失败。
+function formatGkyRecordedDate(raw) {
+	if (!raw) return '';
+	const match = String(raw).match(/(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/);
+	return match ? `${match[1]} ${match[2]}` : String(raw);
+}
+
 // 幂等建表 + 旧库列级升级(SQLite ALTER TABLE ADD COLUMN 补齐缺失列):
 // 新库直接按 DB_SCHEMA_SQL 全量建表;已上线的旧库 CREATE TABLE IF NOT EXISTS 不会补列,
 // 这里用 PRAGMA table_info 检查缺失列并逐个补齐,保证旧数据不丢、新字段有默认值。
@@ -620,23 +629,25 @@ async function dbCheckBlacklist(env, userId) {
 	const cached = dbUserCache.get(tgid);
 	if (cached && (now - cached.fetchedAt) < DB_USER_CACHE_TTL_MS) {
 		return cached.isBlacklisted
-			? { isBlacklisted: true, message: '❌ 您的TGID在联网黑名单中，请自行联系管理员解封。', banReason: cached.banReason, bannedAt: cached.bannedAt }
+			? { isBlacklisted: true, message: '❌ 您的TGID在联网黑名单中，请自行联系管理员解封。', banReason: cached.banReason, bannedAt: cached.bannedAt, bannedBy: cached.bannedBy }
 			: { isBlacklisted: false, message: null };
 	}
 	try {
-		const row = await env.DB.prepare('SELECT is_blacklisted, ban_reason, banned_at FROM users WHERE tgid = ?').bind(tgid).first();
+		const row = await env.DB.prepare('SELECT is_blacklisted, ban_reason, banned_at, banned_by FROM users WHERE tgid = ?').bind(tgid).first();
 		let isBlacklisted = Boolean(row?.is_blacklisted);
 		const banReason = row?.ban_reason || '';
 		const bannedAt = row?.banned_at || 0;
+		// 操作人 tgid(TEXT;空字符串=旧数据无记录),供 /check 展示封禁操作人
+		const bannedBy = row?.banned_by || '';
 		// 命中黑名单 → 复核是否为任一主群管理员,是则视为未拉黑并修复数据层(主群管理员 is_blacklisted 永远为 0)
 		if (isBlacklisted && await isGroupAdmin(tgid)) {
 			console.log(`[DB] 黑名单豁免: tgid=${tgid} 是群组管理员,视为未拉黑`);
 			isBlacklisted = false;
 			await dbClearBlacklistStatus(env, tgid);
 		}
-		dbUserCache.set(tgid, { isBlacklisted, banReason, bannedAt, fetchedAt: now });
+		dbUserCache.set(tgid, { isBlacklisted, banReason, bannedAt, bannedBy, fetchedAt: now });
 		return isBlacklisted
-			? { isBlacklisted: true, message: '❌ 您的TGID在联网黑名单中，请自行联系管理员解封。', banReason, bannedAt }
+			? { isBlacklisted: true, message: '❌ 您的TGID在联网黑名单中，请自行联系管理员解封。', banReason, bannedAt, bannedBy }
 			: { isBlacklisted: false, message: null };
 	} catch (error) {
 		console.error('检查黑名单时出错:', error);
@@ -1751,6 +1762,39 @@ function formatBannedUserLabel(user) {
 	return `<a href="tg://user?id=${escapeHtml(user.id)}">${escapeHtml(maskedName)}</a>(<code>${escapeHtml(user.id)}</code>)`;
 }
 
+// 查询封禁操作人的展示标签(/check 联网黑名单明细用):通过 TGID 反查操作人姓名,
+// 渲染为 "<a href='tg://user?id=TGID'>姓名</a>(<code>TGID</code>)"。
+// 注意:此处必须独立调 getChat,严禁复用 getChatInfoCached(其 fallback 'CM技术交流群'/'@CMLiussss'
+// 是群组专用语义,用在人身上会显示错误信息)、也不要复用 getChatInfoFromId(只取 first_name 丢 last_name,
+// 且返回结构不含 id)。
+// 姓名取 first_name + last_name 拼接,两者皆无时退化为 username;
+// getChat 失败/查不到姓名时退化为仅展示 "(<code>TGID</code>)",绝不能因姓名查询失败阻断 /check 整体输出。
+async function getBanOperatorLabel(operatorTgid) {
+	const tgid = String(operatorTgid || '').trim();
+	if (!tgid) return '';
+	let name = '';
+	try {
+		const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChat`;
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: tgid })
+		});
+		const result = await response.json();
+		if (response.ok && result?.result) {
+			const chat = result.result;
+			name = [chat.first_name, chat.last_name].filter(Boolean).join(' ') || chat.username || '';
+		}
+	} catch (error) {
+		// 姓名查询失败仅降级展示(退化为纯 TGID),不阻断 /check 整体输出
+		console.log(`查询封禁操作人姓名失败(tgid=${tgid}):`, error.message);
+	}
+	const safeTgid = escapeHtml(tgid);
+	return name
+		? `<a href="tg://user?id=${safeTgid}">${escapeHtml(name)}</a>(<code>${safeTgid}</code>)`
+		: `(<code>${safeTgid}</code>)`;
+}
+
 async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	// 1. 查询 gkybot
 	let banlistData = { success: false, banned: false, error: '未执行查询' };
@@ -1767,16 +1811,19 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		await dbSetGkyBlacklistStatus(options.env, tgidToCheck, Boolean(banlistData.banned));
 	}
 
-	// 2. 查询联网黑名单(主群事件写入的 is_blacklisted;数据库版可返回封禁原因/时间,供下方展示)
+	// 2. 查询联网黑名单(主群事件写入的 is_blacklisted;数据库版可返回封禁原因/时间/操作人,供下方展示)
 	let isLocalBlacklisted = false;
 	let localBlacklistInfo = null;
 	if (options.env) {
 		const blacklistCheck = await checkBlacklist(tgidToCheck, options.env);
 		isLocalBlacklisted = blacklistCheck.isBlacklisted;
-		if (blacklistCheck.banReason || blacklistCheck.bannedAt) {
+		// 任一审计字段(原因/时间/操作人)存在即构建明细对象,避免未来只落 banned_by 的写入路径丢失明细
+		if (blacklistCheck.banReason || blacklistCheck.bannedAt || blacklistCheck.bannedBy) {
 			localBlacklistInfo = {
 				banReason: blacklistCheck.banReason,
-				bannedAt: blacklistCheck.bannedAt
+				bannedAt: blacklistCheck.bannedAt,
+				// 操作人 tgid(KV 版/未命中分支无此字段 → undefined,兜底为空串)
+				bannedBy: blacklistCheck.bannedBy || ''
 			};
 		}
 	}
@@ -1812,16 +1859,26 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	// 联网黑名单状态(数据库版可附带封禁原因与时间;KV 版仅 ID 数组,无原因字段)
 	if (options.env) {
 		if (isLocalBlacklisted) {
-			// 兼容旧数据中可能残留的命令后缀(如 '管理员封禁(/ban)'/'管理员封禁(/spam)'),
-			// 展示前剥掉,确保在主群 /check 公开回复里普通成员看不到具体命令提示;
-			// 新写入通过 DB_BAN_REASON_MAP 已是干净文案。
+			responseMessage += `🛡️ <b>联网黑名单:</b> 🚫 <b>已封禁</b>\n`;
+			// 明细三行(操作人/方式/日期),每行仅在对应数据存在时输出,全部缺失则不输出明细:
+			//   - 操作人:bannedBy(操作人 TGID)经 getChat 反查姓名(旧数据 bannedBy 为空 → 整行不输出);
+			//   - 封禁方式:兼容旧数据中可能残留的命令后缀(如 '管理员封禁(/ban)'/'管理员封禁(/spam)'),
+			//     展示前剥掉,确保在主群 /check 公开回复里普通成员看不到具体命令提示;
+			//     新写入通过 DB_BAN_REASON_MAP 已是干净文案;
+			//   - 封禁日期:formatTimestamp 取 "YYYY-MM-DD HH:MM"。
+			if (localBlacklistInfo?.bannedBy) {
+				responseMessage += `👤 <b>封禁操作:</b> ${await getBanOperatorLabel(localBlacklistInfo.bannedBy)}\n`;
+			}
 			const rawReason = localBlacklistInfo?.banReason ? escapeHtml(localBlacklistInfo.banReason) : '';
 			const reason = rawReason.replace(/\s*\(\/\w+\)\s*$/, '');
+			if (reason) {
+				responseMessage += `🚫 <b>封禁方式:</b> ${reason}\n`;
+			}
 			const ts = localBlacklistInfo?.bannedAt;
 			const tsStr = ts && ts > 0 ? formatTimestamp(ts).slice(0, 16) : ''; // YYYY-MM-DD HH:MM
-			const detail = [reason, tsStr].filter(Boolean).join(', ');
-			const suffix = detail ? ` (${detail})` : '';
-			responseMessage += `🛡️ <b>联网黑名单:</b> 🚫 <b>已封禁</b>${suffix}\n`;
+			if (tsStr) {
+				responseMessage += `📅 <b>封禁日期:</b> ${tsStr}\n`;
+			}
 		} else {
 			responseMessage += `🛡️ <b>联网黑名单:</b> ✅ 正常\n`;
 		}
@@ -1845,7 +1902,9 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 			responseMessage += `\n`;
 		}
 		if (banlistData.msgId) responseMessage += `📨 <b>MsgID:</b> <code>${escapeHtml(banlistData.msgId)}</code>\n`;
-		if (banlistData.recordedDate) responseMessage += `📅 <b>封禁日期:</b> ${escapeHtml(banlistData.recordedDate)}\n`;
+		// recordedDate 规范化为 "YYYY-MM-DD HH:MM"(formatGkyRecordedDate 提取失败时原样返回原始串)
+		const gkyRecordedDate = formatGkyRecordedDate(banlistData.recordedDate);
+		if (gkyRecordedDate) responseMessage += `📅 <b>封禁日期:</b> ${escapeHtml(gkyRecordedDate)}\n`;
 		if (banlistData.reason) responseMessage += `⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}\n`;
 		if (banlistData.info) responseMessage += `📝 <b>封禁内容:</b>\n<tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>\n`;
 	}
