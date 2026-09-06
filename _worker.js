@@ -1217,7 +1217,16 @@ async function restoreUserInAllMainGroups(userId, env) {
 	for (const chatId of GROUP_ID_SET) {
 		const result = await restoreUserInSingleMainGroup(chatId, userId, env);
 		const info = await getChatInfoCached(chatId);
-		const label = info?.fromFallback ? result.chatId : info.title;
+		// 群名渲染(2026-09-04 用户定版:群名一律带链接):
+		//   - 非 fallback 且有公开 username → <a href="https://t.me/xxx">群名</a>;
+		//   - 非 fallback 无 username(私有群) → 转义后的纯群名(私有群无公开链接可跳);
+		//   - fallback(API 失败) → 沿用旧规回退 chatId,避免多主群都显示同一个默认群名。
+		let label = result.chatId;
+		if (info && !info.fromFallback && info.title) {
+			label = info.publicUsername
+				? `<a href="https://t.me/${escapeHtml(info.publicUsername)}">${escapeHtml(info.title)}</a>`
+				: escapeHtml(info.title);
+		}
 		const groupLines = [];
 		if (result.actions.length > 0) {
 			const line = `✅ ${label}: ${result.actions.join('，')}`;
@@ -1854,11 +1863,12 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		if (options.actionInCurrentChat) {
 			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请在本群发送下方复制的代码。`;
 		} else {
-			// 私聊场景:列出全部主群入口(多主群时用顿号分隔,如 @a、@b、@c),
-			// 替代旧版单群名(只列 GROUP_ID_SET[0] 一个)。listMainGroupInfos 复用 getChatInfoCached
-			// 永久缓存(0 额外请求);管理员点击 @username 即可跳转回任一主群发送代码。
+			// 私聊场景:列出全部主群入口(多主群时用顿号分隔)。
+			// 2026-09-04 用户定版:群名一律做成链接(formatMainGroupsNamesHint,公开群 <a href="https://t.me/xxx">群名</a>,
+			// 私有群/fallback 回退 群名<code>(chatId)</code>),替代旧版裸 @username 列表(formatMainGroupsHint)。
+			// listMainGroupInfos 复用 getChatInfoCached 永久缓存(0 额外请求);管理员点击群名即可跳转回任一主群发送代码。
 			const mainGroupInfos = await listMainGroupInfos(options.env);
-			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请返回 ${formatMainGroupsHint(mainGroupInfos)} 群组发送下方复制的代码。`;
+			responseMessage += `\n👉 若同意 <b>${黑白名单} (GKYbot)</b>，请返回 ${formatMainGroupsNamesHint(mainGroupInfos)} 群组发送下方复制的代码。`;
 		}
 		inlineKeyboard.push([{ text: `📋 点击复制 ${黑白名单} 代码`, copy_text: { text: copyText } }]);
 	}
@@ -2325,8 +2335,13 @@ async function handleMessage(message, env) {
 			const isAdmin = await checkIfUserIsAdmin(userId);
 
 			if (!isAdmin) {
-				const groupInfo = await getGroupInfo();
-				await sendTelegramMessage(chatId, `❌ <b>权限不足</b>\n\n此功能仅限 ${groupInfo.title} 的管理员使用。`);
+				// 多主群权限提示(2026-09-04 用户反馈):权限判定为"任一主群管理员",
+				// 提示文案须列出全部主群(旧版 getGroupInfo() 无参只取 GROUP_ID_SET[0],多主群时误导);
+				// 群名统一走 formatMainGroupsNamesHint 链接渲染(公开群 <a href="https://t.me/xxx">群名</a>,
+				// 私有群/fallback 回退 群名<code>(chatId)</code>),复用 getChatInfoCached 永久缓存(0 额外请求)。
+				const mainGroupInfos = await listMainGroupInfos(env);
+				const groupsLabel = formatMainGroupsNamesHint(mainGroupInfos);
+				await sendTelegramMessage(chatId, `❌ <b>权限不足</b>\n\n此功能仅限 ${groupsLabel} 的管理员使用。`);
 				return;
 			}
 
@@ -2619,9 +2634,12 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-		// 发送确认消息:列出全部主群入口,方便用户点击返回(旧单群版仅列固定 GROUP_ID)
+		// 发送确认消息:列出全部主群入口,方便用户点击返回(旧单群版仅列固定 GROUP_ID)。
+		// 群名渲染统一走 formatMainGroupsNamesHint(2026-09-04 定版:群名一律带链接,
+		// 与上方 /start 欢迎词同款;公开群 <a href="https://t.me/xxx">群名</a>,私有群/fallback 回退 群名<code>(chatId)</code>),
+		// 替代旧版裸 @username 列表(formatMainGroupsHint)。
 		const mainGroupInfos = await listMainGroupInfos(env);
-		const mainGroupsHint = formatMainGroupsHint(mainGroupInfos);
+		const mainGroupsHint = formatMainGroupsNamesHint(mainGroupInfos);
 		await sendTelegramMessage(chatId, `✅ 已同意给予解封\n\n请点击 ${mainGroupsHint} 返回群组\n\n⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`);
 
 		// 恢复用户在全部主群的群内状态(逐主群 getChatMember → unban/restrict → 回写"健康"):
