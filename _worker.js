@@ -1028,6 +1028,34 @@ async function checkIfUserIsAdminInAnyMainGroup(userId) {
 	return false;
 }
 
+// 用户是否为"指定主群"(chatId 必须属于 GROUP_ID_SET)的群主/管理员(多主群越权修复辅助):
+// 复用 getMainGroupAdminSet(chatId)(每主群 60s 的 getChatAdministrators 名单缓存,
+// 与 checkIfUserIsAdminInAnyMainGroup 同源同语义,不放大 Telegram API 配额)。
+// 返回 Set<string>,判定用 .has(String(userId));获取失败按空名单降级(恒 false,不抛错)。
+// 注意:调用方须保证 chatId 是主群;对非主群调用语义未定义(按空名单返回 false)。
+async function checkIfUserIsAdminInMainGroup(userId, chatId) {
+	const admins = await getMainGroupAdminSet(chatId);
+	return admins.has(String(userId));
+}
+
+// 指令执行鉴权统一分流(多主群越权修复,2026-09):
+// 语义与产品鉴权规则一致:
+//   - 私聊(message.chat.type==='private')→ 允许"任一主群(A 或 B)"的管理员执行(规则 1);
+//   - 任一主群群内 → 仅允许"该主群自身"的管理员执行(规则 2),各主群管理员权限相互隔离(规则 3);
+//   - 其它群 / 异常场景 → 一律 false(不可达指令由调用方既有守卫先行拦截,不抛错)。
+// 主群群内判定复用 getMainGroupAdminSet(chatId)(60s 名单缓存),不放大 Telegram API 配额。
+async function checkCommandAdmin(userId, message) {
+	if (!message || !message.chat) return false;
+	const chat = message.chat;
+	if (chat.type === 'private') {
+		return await checkIfUserIsAdminInAnyMainGroup(userId);
+	}
+	if (isMainGroup(chat.id)) {
+		return await checkIfUserIsAdminInMainGroup(userId, chat.id);
+	}
+	return false;
+}
+
 // 群组信息实例级缓存(按 chatId):title 取群名,username 带 @ 前缀(与既有 getGroupInfo 格式一致)。
 // 获取失败回退默认文案(与旧行为一致:不因 getChat 失败阻断业务流程)。
 // 返回对象新增 fromFallback 标志:true=API 失败使用默认文案;false=真实获取。调用方按需决定是否回退到 chatId(多主群场景避免都显示同一个 'CM技术交流群')。
@@ -2206,7 +2234,9 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-		const isAdmin = await checkIfUserIsAdmin(userId);
+		// /spam 主群路径:走到此处时消息必在主群群内(私聊会在上方 !isGroupIdChat 分支被 chat.type 守卫 return),
+		// 多主群越权修复 → 仅限"本主群"管理员执行(规则 2),不允许其它主群管理员越权。
+		const isAdmin = await checkIfUserIsAdminInMainGroup(userId, chatId);
 		if (!isAdmin) {
 			// 备用通道:非管理员但拥有 /ad 权限(当前所在主群助推者或 /ad 白名单)→ 按 /ad 举报投票逻辑处理
 			const isBoosted = await checkIfUserBoostedInChat(chatId, userId);
@@ -2276,7 +2306,9 @@ async function handleMessage(message, env) {
 		}
 		// 删除 /ad 命令消息,隐藏命令痕迹(bot 非群管理员时删除失败仅打日志,不阻断后续流程)
 		await deleteMessage(chatId, message.message_id);
-		const isAdmin = await checkIfUserIsAdmin(userId);
+		// /ad 主群路径:上方已 isMainGroup(chatId) 守卫,消息必在主群群内;
+		// 多主群越权修复 → 仅限"本主群"管理员执行(规则 2),不允许其它主群管理员越权。
+		const isAdmin = await checkIfUserIsAdminInMainGroup(userId, chatId);
 		if (!isAdmin) {
 			// 非管理员→检查助推者(当前主群) / 白名单
 			const isBoosted = await checkIfUserBoostedInChat(chatId, userId);
@@ -2353,7 +2385,9 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-		const isAdmin = await checkIfUserIsAdmin(userId);
+		// /check 主群群内与私聊都可达 → 按场景分流(规则 1/2):
+		//   私聊 → 任一主群管理员;主群群内 → 仅该主群管理员;其它群已被上方 isPrivateOrManagedGroup 拦截。
+		const isAdmin = await checkCommandAdmin(userId, message);
 		if (!isAdmin) {
 			return;
 		}
@@ -2406,17 +2440,38 @@ async function handleMessage(message, env) {
 		// 检查是否有参数 (例如: /start check_8435016129)
 		const parts = text.split(' ');
 		if (parts.length > 1 && parts[1].startsWith('check_')) {
-			// 验证用户是否是任一主群的管理员
-			const isAdmin = await checkIfUserIsAdmin(userId);
+			// 多主群越权修复:按消息场景分流管理员鉴权(规则 1/2/3):
+			//   - 私聊 → 任一主群(A 或 B)管理员(规则 1);
+			//   - 主群群内 → 仅该主群自身管理员(规则 2/3);
+			//   - 其它群 → 该 deep-link 查询入口仅限私聊/主群使用,静默忽略。
+			const isPrivateChatHere = message.chat?.type === 'private';
+			const isMainGroupChatHere = isMainGroup(chatId);
+			if (!isPrivateChatHere && !isMainGroupChatHere) {
+				return; // 其它群:静默忽略
+			}
+
+			let isAdmin;
+			if (isPrivateChatHere) {
+				// 私聊:任一主群管理员均可发起查询
+				isAdmin = await checkIfUserIsAdminInAnyMainGroup(userId);
+			} else {
+				// 主群群内:仅该主群管理员可发起查询
+				isAdmin = await checkIfUserIsAdminInMainGroup(userId, chatId);
+			}
 
 			if (!isAdmin) {
-				// 多主群权限提示(2026-09-04 用户反馈):权限判定为"任一主群管理员",
-				// 提示文案须列出全部主群(旧版 getGroupInfo() 无参只取 GROUP_ID_SET[0],多主群时误导);
-				// 群名统一走 formatMainGroupsNamesHint 链接渲染(公开群 <a href="https://t.me/xxx">群名</a>,
-				// 私有群/fallback 回退 群名<code>(chatId)</code>),复用 getChatInfoCached 永久缓存(0 额外请求)。
-				const mainGroupInfos = await listMainGroupInfos(env);
-				const groupsLabel = formatMainGroupsNamesHint(mainGroupInfos);
-				await sendTelegramMessage(chatId, `❌ <b>权限不足</b>\n\n此功能仅限 ${groupsLabel} 的管理员使用。`);
+				if (isPrivateChatHere) {
+					// 多主群权限提示(2026-09-04 用户反馈):私聊权限判定为"任一主群管理员",
+					// 提示文案须列出全部主群(旧版 getGroupInfo() 无参只取 GROUP_ID_SET[0],多主群时误导);
+					// 群名统一走 formatMainGroupsNamesHint 链接渲染(公开群 <a href="https://t.me/xxx">群名</a>,
+					// 私有群/fallback 回退 群名<code>(chatId)</code>),复用 getChatInfoCached 永久缓存(0 额外请求)。
+					const mainGroupInfos = await listMainGroupInfos(env);
+					const groupsLabel = formatMainGroupsNamesHint(mainGroupInfos);
+					await sendTelegramMessage(chatId, `❌ <b>权限不足</b>\n\n此功能仅限 ${groupsLabel} 的管理员使用。`);
+				} else {
+					// 主群群内:仅限本群管理员
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限本群管理员使用。');
+				}
 				return;
 			}
 
@@ -2492,8 +2547,9 @@ async function handleMessage(message, env) {
 			return;
 		}
 
-		// 检查是否是群组管理员
-		const isAdmin = await checkIfUserIsAdmin(userId);
+		// /ban 主群路径:主群群内与私聊都可达 → 按场景分流(规则 1/2):
+		//   私聊 → 任一主群管理员;主群群内 → 仅该主群管理员;其它群已被上方 isPrivateOrManagedGroup 拦截。
+		const isAdmin = await checkCommandAdmin(userId, message);
 		if (!isAdmin) {
 			// 备用通道:非管理员但拥有 /ad 权限(当前所在主群助推者或 /ad 白名单)→ 按 /ad 举报投票逻辑处理
 			const isBoosted = await checkIfUserBoostedInChat(chatId, userId);
@@ -2619,8 +2675,9 @@ async function handleMessage(message, env) {
 				return;
 			}
 
-			// 检查是否是群组管理员
-			const isAdmin = await checkIfUserIsAdmin(userId);
+			// /unban(shouldHandleAdminUnban 分支):主群群内与私聊都可达 → 按场景分流(规则 1/2):
+			//   私聊 → 任一主群管理员;主群群内 → 仅该主群管理员;其它群已被上方 isPrivateOrManagedGroup 拦截。
+			const isAdmin = await checkCommandAdmin(userId, message);
 			if (!isAdmin) {
 				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限群组管理员使用。');
 				return;
@@ -4272,9 +4329,13 @@ async function handleAdCallbackQuery(callbackQuery, env) {
 		return;
 	}
 
-	// 群管理员一票否决:任一主群管理员点"赞成"或"反对"立即结束
-	// (checkIfUserIsAdmin 已代理为任一主群管理员判定,走主群管理员名单缓存)
-	const voterIsAdmin = await checkIfUserIsAdmin(voterId);
+	// 群管理员一票否决:仅允许"该投票所在主群(state.chatId)"的管理员行使(规则 2/3)。
+	// 多主群越权修复:原先"任一主群管理员"(checkIfUserIsAdmin)会让 B 群管理员在 A 群
+	// 发起的投票上点"赞成/反对"直接一票否决,属越权;state.chatId 即按钮消息所在主群,
+	// 与 callback chatId 一致。上方已通过 checkUserStatusInChat(state.chatId, voterId) 取得
+	// voterStatusValue,直接复用 status==='creator'/'administrator' 判定(等价于按 state.chatId
+	// 单点查询,且 0 额外 Telegram API 调用;该变量在前置资格检查分支已保证非空)。
+	const voterIsAdmin = voterStatusValue === 'creator' || voterStatusValue === 'administrator';
 	if (voterIsAdmin) {
 		const adminResult = action === 'A' ? 'approved' : 'rejected';
 		state.vetoedBy = snapshotTelegramUser(callbackQuery.from);
