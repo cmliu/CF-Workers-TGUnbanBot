@@ -71,7 +71,7 @@ KV 中会使用 `blacklist` 这个 key 保存联网黑名单数组（数据库�
 | `first_name` / `last_name` / `username` | TEXT | 资料快照（每次收到消息自动刷新） |
 | `is_bot` | INTEGER | 是否机器人 |
 | `is_blacklisted` | INTEGER | 是否在联网黑名单（0/1） |
-| `ban_reason` | TEXT | 联网黑名单原因：`举报`（/ad 投票通过）、`管理员封禁(/spam)`、`管理员封禁(/ban)` |
+| `ban_reason` | TEXT | 联网黑名单原因：`群众举报`（/ad 投票通过）、`管理员封禁(/spam)`、`管理员封禁(/ban)` |
 | `banned_at` | INTEGER | 联网黑名单时间（epoch 秒；0 = 未知，KV 导入的旧数据无时间时为 0） |
 | `banned_by` | TEXT | 封禁处理人 tgid（溯源）：/ad 存举报发起人，/spam、/ban 存操作管理员 |
 | `can_report` | INTEGER | 举报资格（/add_ad_admin 白名单，0/1） |
