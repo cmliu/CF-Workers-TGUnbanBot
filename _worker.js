@@ -1285,7 +1285,7 @@ async function restoreUserInAllMainGroups(userId, env) {
 		if (info && !info.fromFallback && info.title) {
 			label = info.publicUsername
 				? `<a href="https://t.me/${escapeHtml(info.publicUsername)}">${escapeHtml(info.title)}</a>`
-				: escapeHtml(info.title);
+				: `${escapeHtml(info.title)}<code>(${escapeHtml(result.chatId)})</code>`;
 		}
 		const groupLines = [];
 		if (result.actions.length > 0) {
