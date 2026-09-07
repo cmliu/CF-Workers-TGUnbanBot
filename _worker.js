@@ -2315,7 +2315,16 @@ async function handleMessage(message, env) {
 			}
 			await sendTelegramMessage(chatId, responseMessage);
 		} else {
-			await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}`);
+			// 2026-09-08 修复:addToBlacklist 返回 alreadyExists(该用户已在联网黑名单)时,
+			// 被回复的这条消息即违规内容 → 同样先删除再提示(与 /ban 主群 alreadyExists 分支一致),
+			// 避免 /spam 重复举报时被回复的广告消息残留群内;非 alreadyExists 的真实失败
+			// (未绑定 KV/D1、写入异常等)保持原样只提示不删除(deleteMessage 内部已 try-catch)。
+			if (result.alreadyExists && message.reply_to_message) {
+				await deleteMessage(chatId, message.reply_to_message.message_id);
+				await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}\n✅ 已删除被举报的违规消息`);
+			} else {
+				await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}`);
+			}
 		}
 		return;
 	}
@@ -4016,7 +4025,16 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 	const duplicateCheck = await checkAdDuplicate(chatId, targetUserId, env);
 	console.log(`[/ad] 重复预检 tgid=${targetUserId} 已禁言或被ban=${duplicateCheck.mutedOrBanned} 联网黑名单=${duplicateCheck.localBlacklisted} 跳过=${duplicateCheck.shouldSkip}`);
 	if (duplicateCheck.shouldSkip) {
-		await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已在本群被禁言或被封禁，且已在联网黑名单中，无需重复发起举报投票`);
+		// 2026-09-08 修复:直发 /ad <tgid>(无回复对象)举报通过后广告消息无法被删除;群友改为
+		// "回复广告消息 + /ad(/ban /spam)"再次举报时,目标已在本群被禁言/封禁且已在联网黑名单
+		// → 不再只是提示早退,确认后先删除被回复的这条违规消息再返回,避免违规内容残留群内
+		// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程;无回复场景保持原"无需重复举报"语义)。
+		if (message.reply_to_message) {
+			await deleteMessage(chatId, message.reply_to_message.message_id);
+			await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已确认在联网黑名单中，已删除被举报的违规消息`);
+		} else {
+			await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已在本群被禁言或被封禁，且已在联网黑名单中，无需重复发起举报投票`);
+		}
 		return;
 	}
 
