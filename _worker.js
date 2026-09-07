@@ -16,24 +16,24 @@ let BOT_ID = null;
 // - 任一主群(GROUP_ID_SET 内)管理员回复消息(或带参数)发送 /ad,发起一次隐藏的举报投票。
 //   /ad 动作只在其发起的主群内生效/展示,不跨群广播。
 // - 回复场景:把被举报内容发给 Workers AI(模型由 AD_AI_MODEL 配置,默认 @cf/openai/gpt-oss-20b),
-//   由 AI 按群规判断威胁评级(0~100 分),评级决定本次投票的生效阈值:
-//     🔴A 高危 = 2 票  🟠B 危险 = 4 票  🟡C 可疑 = 6 票  🔵D 未知 = 8 票
+//   由 AI 按群规判断威胁评级(level 权威 + score 0~100 档内校准),评级决定本次投票的生效阈值:
+//     🔴S 极危 = 2 票  🟠A 高危 = 3 票  🟡B 危险 = 4 票  🟢C 可疑 = 5 票  🔵D 低危 = 6 票  ⚪E 无害 = 8 票
 //   AI 同时给出简短理由说明,仅记录在 Workers 日志中,不展示在投票消息里。
-// - 直接 /ad <tgid>(无回复内容)/ 无文字内容 / AI 基础设施失败(未绑定/超时/异常)→ 回退 🟡C 可疑(6 票)。
-// - AI 有响应但无法识别/拒绝答复(空响应、格式不对、可能触发安全策略拒答)→ 按 🟠B 危险(4 票)处理。
+// - 直接 /ad <tgid>(无回复内容)/ 无文字内容 / AI 基础设施失败(未绑定/超时/异常)→ 回退 🟢C 可疑(5 票)。
+// - AI 有响应但无法识别/拒绝答复(空响应、格式不对、可能触发安全策略拒答)→ 按 🟡B 危险(4 票)处理。
 // - 群规由 AD_GROUP_RULES 变量规定(env 可覆盖),默认"禁止讨论涉及涉政、NSFW、引战、嘲讽引战、广告推销、邪教"。
 // - 投票状态持久化到 env.KV: key = ad_vote:<vote_token>, TTL 7 天。
 // - 结束时调用 editMessageText 移除按钮,若赞成胜出则触发封禁(写入 KV 黑名单 + 群内禁言)。
 // - /ad 不出现在 setMyCommands 命令菜单中(保持隐藏)。
 // - 非管理员(含普通用户)触发 /ad:助推者/白名单直接发起投票;普通用户回复消息 + /ad 时先发占位
-//   "AI 正在评级",评级 A/B 把占位编辑为投票,AI 拒答/无法识别(unrecognized)沿用既有语义按 🟠B 弹投票,
-//   明确 C/D 或 AI 基础设施失败(null)把占位编辑为"未触发投票"收尾,均不发权限提示。
+//   "AI 正在评级",评级 S/A/B(极危/高危/危险)把占位编辑为投票,AI 拒答/无法识别(unrecognized)
+//   沿用既有语义按 🟡B 弹投票,明确 C/D/E 或 AI 基础设施失败(null)把占位编辑为"未触发投票"收尾,均不发权限提示。
 // - 主群内 /ad 命令消息发送后即被删除(隐藏命令痕迹);需要 await AI 的场景均先发占位消息再编辑落定,
 //   避免"等待 AI 期间群内无任何回应"的失效观感;纯 /ad <tgid> 无内容直接 C 级投票时不发占位。
 // ========================================================
 
-// 回退阈值:AI 不可用 / 直接传 tgid / 无文字内容时使用(默认 C 可疑 6 票)
-let AD_VOTE_THRESHOLD = 6;
+// 回退阈值:AI 不可用 / 直接传 tgid / 无文字内容时使用(默认 C 可疑 5 票,与评级表 C 档 5 票对齐)
+let AD_VOTE_THRESHOLD = 5;
 // 群规文本:发给 AI 判断威胁等级的依据,env.AD_GROUP_RULES 可覆盖
 let AD_GROUP_RULES = '禁止讨论涉及涉政、NSFW、引战、嘲讽引战、广告推销、邪教';
 const AD_VOTE_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -49,13 +49,34 @@ const AD_VOTE_MAX_VOTES = 10;
 let AD_AI_MODEL = '@cf/openai/gpt-oss-20b';
 let AD_AI_TIMEOUT_MS = 12000; // 单次调用超时,超时/异常回退 C 可疑(12s + 发送消息 < Worker 30s 墙钟上限)
 const AD_AI_MAX_CONTENT_CHARS = 500; // 发送给 AI 的被举报内容最大长度
-// 评级表:分数区间决定评级,评级决定本次投票生效阈值
+// 评级表(6 档,AI 威胁评级的权威数据源;key=level 大写字母,score 0~100 越高越危险):
+// - minScore/maxScore 定义分数区间;AI 判定采用"level 权威 + score 档内校准":level 定档,
+//   score 只 clamp 到所选档的 [minScore,maxScore] 区间内,不允许越档。
+// - votes=本次投票生效的赞成票阈值;反对票阈值恒 = AD_VOTE_MAX_VOTES(10) − votes。
+// - allowUserVote:普通用户举报通道是否弹投票——true(S/A/B)弹票;false(C/D/E)静默无害收尾。
+// - 语义:S 极危=诈骗/硬核NSFW/涉政/邪教/人肉威胁等恶性且明确;A 高危=恶意骚扰/广告+辱骂叠加/软色情;
+//   B 危险=广告推销/引战/嘲讽引战(情节一般);C 可疑=疑似擦边/疑似广告,证据不足;
+//   D 低危=语气不佳/轻微不适,不构成违规;E 无害=未违反群规。
 const AD_THREAT_RATINGS = {
-	A: { level: 'A', emoji: '🔴', label: '🔴 A 高危', minScore: 81, maxScore: 100, votes: 2 },
-	B: { level: 'B', emoji: '🟠', label: '🟠 B 危险', minScore: 61, maxScore: 80, votes: 4 },
-	C: { level: 'C', emoji: '🟡', label: '🟡 C 可疑', minScore: 31, maxScore: 60, votes: 6 },
-	D: { level: 'D', emoji: '🔵', label: '🔵 D 未知', minScore: 0, maxScore: 30, votes: 8 }
+	S: { level: 'S', emoji: '🔴', label: '🔴 S 极危', minScore: 91, maxScore: 100, votes: 2, allowUserVote: true },
+	A: { level: 'A', emoji: '🟠', label: '🟠 A 高危', minScore: 76, maxScore: 90, votes: 3, allowUserVote: true },
+	B: { level: 'B', emoji: '🟡', label: '🟡 B 危险', minScore: 61, maxScore: 75, votes: 4, allowUserVote: true },
+	C: { level: 'C', emoji: '🟢', label: '🟢 C 可疑', minScore: 41, maxScore: 60, votes: 5, allowUserVote: false },
+	D: { level: 'D', emoji: '🔵', label: '🔵 D 低危', minScore: 21, maxScore: 40, votes: 6, allowUserVote: false },
+	E: { level: 'E', emoji: '⚪', label: '⚪ E 无害', minScore: 0, maxScore: 20, votes: 8, allowUserVote: false }
 };
+
+// 普通用户通道是否允许该评级弹投票(评级决策 helper,供 handleAdCommand 判定):
+// - 优先采用评级对象上已携带的 allowUserVote(兼容未来档对象自描述);
+// - 仅拿到 level 字符串 / 对象未带该字段时,查 AD_THREAT_RATINGS[level]?.allowUserVote;
+// - 未知 level → fail-closed 返回 false(不弹投票)。
+function ratingAllowsUserVote(levelOrThreat) {
+	if (!levelOrThreat) return false;
+	const direct = typeof levelOrThreat === 'object' ? levelOrThreat.allowUserVote : undefined;
+	if (typeof direct === 'boolean') return direct;
+	const level = typeof levelOrThreat === 'string' ? levelOrThreat : levelOrThreat.level;
+	return AD_THREAT_RATINGS[level]?.allowUserVote ?? false;
+}
 
 // 黑名单实例级内存缓存:短 TTL 降低 KV 读频率,避免逼近 KV 免费档读取上限
 const BLACKLIST_CACHE_TTL_MS = 5000; // 5 秒,写入后跨实例最长延迟
@@ -2315,8 +2336,8 @@ async function handleMessage(message, env) {
 			const isAllowed = await isAdAllowlisted(env, userId);
 			if (!isBoosted && !isAllowed) {
 				// 普通用户举报通道:回复消息 + /ad → 评级逻辑已收敛进 handleAdCommand(userReport 模式:
-				// 先发占位消息,AI 评级 A/B 编辑为投票,拒答/unrecognized 按 🟠B 弹投票,
-				// 明确 C/D 或 AI 基础设施失败(null)编辑为"未触发投票"收尾)。
+				// 先发占位消息,AI 评级 S/A/B 编辑为投票,拒答/unrecognized 按 🟡B 弹投票,
+				// 明确 C/D/E 或 AI 基础设施失败(null)编辑为"未触发投票"收尾)。
 				// 此处仅做"有无可评内容"门槛:非回复或无文字(caption 也算)→ 命令消息已删除,静默。
 				const replyMsg = message.reply_to_message;
 				const src = (typeof replyMsg?.text === 'string' && replyMsg.text.length > 0)
@@ -3533,6 +3554,10 @@ function buildAdVoteMessageText(state) {
 	// 威胁评级与生效阈值(兼容旧 KV 状态:无评级字段时按 C 可疑 / 存储阈值兜底)
 	const rating = AD_THREAT_RATINGS[state.threatLevel] || AD_THREAT_RATINGS.C;
 	const threatLabel = state.threatLabel || rating.label;
+	// 旧 KV 状态可能无 threatScore(或存 null);仅有数值分数时在评级后追加" · N 分"
+	const threatScoreText = (typeof state.threatScore === 'number' && Number.isFinite(state.threatScore))
+		? ` · ${state.threatScore} 分`
+		: '';
 	const threshold = state.threshold || AD_VOTE_THRESHOLD;
 	const rejectThreshold = state.rejectThreshold || threshold; // 反对阈值,旧状态缺省=赞成阈值
 
@@ -3542,7 +3567,7 @@ ${resultLine}${vetoLine}
 <b>被举报ID:</b> <code>${escapeHtml(state.targetUserId)}</code>
 <b>发起人:</b> ${creatorText}
 
-<b>威胁评级:</b> <b>${escapeHtml(threatLabel)}</b>
+<b>威胁评级:</b> <b>${escapeHtml(threatLabel)}</b>${threatScoreText}
 <b>截止时间:</b> <code>${escapeHtml(deadlineStr)}</code>
 
 <b>赞成:</b> ${approverCount}/${threshold}
@@ -3573,16 +3598,19 @@ function buildAdVoteInlineKeyboard(voteToken, state) {
 
 // ---- AI 威胁评级 ----
 
-// 分数 → 评级:0~30=D,31~60=C,61~80=B,81~100=A(分数越高越危险)
+// 分数 → 档对象兜底(level 缺失/非法时的兼容路径):由分数落在哪个档的 [minScore,maxScore] 区间返回对应档。
+// 分数区间由 AD_THREAT_RATINGS 数据驱动,不在此硬编码边界;0~100 已被 6 档无重叠全覆盖,
+// 理论不存在未命中,兜底返回最低档 E(无害)。
 function scoreToRating(score) {
-	if (score >= 81) return AD_THREAT_RATINGS.A;
-	if (score >= 61) return AD_THREAT_RATINGS.B;
-	if (score >= 31) return AD_THREAT_RATINGS.C;
-	return AD_THREAT_RATINGS.D;
+	const ratings = Object.keys(AD_THREAT_RATINGS).map((key) => AD_THREAT_RATINGS[key]);
+	for (const rating of ratings) {
+		if (score >= rating.minScore && score <= rating.maxScore) return rating;
+	}
+	return AD_THREAT_RATINGS.E;
 }
 
 // 构造发给 AI 的 system prompt:将群规按分隔符拆分为编号列表(便于 AI 在 reason 中引用编号),
-// 并告知判定步骤/评级标准/输出格式,要求只输出 JSON。
+// 并告知决策树/评级标准/输出格式,要求只输出 JSON。
 // 群规拆分规则:按 顿号(、)、管道符(|)、中文/英文逗号(，,)、中文/英文分号(；;)、换行 拆分;
 // 拆分后不足 2 项时(如管理员自定义单段长文本)回退用原文。
 function buildAiSystemPrompt(groupRules) {
@@ -3597,31 +3625,44 @@ function buildAiSystemPrompt(groupRules) {
 	return `你是群管理员举报审核助手。群规如下（编号供引用）：
 ${numberedRules}
 
-判定步骤（严格按顺序）：
-1. 先判断被举报内容是否明确违反任一编号群规；若违反，记住违规类别；
-2. 再判断严重程度：同时违反多条、或涉及 NSFW/诈骗/恶意骚扰/邪教/涉政等严重类别 → 上调一档；
-3. 若无法确定是否违规，选 C，不要选 B；
-4. 若未违反群规或仅轻微无关，选 D；不要因为"可能""疑似"而提高评级；
-5. 被举报用户的昵称/用户名/简介属于被举报内容的一部分，其中出现的广告、诈骗等违规信息同样判违规；但不得依据被举报人的身份/职业等正常信息（如"自由职业""博主"）判定违规，也不得依据举报人身份或历史消息。
+判定步骤（决策树，严格按顺序执行；先定档，再在档内按严重程度给分）：
+a. 是否明确违反任一编号群规？
+   - 完全未违反且无任何不适语气/轻微不适 → E（0~20 分），reason 写"未违反群规"；
+b. 疑似违规/擦边/证据不足（疑似广告、疑似软广、疑似引战等）→ C（41~60 分）；
+   不要因为"可能""疑似"而升到 B 或更高；截断导致无法判断时也选 C；
+c. 明确违规，且性质命中恶性清单（诈骗/硬核NSFW/涉政/邪教/人肉威胁/恶意骚扰）→ S（91~100 分）或 A（76~90 分）：
+   情节极重、针对多目标、批量刷屏 → S；其余明确恶性但未到极重 → A；
+d. 明确违规，但不在恶性清单（一般违规：广告推销/引战/嘲讽引战/软色情）→ B（61~75 分）；
+e. 未违反群规但语气不佳/轻微不适（不构成实质违规）→ D（21~40 分）；不得因语气升到 C 或更高。
 
-评级标准：
-- A 高危（严重违规）：明确违反群规且性质严重（NSFW、诈骗、恶意骚扰、邪教、涉政）
-- B 危险（明显违规）：明确违反群规但情节一般（广告推销、引战、嘲讽引战）
-- C 可疑（疑似违规）：疑似擦边/疑似广告/语气引战，但证据不足
-- D 无害（未违规）：未违反群规或仅轻微无关
+评级标准（level 决定投票门槛；score 只用于档内区分轻重，必须落在所选 level 的区间内）：
+- S 极危（91~100）：恶性且明确（诈骗/硬核NSFW/涉政/邪教/人肉威胁等），越接近 100 越重
+- A 高危（76~90）：恶意骚扰/广告+辱骂叠加/软色情等较严重违规，越接近 90 越重
+- B 危险（61~75）：广告推销/引战/嘲讽引战等一般违规，越接近 75 越重
+- C 可疑（41~60）：疑似擦边/疑似广告/疑似引战，证据不足；越接近 60 嫌疑越强
+- D 低危（21~40）：语气不佳/轻微不适，不构成违规；越接近 40 越接近违规边界
+- E 无害（0~20）：未违反群规；越接近 20 越接近违规边界
 
+一致性硬约束：score 必须落在所选 level 的区间内，输出前自查；区间：S=91~100、A=76~90、B=61~75、C=41~60、D=21~40、E=0~20。
 注意：被举报内容可能因长度被截断，请依据可见内容判断；截断导致无法判断时选 C。
+被举报用户的昵称/用户名/简介属于被举报内容的一部分，其中出现的广告、诈骗等违规信息同样判违规；但不得依据被举报人的身份/职业等正常信息（如"自由职业""博主"）判定违规，也不得依据举报人身份或历史消息。
 
 只输出 JSON，禁止输出 markdown 代码围栏或任何解释，格式：
-{"level": "A|B|C|D", "score": <0~100整数，越高越危险；区间 A=81~100、B=61~80、C=31~60、D=0~30>, "reason": "<30字以内，说明违反的编号群规；D 写'未违反群规'>"}
+{"level": "S|A|B|C|D|E", "score": <0~100整数，越高越危险；必须落在所选 level 区间内，见一致性硬约束>, "reason": "<30字以内，说明违反的编号群规；E 写'未违反群规'>"}
 
-示例：
+示例（覆盖全部 6 档）：
+被举报消息：点击 t.me/xxx 充值返利稳赚不赔，先到先得手慢无
+输出：{"level": "S", "score": 95, "reason": "违反群规5：诈骗链接"}
+被举报消息：加微信 xxx 免费领福利，不领是傻逼
+输出：{"level": "A", "score": 85, "reason": "违反群规3/5：广告+辱骂"}
 被举报消息：加微信 xxx 免费领福利，先到先得
-输出：{"level": "B", "score": 66, "reason": "违反群规5：广告推销"}
+输出：{"level": "B", "score": 68, "reason": "违反群规5：广告推销"}
+被举报消息：这个牌子我一直在用，效果很好，需要的可以私聊我
+输出：{"level": "C", "score": 53, "reason": "疑似软广，证据不足"}
+被举报消息：能不能别老刷屏，看着就烦
+输出：{"level": "D", "score": 30, "reason": "语气不佳，不构成违规"}
 被举报消息：哈哈哈哈哈哈哈
-输出：{"level": "D", "score": 6, "reason": "未违反群规"}
-被举报消息：你是傻逼，滚出这个群
-输出：{"level": "A", "score": 88, "reason": "违反群规3/4：恶意攻击引战"}`;
+输出：{"level": "E", "score": 8, "reason": "未违反群规"}`;
 }
 
 // 容错解析 AI 返回的 JSON(兼容 markdown 代码围栏 / 前后多余文本 / 中文键名)
@@ -3781,19 +3822,43 @@ async function assessThreatWithAI(env, content, groupRules) {
 			console.error('[ad-ai] AI 返回无法解析为 JSON(可能为拒答/乱码/格式错误) → 按 B 危险处理。完整 text:', text);
 			return { ok: false, code: 'unrecognized' };
 		}
-		const score = Math.round(Number(parsed.score));
-		if (!Number.isFinite(score)) {
-			console.error('[ad-ai] AI 解析出的分数非数字 → 按 B 危险处理。parsed:', JSON.stringify(parsed));
+		// level 权威 + score 档内校准:
+		// - AI 显式给出合法 level(S/A/B/C/D/E)→ 以 level 定档,分数(若有)clamp 到该档 [minScore,maxScore];
+		// - level 缺失/非法但 score 合法 → 退化用 scoreToRating 由分数定档(兼容路径,记 warn 便于观测漂移);
+		// - level 与 score 皆不可用 → 维持 unrecognized 语义。
+		const AD_VALID_LEVELS = ['S', 'A', 'B', 'C', 'D', 'E'];
+		const rawLevel = typeof parsed.level === 'string' ? parsed.level.trim().toUpperCase() : '';
+		const levelValid = AD_VALID_LEVELS.includes(rawLevel);
+		const rawScore = Math.round(Number(parsed.score));
+		const scoreValid = Number.isFinite(rawScore);
+		if (!levelValid && !scoreValid) {
+			console.error('[ad-ai] AI 返回的 level 非法且分数非数字 → 按 B 危险处理。parsed:', JSON.stringify(parsed));
 			return { ok: false, code: 'unrecognized' };
 		}
-		const clampedScore = Math.max(0, Math.min(100, score));
-		const rating = scoreToRating(clampedScore);
-		console.log('[ad-ai] 解析成功: score=' + clampedScore + ' → 评级=' + rating.level + ' ' + rating.label + ' → 票数=' + rating.votes + ', reason="' + (parsed.reason || '') + '"');
+		let rating;
+		let finalScore;
+		let calibrated = false;
+		if (levelValid) {
+			rating = AD_THREAT_RATINGS[rawLevel];
+			if (scoreValid && (rawScore < rating.minScore || rawScore > rating.maxScore)) {
+				calibrated = true;
+				finalScore = Math.max(rating.minScore, Math.min(rating.maxScore, rawScore));
+				console.warn('[ad-ai] AI 分数与等级不一致,已校准: level=' + rawLevel + ' rawScore=' + rawScore + ' → clampedScore=' + finalScore);
+			} else {
+				finalScore = scoreValid ? rawScore : null;
+			}
+		} else {
+			// level 缺失/非法但 score 合法 → 按分数兜底定级(分数越高越危险)
+			finalScore = Math.max(0, Math.min(100, rawScore));
+			rating = scoreToRating(finalScore);
+			console.warn('[ad-ai] AI 未返回合法 level,按 score 兜底定级: rawLevel="' + (parsed.level === undefined ? '(缺失)' : String(parsed.level)) + '" score=' + finalScore + ' → 评级=' + rating.level);
+		}
+		console.log('[ad-ai] 解析成功: level=' + rating.level + ' score=' + finalScore + (calibrated ? '(档内校准)' : '') + ' → 评级=' + rating.label + ' → 票数=' + rating.votes + ', reason="' + (parsed.reason || '') + '"');
 		return {
 			ok: true,
 			level: rating.level,
 			label: rating.label,
-			score: clampedScore,
+			score: finalScore,
 			reason: String(parsed.reason || '').slice(0, 80) || '未提供理由',
 			threshold: rating.votes
 		};
@@ -3857,8 +3922,8 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 	const chatId = message.chat.id;
 	const userId = message.from.id;
 	// options.userReport=true → 普通用户举报通道(无举报权限):
-	// AI 评级明确 A/B → 把占位编辑为投票;AI 拒答/道德围墙/无法解析(unrecognized)→ 沿用仓库
-	// 评级语义按 B 危险把占位编辑为投票;评级 C/D → 编辑占位为"✅ 无害"收尾;仅 AI 基础设施
+	// AI 评级明确 S/A/B(allowUserVote=true)→ 把占位编辑为投票;AI 拒答/道德围墙/无法解析(unrecognized)→ 沿用仓库
+	// 评级语义按 B 危险把占位编辑为投票;评级 C/D/E(allowUserVote=false)→ 编辑占位为"✅ 无害"收尾;仅 AI 基础设施
 	// 失败(null: 未绑定/超时/网络/限流)→ 编辑占位为"⚠️ 无法完成评级"收尾;后两者不建投票
 	// state、不写 KV(取代旧"外层预评级+非A/B完全静默")。
 	const userReportMode = Boolean(options && options.userReport);
@@ -4008,22 +4073,23 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 
 	// 7. 评级决策:
 	//    - preAssessedThreat(兼容旧调用点:外部已评级)→ 直接采用,不再调 AI;
-	//    - 普通用户通道(userReportMode)→ AI 明确 A/B 弹投票;unrecognized(AI 拒答/道德围墙/
-	//      无法解析,内容可能确实违规才触发)→ 沿用仓库评级语义按 B 危险弹投票;AI 明确 C/D →
-	//      ✅ 无害收尾;仅 AI 基础设施失败(null)→ ⚠️ 未评级收尾(后两者不建投票 state、不写 KV);
+	//    - 普通用户通道(userReportMode)→ AI 明确 S/A/B(allowUserVote=true)弹投票;unrecognized
+	//      (AI 拒答/道德围墙/无法解析,内容可能确实违规才触发)→ 沿用仓库评级语义按 B 危险弹投票;
+	//      AI 明确 C/D/E(allowUserVote=false)→ ✅ 无害收尾;仅 AI 基础设施失败(null)→
+	//      ⚠️ 未评级收尾(后两者不建投票 state、不写 KV);
 	//    - 有举报权限通道 → 评级只决定门槛,一律弹投票(AI成功按评级 / unrecognized→B / 失败→C / 无内容→C)。
 	let threat = null;
 	let closeKind = null; // 'harmless'=明确无害 | 'unassessable'=AI基础设施失败(null) | null=弹投票
 	if (preAssessedThreat) {
 		threat = preAssessedThreat;
-		if (userReportMode && threat.level !== 'A' && threat.level !== 'B') {
-			closeKind = 'harmless'; // 外部预评级已明确 C/D → 无害收尾
+		if (userReportMode && !ratingAllowsUserVote(threat)) {
+			closeKind = 'harmless'; // 外部预评级 C/D/E(allowUserVote=false)→ 无害收尾
 		}
 	} else if (userReportMode) {
-		if (threatAssessment?.ok && (threatAssessment.level === 'A' || threatAssessment.level === 'B')) {
-			threat = threatAssessment; // 明确 A/B → 弹投票
+		if (threatAssessment?.ok && ratingAllowsUserVote(threatAssessment)) {
+			threat = threatAssessment; // S/A/B(allowUserVote=true)→ 弹投票
 		} else if (threatAssessment?.ok) {
-			closeKind = 'harmless'; // 明确 C/D → 无害收尾
+			closeKind = 'harmless'; // C/D/E(allowUserVote=false)→ 无害收尾
 		} else if (threatAssessment?.code === 'unrecognized') {
 			// AI 拒答/返回无法识别(含道德围墙拒绝)→ 内容可能确实违规才触发,必须沿用仓库评级语义:
 			// 按 B 危险弹投票,不得降级为"无法评级"收尾(与下方有举报权限通道的 unrecognized→B 同构)。
