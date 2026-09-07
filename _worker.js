@@ -1285,7 +1285,7 @@ async function restoreUserInAllMainGroups(userId, env) {
 		if (info && !info.fromFallback && info.title) {
 			label = info.publicUsername
 				? `<a href="https://t.me/${escapeHtml(info.publicUsername)}">${escapeHtml(info.title)}</a>`
-				: escapeHtml(info.title);
+				: `${escapeHtml(info.title)}<code>(${escapeHtml(result.chatId)})</code>`;
 		}
 		const groupLines = [];
 		if (result.actions.length > 0) {
@@ -3568,7 +3568,9 @@ function buildAdVoteMessageText(state) {
 		? ` · ${state.threatScore} 分`
 		: '';
 	const threshold = state.threshold || AD_VOTE_THRESHOLD;
-	const rejectThreshold = state.rejectThreshold || threshold; // 反对阈值,旧状态缺省=赞成阈值
+	const rejectThreshold = (typeof state.rejectThreshold === 'number' && Number.isFinite(state.rejectThreshold))
+		? state.rejectThreshold
+		: Math.max(1, AD_VOTE_MAX_VOTES - threshold);
 
 	return `⚠️ <b>#广告举报</b>
 ${resultLine}${vetoLine}
