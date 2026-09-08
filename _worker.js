@@ -15,12 +15,16 @@ let BOT_ID = null;
 // 概要:
 // - 任一主群(GROUP_ID_SET 内)管理员回复消息(或带参数)发送 /ad,发起一次隐藏的举报投票。
 //   /ad 动作只在其发起的主群内生效/展示,不跨群广播。
-// - 回复场景:把被举报内容发给 Workers AI(模型由 AD_AI_MODEL 配置,默认 @cf/openai/gpt-oss-20b),
+// - 回复场景:把被举报内容发给 Workers AI(模型列表由 AD_AI_MODEL 配置,默认按序容灾:
+//   gemma-4-26b-a4b-it → gpt-oss-20b;env.AD_AI_MODEL 以英文逗号分隔/JSON 数组可整体替换,
+//   仅当某模型"超时或抛异常"[基础设施失败]时切换下一个;unrecognized[有响应但拒答/无法识别]不切换,立即落定),
 //   由 AI 按群规判断威胁评级(level 权威 + score 0~100 档内校准),评级决定本次投票的生效阈值:
 //     🔴S 极危 = 2 票  🟠A 高危 = 3 票  🟡B 危险 = 4 票  🟢C 可疑 = 5 票  🔵D 低危 = 6 票  ⚪E 无害 = 8 票
 //   AI 同时给出简短理由说明,以 spoiler 折叠形式展示在投票消息「评级理由:」行(默认模糊遮挡,点击展开),仍同步记录 Workers 日志。
 //   reason 强制要求模型用简体中文输出并直接给结论(禁止英文句子/思维链口吻,即使被举报内容是外语);
-//   AI 响应耗时(latencyMs,从发出请求到拿到答复)记录到投票 state,在「威胁评级:」行追加显示"· 耗时 N ms"(便于观察模型速度)。
+//   AI 响应耗时(latencyMs)只统计"实际产出该次结果的那次模型尝试"(超时/异常的尝试不计入),随投票 state 展示,
+//   在「威胁评级:」行追加显示"· 耗时 N ms";实际产出评级的模型 ID 存 aiModel,投票消息在「评级理由:」行之后
+//   以「评级模型:」行展示其短名(如 gemma-4-26b-a4b-it;仅 AI 有响应路径携带,旧 KV 状态无此字段不显示)。
 // - 直接 /ad <tgid>(无回复内容)/ 无文字内容 / AI 基础设施失败(未绑定/超时/异常)→ 回退 🟢C 可疑(5 票)。
 // - AI 有响应但无法识别/拒绝答复(空响应、格式不对、可能触发安全策略拒答)→ 按 🟡B 危险(4 票)处理。
 // - 群规由 AD_GROUP_RULES 变量规定(env 可覆盖),默认"禁止讨论涉及涉政、NSFW、引战、嘲讽引战、广告推销、邪教"。
@@ -45,11 +49,40 @@ const AD_VOTE_BUTTON_PREFIX = 'adv:'; // callback_data 前缀
 const AD_VOTE_MAX_VOTES = 10;
 
 // ---- AI 威胁评级配置(env 均可覆盖) ----
-// 主模型:可用 env.AD_AI_MODEL 覆盖(如 @cf/qwen/qwen3-30b-a3b-fp8)。
-// 默认 @cf/openai/gpt-oss-20b:实测延迟约 2s,稳定性好;此前默认的
-// @cf/zai-org/glm-4.7-flash 在部分账号/区域持续超时(>12s 无响应)。
-let AD_AI_MODEL = '@cf/openai/gpt-oss-20b';
-let AD_AI_TIMEOUT_MS = 12000; // 单次调用超时,超时/异常回退 C 可疑(12s + 发送消息 < Worker 30s 墙钟上限)
+// 模型列表(数组,按序容灾):env.AD_AI_MODEL 可整体替换——支持英文逗号分隔多模型 / JSON 字符串数组 / 单个模型名;
+// 解析后为空(未配置/全空串) → 回退内置默认列表 AD_AI_DEFAULT_MODELS。顺序即用户配置顺序。
+// 调用按数组顺序逐个尝试:仅当某模型"超时或抛异常"(基础设施失败)时切换下一个;unrecognized(有响应但
+// 空文本/无法解析/拒答/道德围墙)不切换,立即按既有语义落定(拒答本身即评级结论)。
+// 内置默认(顺序为用户指定,保持不动):gemma-4-26b-a4b-it 最先;gpt-oss-20b 实测延迟约 2s、稳定性好放最后兜底;
+// 原首位的 glm-4.7-flash 在部分账号/区域持续超时(>12s 无响应),2026-09-08 已从默认列表移除。
+const AD_AI_DEFAULT_MODELS = [
+	'@cf/google/gemma-4-26b-a4b-it',
+	'@cf/openai/gpt-oss-20b'
+];
+let AD_AI_MODELS = AD_AI_DEFAULT_MODELS.slice(); // 实际生效的模型列表:fetch 阶段按 env.AD_AI_MODEL 整体替换;未覆盖时=内置默认
+let AD_AI_TIMEOUT_MS = 12000; // 单次调用超时(每个模型的单次尝试独立计时),超时/异常切换下一个;全部失败回退 C 可疑(两次最坏 ~24s 接近 Worker 30s 墙钟上限,残余风险见头注)
+
+// 解析 env.AD_AI_MODEL 为"本次要用的模型数组"(纯逻辑,便于 QA 直接测):
+// - 输入先 String()+trim;空 → 回退内置默认;
+// - 先尝试 JSON.parse:若结果是字符串数组 → 用之(允许 env 配 JSON 数组);
+// - 否则按英文逗号 , split → 逐项 trim → 过滤空串;
+// - 解析后仍为空 → 回退内置默认。顺序即用户配置顺序。
+function resolveAdAiModels(envValue) {
+	const raw = String(envValue == null ? '' : envValue).trim();
+	if (!raw) return AD_AI_DEFAULT_MODELS.slice();
+	let candidates = null;
+	try {
+		const parsed = JSON.parse(raw);
+		if (Array.isArray(parsed)) candidates = parsed;
+	} catch (_) {
+		candidates = null; // 非 JSON(普通逗号分隔串 / 单个模型名)→ 走 split 分支
+	}
+	const list = Array.isArray(candidates) ? candidates : raw.split(',');
+	const models = list
+		.map((item) => String(item).trim())
+		.filter((item) => item.length > 0);
+	return models.length > 0 ? models : AD_AI_DEFAULT_MODELS.slice();
+}
 const AD_AI_MAX_CONTENT_CHARS = 500; // 发送给 AI 的被举报内容最大长度
 // 评级表(6 档,AI 威胁评级的权威数据源;key=level 大写字母,score 0~100 越高越危险):
 // - minScore/maxScore 定义分数区间;AI 判定采用"level 权威 + score 档内校准":level 定档,
@@ -1350,7 +1383,7 @@ export default {
 		const url = new URL(request.url);
 		AD_VOTE_THRESHOLD = parseInt(env.AD_VOTE_THRESHOLD) || AD_VOTE_THRESHOLD;
 		AD_GROUP_RULES = String(env.AD_GROUP_RULES || '').trim() || AD_GROUP_RULES;
-		AD_AI_MODEL = String(env.AD_AI_MODEL || '').trim() || AD_AI_MODEL;
+		AD_AI_MODELS = resolveAdAiModels(env.AD_AI_MODEL); // 整体替换模型列表(逗号分隔/JSON 数组/单模型;空回退内置默认)
 		AD_AI_TIMEOUT_MS = parseInt(env.AD_AI_TIMEOUT_MS) || AD_AI_TIMEOUT_MS;
 		const path = url.pathname.slice(1); // 移除开头的斜杠
 		let TOKEN;
@@ -3515,6 +3548,15 @@ function buildAdTargetText(state, mask) {
 	return `<a href="tg://user?id=${escapeHtml(state.targetUserId)}">${escapeHtml(maskDisplayName(displayName))}</a>`;
 }
 
+// 从模型 ID 中提取用于展示的短名:取最后一个 '/' 之后的子串(如 '@cf/zai-org/glm-4.7-flash' → 'glm-4.7-flash');
+// 若不含 '/' 则原样返回;空/非字符串返回空串(调用方据此不渲染「评级模型:」行)。
+function extractAiModelShortName(modelId) {
+	const s = String(modelId == null ? '' : modelId).trim();
+	if (!s) return '';
+	const idx = s.lastIndexOf('/');
+	return idx === -1 ? s : s.slice(idx + 1);
+}
+
 function buildAdVoteMessageText(state) {
 	const isApproved = state.result === 'approved';
 	const isRejected = state.result === 'rejected';
@@ -3578,6 +3620,11 @@ function buildAdVoteMessageText(state) {
 	const threatReasonText = (typeof state.threatReason === 'string' && state.threatReason.trim())
 		? `\n<b>评级理由:</b> <tg-spoiler>${escapeHtml(state.threatReason.trim())}</tg-spoiler>`
 		: '';
+	// 旧 KV 状态可能无 aiModel(2026-09-08 新增);仅当状态里存在非空 aiModel 时,在「评级理由:」spoiler 行之后
+	// 追加一行「评级模型:」,展示实际产出该评级的模型短名(取最后一个 '/' 之后,便于识别由哪个模型落定)
+	const threatModelText = (typeof state.aiModel === 'string' && state.aiModel.trim())
+		? `\n<b>评级模型:</b> <code>${escapeHtml(extractAiModelShortName(state.aiModel))}</code>`
+		: '';
 	const threshold = state.threshold || AD_VOTE_THRESHOLD;
 	const rejectThreshold = (typeof state.rejectThreshold === 'number' && Number.isFinite(state.rejectThreshold))
 		? state.rejectThreshold
@@ -3589,7 +3636,7 @@ ${resultLine}${vetoLine}
 <b>被举报ID:</b> <code>${escapeHtml(state.targetUserId)}</code>
 <b>发起人:</b> ${creatorText}
 
-<b>威胁评级:</b> <b>${escapeHtml(threatLabel)}</b>${threatScoreText}${threatLatencyText}${threatReasonText}
+<b>威胁评级:</b> <b>${escapeHtml(threatLabel)}</b>${threatScoreText}${threatLatencyText}${threatReasonText}${threatModelText}
 <b>截止时间:</b> <code>${escapeHtml(deadlineStr)}</code>
 
 <b>赞成:</b> ${approverCount}/${threshold}
@@ -3813,24 +3860,26 @@ function extractAiResponseText(result) {
 	return '';
 }
 
-// 调用 Workers AI 判断威胁评级(单模型)。返回三态:
-// - 成功:{ ok: true, level, label, score, reason, threshold, latencyMs }
-// - AI 有响应但无法识别/拒绝答复:{ ok: false, code: 'unrecognized', latencyMs }
+// 调用 Workers AI 判断威胁评级(模型数组按序容灾)。返回三态:
+// - 成功:{ ok: true, level, label, score, reason, threshold, model, latencyMs }
+// - AI 有响应但无法识别/拒绝答复:{ ok: false, code: 'unrecognized', model, latencyMs }
 //   → 调用方按 🟡B 危险处理(内容可能触发了安全策略拒答;
-//     含 AI 调用抛"内容安全拒绝"类异常——能触发道德围栏本身就是高危信号)
-// - 基础设施失败(无 AI 绑定 / 超时 / 网络 / 限流等,不含内容安全拒绝):null
+//     含 AI 调用抛"内容安全拒绝"类异常——能触发道德围栏本身就是高危信号);
+//     unrecognized 是终点:该模型"有响应",只是内容触发拒答/无法解析,不切换后续模型
+// - 基础设施失败(无 AI 绑定 / 全部模型超时 / 网络 / 限流等,不含内容安全拒绝):null
 //   → 调用方按 🟢C 可疑中性回退
-// latencyMs 为 AI 响应耗时(毫秒,从发出请求到拿到答复),仅"AI 有响应"的路径携带;
-// null 路径(基础设施失败)不携带,调用方按 C 兜底时无耗时展示。
+// model 为"实际产出该次评级的模型 ID"(仅 AI 有响应的成功/拒答路径携带,含超时/异常切换后命中的模型);
+// latencyMs 只统计"实际产出结果的那次模型尝试"的耗时(毫秒,从该次尝试发出请求到拿到答复),
+// 超时/异常尝试的耗时不计入;null 路径(全部基础设施失败)不携带 model/latencyMs,调用方按 C 兜底时无展示。
 // 所有诊断日志以 [ad-ai] 前缀输出,Cloudflare Workers Logs 中可按前缀 grep 定位。
 async function assessThreatWithAI(env, content, groupRules) {
-	// 入口诊断:env/AI 绑定状态、消息长度、模型名
+	// 入口诊断:env/AI 绑定状态、消息长度、本次模型列表
 	console.log('[ad-ai] === 评估入口 ===', JSON.stringify({
 		hasEnv: Boolean(env),
 		hasAIBinding: Boolean(env && env.AI),
 		aiType: env?.AI ? typeof env.AI : 'undefined',
 		hasRunMethod: env?.AI ? typeof env.AI.run : 'undefined',
-		model: AD_AI_MODEL,
+		models: AD_AI_MODELS,
 		contentLength: content ? content.length : 0,
 		contentPreview: content ? content.slice(0, 80).replace(/\n/g, '\\n') : '',
 		rulesLength: (groupRules || AD_GROUP_RULES).length,
@@ -3852,116 +3901,154 @@ async function assessThreatWithAI(env, content, groupRules) {
 
 	const systemPrompt = buildAiSystemPrompt(groupRules || AD_GROUP_RULES);
 	const userContent = `被举报消息内容:\n${content}`;
-	const runOptions = buildAiRunOptions(AD_AI_MODEL, systemPrompt, userContent);
+	// 本次要用的模型列表:fetch 阶段已按 env.AD_AI_MODEL 解析到 AD_AI_MODELS(空回退内置默认);
+	// 此处兜底再解析一次,避免"未经 fetch 直接调用"时拿到空列表。
+	const models = (Array.isArray(AD_AI_MODELS) && AD_AI_MODELS.length > 0)
+		? AD_AI_MODELS
+		: resolveAdAiModels(env && env.AD_AI_MODEL);
 
-	console.log('[ad-ai] 准备调用 env.AI.run, model=' + AD_AI_MODEL + ', 参数键=' + Object.keys(runOptions).join(',') + ', 超时=' + AD_AI_TIMEOUT_MS + 'ms');
+	// 单模型尝试(内层):每次尝试独立计时 + 独立超时(各自 timerId,结束即清理)。返回三态:
+	//   { kind:'ok', level, label, score, reason, threshold, model, latencyMs } → 解析成功
+	//   { kind:'unrecognized', model, latencyMs }  → 有响应但空文本/无法解析/level+score 均非法/道德围墙拒绝
+	//   { kind:'infra', model, isTimeout, errorMessage } → 超时/网络/限流等基础设施失败 → 外层切换下一模型
+	// latencyMs 仅统计"本次尝试"耗时(aiStart 在每次尝试开始时重置);infra 尝试耗时不计入最终结果。
+	const attemptSingleModel = async (model) => {
+		const aiStart = Date.now();
+		const aiLatencyMs = () => Math.max(0, Math.round(Date.now() - aiStart));
+		const runOptions = buildAiRunOptions(model, systemPrompt, userContent);
 
-	// AI 响应耗时测量:从准备发起请求到拿到答复(含排队/网络/推理),用于观察模型速度并随投票 state 展示
-	const aiStart = Date.now();
-	const aiLatencyMs = () => Math.max(0, Math.round(Date.now() - aiStart));
+		console.log('[ad-ai] 准备调用 env.AI.run, model=' + model + ', 参数键=' + Object.keys(runOptions).join(',') + ', 超时=' + AD_AI_TIMEOUT_MS + 'ms');
 
-	let timerId;
-	try {
-		const result = await Promise.race([
-			env.AI.run(AD_AI_MODEL, runOptions),
-			new Promise((_, reject) => {
-				timerId = setTimeout(
-					() => reject(new Error('AI 调用超时(>' + AD_AI_TIMEOUT_MS + 'ms)')),
-					AD_AI_TIMEOUT_MS
-				);
-			})
-		]);
-		if (timerId) clearTimeout(timerId);
-
-		// 完整打印 AI.run 原始返回(便于诊断格式异常),截断 500 字符
-		let rawStr;
+		let timerId;
 		try {
-			rawStr = JSON.stringify(result);
-		} catch (jsonErr) {
-			rawStr = '[无法 JSON.stringify] typeof=' + typeof result + ', String()=' + String(result);
-		}
-		console.log('[ad-ai] AI.run 已返回, 耗时=' + aiLatencyMs() + 'ms, 截断 500:', rawStr.slice(0, 500));
+			const result = await Promise.race([
+				env.AI.run(model, runOptions),
+				new Promise((_, reject) => {
+					timerId = setTimeout(
+						() => reject(new Error('AI 调用超时(>' + AD_AI_TIMEOUT_MS + 'ms)')),
+						AD_AI_TIMEOUT_MS
+					);
+				})
+			]);
+			if (timerId) clearTimeout(timerId);
 
-		// 多格式提取文本(传统 Chat / Responses API / Chat Completions)
-		const text = extractAiResponseText(result);
-		console.log('[ad-ai] 提取的 response 文本: 长度=' + text.length + ', 前300字符=' + text.slice(0, 300));
-
-		if (!text || !text.trim()) {
-			console.error('[ad-ai] AI 返回空文本(可能被安全策略拒答或模型静默,或返回结构未适配) → 按 B 危险处理。原始返回:', rawStr.slice(0, 500));
-			return { ok: false, code: 'unrecognized', latencyMs: aiLatencyMs() };
-		}
-		const parsed = parseAiThreatJson(text);
-		if (!parsed) {
-			console.error('[ad-ai] AI 返回无法解析为 JSON(可能为拒答/乱码/格式错误) → 按 B 危险处理。完整 text:', text);
-			return { ok: false, code: 'unrecognized', latencyMs: aiLatencyMs() };
-		}
-		// level 权威 + score 档内校准:
-		// - AI 显式给出合法 level(S/A/B/C/D/E)→ 以 level 定档,分数(若有)clamp 到该档 [minScore,maxScore];
-		// - level 缺失/非法但 score 合法 → 退化用 scoreToRating 由分数定档(兼容路径,记 warn 便于观测漂移);
-		// - level 与 score 皆不可用 → 维持 unrecognized 语义。
-		const AD_VALID_LEVELS = ['S', 'A', 'B', 'C', 'D', 'E'];
-		const rawLevel = typeof parsed.level === 'string' ? parsed.level.trim().toUpperCase() : '';
-		const levelValid = AD_VALID_LEVELS.includes(rawLevel);
-		const rawScore = Math.round(Number(parsed.score));
-		const scoreValid = Number.isFinite(rawScore);
-		if (!levelValid && !scoreValid) {
-			console.error('[ad-ai] AI 返回的 level 非法且分数非数字 → 按 B 危险处理。parsed:', JSON.stringify(parsed));
-			return { ok: false, code: 'unrecognized', latencyMs: aiLatencyMs() };
-		}
-		let rating;
-		let finalScore;
-		let calibrated = false;
-		if (levelValid) {
-			rating = AD_THREAT_RATINGS[rawLevel];
-			if (scoreValid && (rawScore < rating.minScore || rawScore > rating.maxScore)) {
-				calibrated = true;
-				finalScore = Math.max(rating.minScore, Math.min(rating.maxScore, rawScore));
-				console.warn('[ad-ai] AI 分数与等级不一致,已校准: level=' + rawLevel + ' rawScore=' + rawScore + ' → clampedScore=' + finalScore);
-			} else {
-				finalScore = scoreValid ? rawScore : null;
+			// 完整打印 AI.run 原始返回(便于诊断格式异常),截断 500 字符
+			let rawStr;
+			try {
+				rawStr = JSON.stringify(result);
+			} catch (jsonErr) {
+				rawStr = '[无法 JSON.stringify] typeof=' + typeof result + ', String()=' + String(result);
 			}
-		} else {
-			// level 缺失/非法但 score 合法 → 按分数兜底定级(分数越高越危险)
-			finalScore = Math.max(0, Math.min(100, rawScore));
-			rating = scoreToRating(finalScore);
-			console.warn('[ad-ai] AI 未返回合法 level,按 score 兜底定级: rawLevel="' + (parsed.level === undefined ? '(缺失)' : String(parsed.level)) + '" score=' + finalScore + ' → 评级=' + rating.level);
-		}
-		console.log('[ad-ai] 解析成功: level=' + rating.level + ' score=' + finalScore + (calibrated ? '(档内校准)' : '') + ' → 评级=' + rating.label + ' → 票数=' + rating.votes + ', reason="' + (parsed.reason || '') + '"');
-		return {
-			ok: true,
-			level: rating.level,
-			label: rating.label,
-			score: finalScore,
-			reason: String(parsed.reason || '').slice(0, 80) || '未提供理由',
-			threshold: rating.votes,
-			latencyMs: aiLatencyMs()
-		};
-	} catch (error) {
-		if (timerId) clearTimeout(timerId);
-		const isTimeout = error && error.message && error.message.includes('AI 调用超时');
-		// 内容安全拒绝检测:能触发道德围栏(如 NSFW)本身就是"内容足够劲爆"的强信号,
-		// 模型/API 常因此直接抛 400/403 或安全策略报错 → 与拒答同等对待,按 B 危险处理。
-		// 超时永远不算内容拒绝(超时不携带内容违规信息),即使 message 含其它词也保持 null→C。
-		const SAFETY_PATTERN = /(?:content|safety|policy|filter|moderat|block|inappropriat|disallow|NSFW|400|403)/i;
-		const isSafetyRejection = !isTimeout && Boolean(error?.message) && SAFETY_PATTERN.test(error.message);
-		if (isSafetyRejection) {
-			console.error('[ad-ai] AI.run 疑似触发道德围栏/内容安全拒绝 → 按 B 危险处理。诊断信息:', JSON.stringify({
+			console.log('[ad-ai] AI.run 已返回, 耗时=' + aiLatencyMs() + 'ms, 截断 500:', rawStr.slice(0, 500));
+
+			// 多格式提取文本(传统 Chat / Responses API / Chat Completions)
+			const text = extractAiResponseText(result);
+			console.log('[ad-ai] 提取的 response 文本: 长度=' + text.length + ', 前300字符=' + text.slice(0, 300));
+
+			if (!text || !text.trim()) {
+				console.error('[ad-ai] AI 返回空文本(可能被安全策略拒答或模型静默,或返回结构未适配) → 按 B 危险处理。model=' + model + ' 原始返回:', rawStr.slice(0, 500));
+				return { kind: 'unrecognized', model, latencyMs: aiLatencyMs() };
+			}
+			const parsed = parseAiThreatJson(text);
+			if (!parsed) {
+				console.error('[ad-ai] AI 返回无法解析为 JSON(可能为拒答/乱码/格式错误) → 按 B 危险处理。model=' + model + ' 完整 text:', text);
+				return { kind: 'unrecognized', model, latencyMs: aiLatencyMs() };
+			}
+			// level 权威 + score 档内校准:
+			// - AI 显式给出合法 level(S/A/B/C/D/E)→ 以 level 定档,分数(若有)clamp 到该档 [minScore,maxScore];
+			// - level 缺失/非法但 score 合法 → 退化用 scoreToRating 由分数定档(兼容路径,记 warn 便于观测漂移);
+			// - level 与 score 皆不可用 → 维持 unrecognized 语义。
+			const AD_VALID_LEVELS = ['S', 'A', 'B', 'C', 'D', 'E'];
+			const rawLevel = typeof parsed.level === 'string' ? parsed.level.trim().toUpperCase() : '';
+			const levelValid = AD_VALID_LEVELS.includes(rawLevel);
+			const rawScore = Math.round(Number(parsed.score));
+			const scoreValid = Number.isFinite(rawScore);
+			if (!levelValid && !scoreValid) {
+				console.error('[ad-ai] AI 返回的 level 非法且分数非数字 → 按 B 危险处理。model=' + model + ' parsed:', JSON.stringify(parsed));
+				return { kind: 'unrecognized', model, latencyMs: aiLatencyMs() };
+			}
+			let rating;
+			let finalScore;
+			let calibrated = false;
+			if (levelValid) {
+				rating = AD_THREAT_RATINGS[rawLevel];
+				if (scoreValid && (rawScore < rating.minScore || rawScore > rating.maxScore)) {
+					calibrated = true;
+					finalScore = Math.max(rating.minScore, Math.min(rating.maxScore, rawScore));
+					console.warn('[ad-ai] AI 分数与等级不一致,已校准: level=' + rawLevel + ' rawScore=' + rawScore + ' → clampedScore=' + finalScore);
+				} else {
+					finalScore = scoreValid ? rawScore : null;
+				}
+			} else {
+				// level 缺失/非法但 score 合法 → 按分数兜底定级(分数越高越危险)
+				finalScore = Math.max(0, Math.min(100, rawScore));
+				rating = scoreToRating(finalScore);
+				console.warn('[ad-ai] AI 未返回合法 level,按 score 兜底定级: rawLevel="' + (parsed.level === undefined ? '(缺失)' : String(parsed.level)) + '" score=' + finalScore + ' → 评级=' + rating.level);
+			}
+			console.log('[ad-ai] 解析成功: model=' + model + ' level=' + rating.level + ' score=' + finalScore + (calibrated ? '(档内校准)' : '') + ' → 评级=' + rating.label + ' → 票数=' + rating.votes + ', reason="' + (parsed.reason || '') + '"');
+			return {
+				kind: 'ok',
+				level: rating.level,
+				label: rating.label,
+				score: finalScore,
+				reason: String(parsed.reason || '').slice(0, 80) || '未提供理由',
+				threshold: rating.votes,
+				model,
+				latencyMs: aiLatencyMs()
+			};
+		} catch (error) {
+			if (timerId) clearTimeout(timerId);
+			const isTimeout = error && error.message && error.message.includes('AI 调用超时');
+			// 内容安全拒绝检测:能触发道德围栏(如 NSFW)本身就是"内容足够劲爆"的强信号,
+			// 模型/API 常因此直接抛 400/403 或安全策略报错 → 与拒答同等对待,按 B 危险处理(终点,不切换模型)。
+			// 超时永远不算内容拒绝(超时不携带内容违规信息),即使 message 含其它词也保持 infra → 切换下一模型。
+			const SAFETY_PATTERN = /(?:content|safety|policy|filter|moderat|block|inappropriat|disallow|NSFW|400|403)/i;
+			const isSafetyRejection = !isTimeout && Boolean(error?.message) && SAFETY_PATTERN.test(error.message);
+			if (isSafetyRejection) {
+				console.error('[ad-ai] AI.run 疑似触发道德围栏/内容安全拒绝 → 按 B 危险处理(终点,不切换模型)。model=' + model + ' 诊断信息:', JSON.stringify({
+					isTimeout,
+					errorName: error?.name,
+					errorMessage: error?.message,
+					errorStackHead: (error?.stack || '').split('\n').slice(0, 4).join(' | ')
+				}));
+				// 安全拒绝也是"AI 有响应"的路径(能触发道德围栏本身即高危信号),携带 model + 本次尝试耗时
+				return { kind: 'unrecognized', model, latencyMs: aiLatencyMs() };
+			}
+			console.error('[ad-ai] AI.run 抛异常(基础设施失败:超时/网络/限流/未知) → 切换下一模型。model=' + model + ' 诊断信息:', JSON.stringify({
 				isTimeout,
 				errorName: error?.name,
 				errorMessage: error?.message,
 				errorStackHead: (error?.stack || '').split('\n').slice(0, 4).join(' | ')
 			}));
-			// 安全拒绝也是"AI 有响应"的路径(能触发道德围栏本身即高危信号),同样携带耗时
-			return { ok: false, code: 'unrecognized', latencyMs: aiLatencyMs() };
+			return { kind: 'infra', model, isTimeout, errorMessage: error && error.message ? String(error.message) : '' };
 		}
-		console.error('[ad-ai] AI.run 抛异常(基础设施失败:超时/网络/限流/未知) → 回退 C 可疑。诊断信息:', JSON.stringify({
-			isTimeout,
-			errorName: error?.name,
-			errorMessage: error?.message,
-			errorStackHead: (error?.stack || '').split('\n').slice(0, 4).join(' | ')
-		}));
-		return null;
+	};
+
+	// 外层:按模型列表顺序逐个尝试。仅 infra(超时/异常)切换下一个;成功/unrecognized 立即返回。
+	for (const model of models) {
+		const attempt = await attemptSingleModel(model);
+		if (attempt.kind === 'infra') {
+			// infra 尝试的耗时不计入最终结果,继续尝试下一个模型
+			continue;
+		}
+		if (attempt.kind === 'unrecognized') {
+			// 有响应但无法识别/拒答:unrecognized 是终点,不尝试后续模型(拒答本身即评级结论)
+			return { ok: false, code: 'unrecognized', model: attempt.model, latencyMs: attempt.latencyMs };
+		}
+		// 成功:携带实际响应模型与本次尝试耗时
+		return {
+			ok: true,
+			level: attempt.level,
+			label: attempt.label,
+			score: attempt.score,
+			reason: attempt.reason,
+			threshold: attempt.threshold,
+			model: attempt.model,
+			latencyMs: attempt.latencyMs
+		};
 	}
+	console.error('[ad-ai] 全部 ' + models.length + ' 个模型均基础设施失败(超时/异常) → 回退 C 可疑(null),不带模型/耗时。models=' + JSON.stringify(models));
+	return null;
 }
 
 // 预检目标用户在本群(当前主群 chatId)是否已被禁言或被 ban(mutedOrBanned)且已存在于本地 KV 黑名单(isBlacklisted)。
@@ -4183,7 +4270,8 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 				score: null,
 				reason: 'AI 无法识别或拒绝答复，按 B 危险处理',
 				threshold: AD_THREAT_RATINGS.B.votes,
-				latencyMs: threatAssessment.latencyMs // AI 有响应(拒答)路径的耗时透传,供投票消息展示
+				latencyMs: threatAssessment.latencyMs, // AI 有响应(拒答)路径的耗时透传,供投票消息展示
+				model: threatAssessment.model // 实际产出该拒答评级的模型ID(仅 AI 有响应路径;可能 undefined → state.aiModel 为空 → 渲染不显示)
 			};
 		} else {
 			closeKind = 'unassessable'; // 仅 AI 基础设施失败(null,无 code)→ 未评级收尾,不弹投票
@@ -4198,7 +4286,8 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 			score: null,
 			reason: 'AI 无法识别或拒绝答复，按 B 危险处理',
 			threshold: AD_THREAT_RATINGS.B.votes,
-			latencyMs: threatAssessment.latencyMs // AI 有响应(拒答)路径的耗时透传,供投票消息展示
+			latencyMs: threatAssessment.latencyMs, // AI 有响应(拒答)路径的耗时透传,供投票消息展示
+			model: threatAssessment.model // 实际产出该拒答评级的模型ID(仅 AI 有响应路径;可能 undefined → state.aiModel 为空 → 渲染不显示)
 		};
 	} else if (aiContent) {
 		// 有可判断内容但 AI 基础设施失败(未绑定/超时/异常,assessThreatWithAI 返回 null)→ 回退 C 可疑
@@ -4258,6 +4347,7 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		threshold: threat.threshold,
 		reason: threat.reason,
 		latencyMs: threatAssessment?.latencyMs ?? null, // AI 响应耗时(仅 AI 有响应路径携带;null/预评级路径为 null)
+		model: threatAssessment?.model ?? null, // 实际产出评级的模型ID(仅 AI 有响应路径携带;null/预评级路径为 null)
 		userReportMode
 	}));
 
@@ -4283,7 +4373,8 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		threatLabel: threat.label,
 		threatScore: threat.score,
 		threatReason: threat.reason,
-		aiLatencyMs: threat.latencyMs, // AI 响应耗时(ms,可能 undefined);旧 KV 状态无此字段 → 渲染时不显示,向后兼容
+		aiLatencyMs: threat.latencyMs, // AI 响应耗时(ms,仅统计"实际产出该次结果的那次模型尝试";可能 undefined);旧 KV 状态无此字段 → 渲染时不显示,向后兼容
+		aiModel: threat.model, // 本次实际产出评级的模型ID(仅AI有响应路径;可能 undefined → 渲染时不显示);旧 KV 状态无此字段 → 渲染时不显示,向后兼容
 		createdAt: now,
 		deadlineAt: now + AD_VOTE_DURATION_HOURS * 3600,
 		finalized: false,
