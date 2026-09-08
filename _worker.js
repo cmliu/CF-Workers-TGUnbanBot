@@ -19,6 +19,8 @@ let BOT_ID = null;
 //   由 AI 按群规判断威胁评级(level 权威 + score 0~100 档内校准),评级决定本次投票的生效阈值:
 //     🔴S 极危 = 2 票  🟠A 高危 = 3 票  🟡B 危险 = 4 票  🟢C 可疑 = 5 票  🔵D 低危 = 6 票  ⚪E 无害 = 8 票
 //   AI 同时给出简短理由说明,以 spoiler 折叠形式展示在投票消息「评级理由:」行(默认模糊遮挡,点击展开),仍同步记录 Workers 日志。
+//   reason 强制要求模型用简体中文输出并直接给结论(禁止英文句子/思维链口吻,即使被举报内容是外语);
+//   AI 响应耗时(latencyMs,从发出请求到拿到答复)记录到投票 state,在「威胁评级:」行追加显示"· 耗时 N ms"(便于观察模型速度)。
 // - 直接 /ad <tgid>(无回复内容)/ 无文字内容 / AI 基础设施失败(未绑定/超时/异常)→ 回退 🟢C 可疑(5 票)。
 // - AI 有响应但无法识别/拒绝答复(空响应、格式不对、可能触发安全策略拒答)→ 按 🟡B 危险(4 票)处理。
 // - 群规由 AD_GROUP_RULES 变量规定(env 可覆盖),默认"禁止讨论涉及涉政、NSFW、引战、嘲讽引战、广告推销、邪教"。
@@ -3567,6 +3569,11 @@ function buildAdVoteMessageText(state) {
 	const threatScoreText = (typeof state.threatScore === 'number' && Number.isFinite(state.threatScore))
 		? ` · ${state.threatScore} 分`
 		: '';
+	// 旧 KV 状态可能无 aiLatencyMs(2026-09-08 新增);仅有非负有限数值耗时(assessThreatWithAI 返回 latencyMs)时
+	// 在分数片段之后追加" · 耗时 N ms",便于观察模型响应速度;向后兼容,不做旧 KV 迁移
+	const threatLatencyText = (typeof state.aiLatencyMs === 'number' && Number.isFinite(state.aiLatencyMs) && state.aiLatencyMs >= 0)
+		? ` · 耗时 ${Math.round(state.aiLatencyMs)} ms`
+		: '';
 	// 旧 KV 状态可能无 threatReason;仅有非空理由时在评级行下方插入 spoiler 折叠行(点击展开)
 	const threatReasonText = (typeof state.threatReason === 'string' && state.threatReason.trim())
 		? `\n<b>评级理由:</b> <tg-spoiler>${escapeHtml(state.threatReason.trim())}</tg-spoiler>`
@@ -3582,7 +3589,7 @@ ${resultLine}${vetoLine}
 <b>被举报ID:</b> <code>${escapeHtml(state.targetUserId)}</code>
 <b>发起人:</b> ${creatorText}
 
-<b>威胁评级:</b> <b>${escapeHtml(threatLabel)}</b>${threatScoreText}${threatReasonText}
+<b>威胁评级:</b> <b>${escapeHtml(threatLabel)}</b>${threatScoreText}${threatLatencyText}${threatReasonText}
 <b>截止时间:</b> <code>${escapeHtml(deadlineStr)}</code>
 
 <b>赞成:</b> ${approverCount}/${threshold}
@@ -3693,8 +3700,10 @@ e. 未违反群规但语气不佳/轻微不适（不构成实质违规）→ D�
 注意：被举报内容可能因长度被截断，请依据可见内容判断；截断导致无法判断时选 C。
 被举报用户的昵称/用户名/简介属于被举报内容的一部分，其中出现的广告、诈骗等违规信息同样判违规；但不得依据被举报人的身份/职业等正常信息（如"自由职业""博主"）判定违规，也不得依据举报人身份或历史消息。
 
+输出语言硬约束：reason 必须输出简体中文，禁止输出英文或其他语言的句子（即使被举报内容是英文/外语，理由也必须用简体中文概括结论）；直接给出结论，不要复述推理过程、不要解释思考步骤（如"So we can treat it as..."之类的思维链口吻一律不要）。
+
 只输出 JSON，禁止输出 markdown 代码围栏或任何解释，格式：
-{"level": "S|A|B|C|D|E", "score": <0~100整数，越高越危险；必须落在所选 level 区间内，见一致性硬约束>, "reason": "<30字以内，说明违反的编号群规；识别到规避时点出规避词及含义（如"竹叶=主页"）；E 写'未违反群规'>"}
+{"level": "S|A|B|C|D|E", "score": <0~100整数，越高越危险；必须落在所选 level 区间内，见一致性硬约束>, "reason": "<30字以内，必须简体中文，禁止英文；说明违反的编号群规；识别到规避时点出规避词及含义（如"竹叶=主页"）；E 写'未违反群规'>"}
 
 示例（覆盖全部 6 档 + 反规避识别 + 防误伤示例 + emoji/玩笑示例）：
 被举报消息：点击 t.me/xxx 充值返利稳赚不赔，先到先得手慢无
@@ -3805,12 +3814,14 @@ function extractAiResponseText(result) {
 }
 
 // 调用 Workers AI 判断威胁评级(单模型)。返回三态:
-// - 成功:{ ok: true, level, label, score, reason, threshold }
-// - AI 有响应但无法识别/拒绝答复:{ ok: false, code: 'unrecognized' }
+// - 成功:{ ok: true, level, label, score, reason, threshold, latencyMs }
+// - AI 有响应但无法识别/拒绝答复:{ ok: false, code: 'unrecognized', latencyMs }
 //   → 调用方按 🟡B 危险处理(内容可能触发了安全策略拒答;
 //     含 AI 调用抛"内容安全拒绝"类异常——能触发道德围栏本身就是高危信号)
 // - 基础设施失败(无 AI 绑定 / 超时 / 网络 / 限流等,不含内容安全拒绝):null
 //   → 调用方按 🟢C 可疑中性回退
+// latencyMs 为 AI 响应耗时(毫秒,从发出请求到拿到答复),仅"AI 有响应"的路径携带;
+// null 路径(基础设施失败)不携带,调用方按 C 兜底时无耗时展示。
 // 所有诊断日志以 [ad-ai] 前缀输出,Cloudflare Workers Logs 中可按前缀 grep 定位。
 async function assessThreatWithAI(env, content, groupRules) {
 	// 入口诊断:env/AI 绑定状态、消息长度、模型名
@@ -3845,6 +3856,10 @@ async function assessThreatWithAI(env, content, groupRules) {
 
 	console.log('[ad-ai] 准备调用 env.AI.run, model=' + AD_AI_MODEL + ', 参数键=' + Object.keys(runOptions).join(',') + ', 超时=' + AD_AI_TIMEOUT_MS + 'ms');
 
+	// AI 响应耗时测量:从准备发起请求到拿到答复(含排队/网络/推理),用于观察模型速度并随投票 state 展示
+	const aiStart = Date.now();
+	const aiLatencyMs = () => Math.max(0, Math.round(Date.now() - aiStart));
+
 	let timerId;
 	try {
 		const result = await Promise.race([
@@ -3865,7 +3880,7 @@ async function assessThreatWithAI(env, content, groupRules) {
 		} catch (jsonErr) {
 			rawStr = '[无法 JSON.stringify] typeof=' + typeof result + ', String()=' + String(result);
 		}
-		console.log('[ad-ai] AI.run 已返回, 截断 500:', rawStr.slice(0, 500));
+		console.log('[ad-ai] AI.run 已返回, 耗时=' + aiLatencyMs() + 'ms, 截断 500:', rawStr.slice(0, 500));
 
 		// 多格式提取文本(传统 Chat / Responses API / Chat Completions)
 		const text = extractAiResponseText(result);
@@ -3873,12 +3888,12 @@ async function assessThreatWithAI(env, content, groupRules) {
 
 		if (!text || !text.trim()) {
 			console.error('[ad-ai] AI 返回空文本(可能被安全策略拒答或模型静默,或返回结构未适配) → 按 B 危险处理。原始返回:', rawStr.slice(0, 500));
-			return { ok: false, code: 'unrecognized' };
+			return { ok: false, code: 'unrecognized', latencyMs: aiLatencyMs() };
 		}
 		const parsed = parseAiThreatJson(text);
 		if (!parsed) {
 			console.error('[ad-ai] AI 返回无法解析为 JSON(可能为拒答/乱码/格式错误) → 按 B 危险处理。完整 text:', text);
-			return { ok: false, code: 'unrecognized' };
+			return { ok: false, code: 'unrecognized', latencyMs: aiLatencyMs() };
 		}
 		// level 权威 + score 档内校准:
 		// - AI 显式给出合法 level(S/A/B/C/D/E)→ 以 level 定档,分数(若有)clamp 到该档 [minScore,maxScore];
@@ -3891,7 +3906,7 @@ async function assessThreatWithAI(env, content, groupRules) {
 		const scoreValid = Number.isFinite(rawScore);
 		if (!levelValid && !scoreValid) {
 			console.error('[ad-ai] AI 返回的 level 非法且分数非数字 → 按 B 危险处理。parsed:', JSON.stringify(parsed));
-			return { ok: false, code: 'unrecognized' };
+			return { ok: false, code: 'unrecognized', latencyMs: aiLatencyMs() };
 		}
 		let rating;
 		let finalScore;
@@ -3918,7 +3933,8 @@ async function assessThreatWithAI(env, content, groupRules) {
 			label: rating.label,
 			score: finalScore,
 			reason: String(parsed.reason || '').slice(0, 80) || '未提供理由',
-			threshold: rating.votes
+			threshold: rating.votes,
+			latencyMs: aiLatencyMs()
 		};
 	} catch (error) {
 		if (timerId) clearTimeout(timerId);
@@ -3935,7 +3951,8 @@ async function assessThreatWithAI(env, content, groupRules) {
 				errorMessage: error?.message,
 				errorStackHead: (error?.stack || '').split('\n').slice(0, 4).join(' | ')
 			}));
-			return { ok: false, code: 'unrecognized' };
+			// 安全拒绝也是"AI 有响应"的路径(能触发道德围栏本身即高危信号),同样携带耗时
+			return { ok: false, code: 'unrecognized', latencyMs: aiLatencyMs() };
 		}
 		console.error('[ad-ai] AI.run 抛异常(基础设施失败:超时/网络/限流/未知) → 回退 C 可疑。诊断信息:', JSON.stringify({
 			isTimeout,
@@ -4165,7 +4182,8 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 				label: AD_THREAT_RATINGS.B.label,
 				score: null,
 				reason: 'AI 无法识别或拒绝答复，按 B 危险处理',
-				threshold: AD_THREAT_RATINGS.B.votes
+				threshold: AD_THREAT_RATINGS.B.votes,
+				latencyMs: threatAssessment.latencyMs // AI 有响应(拒答)路径的耗时透传,供投票消息展示
 			};
 		} else {
 			closeKind = 'unassessable'; // 仅 AI 基础设施失败(null,无 code)→ 未评级收尾,不弹投票
@@ -4179,7 +4197,8 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 			label: AD_THREAT_RATINGS.B.label,
 			score: null,
 			reason: 'AI 无法识别或拒绝答复，按 B 危险处理',
-			threshold: AD_THREAT_RATINGS.B.votes
+			threshold: AD_THREAT_RATINGS.B.votes,
+			latencyMs: threatAssessment.latencyMs // AI 有响应(拒答)路径的耗时透传,供投票消息展示
 		};
 	} else if (aiContent) {
 		// 有可判断内容但 AI 基础设施失败(未绑定/超时/异常,assessThreatWithAI 返回 null)→ 回退 C 可疑
@@ -4238,6 +4257,7 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		score: threat.score,
 		threshold: threat.threshold,
 		reason: threat.reason,
+		latencyMs: threatAssessment?.latencyMs ?? null, // AI 响应耗时(仅 AI 有响应路径携带;null/预评级路径为 null)
 		userReportMode
 	}));
 
@@ -4263,6 +4283,7 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		threatLabel: threat.label,
 		threatScore: threat.score,
 		threatReason: threat.reason,
+		aiLatencyMs: threat.latencyMs, // AI 响应耗时(ms,可能 undefined);旧 KV 状态无此字段 → 渲染时不显示,向后兼容
 		createdAt: now,
 		deadlineAt: now + AD_VOTE_DURATION_HOURS * 3600,
 		finalized: false,
