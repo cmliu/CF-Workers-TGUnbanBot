@@ -84,6 +84,7 @@ function resolveAdAiModels(envValue) {
 	return models.length > 0 ? models : AD_AI_DEFAULT_MODELS.slice();
 }
 const AD_AI_MAX_CONTENT_CHARS = 500; // 发送给 AI 的被举报内容最大长度
+const AD_AI_MAX_QUOTE_CONTEXT_CHARS = 300; // 回复引用语境(被举报消息自身 reply_to_message 引用的他人消息文本)最大长度(2026-09-08)
 // 评级表(6 档,AI 威胁评级的权威数据源;key=level 大写字母,score 0~100 越高越危险):
 // - minScore/maxScore 定义分数区间;AI 判定采用"level 权威 + score 档内校准":level 定档,
 //   score 只 clamp 到所选档的 [minScore,maxScore] 区间内,不允许越档。
@@ -3703,6 +3704,11 @@ ${numberedRules}
 - 群内玩笑/口癖/吐槽/讽刺(含 bot 命令名 ad/spam/ban 字样)、纯 emoji 表情、单字符或短词起哄,均不视为违规,也不视为规避广告。
 - 当被举报人**无变现目标**且消息内容为**纯 emoji / 玩笑 / 口癖 / 简短调侃**时,直接判 E 无害(0~20 分),无需走决策树 c/d。
 
+回复引用语境说明（2026-09-08 新增；仅当输入含"被举报消息回复引用的他人消息内容"标注块时适用）：
+- 该内容来自他人消息，不是被举报人发送的原文，不得仅凭引用内容本身对被举报人定档；
+- 评级以被举报人自身文本为准：自身文本无害、仅对广告做普通回复互动且无自身引流/变现意图 → 不得因引用内容升档（仍先经反误伤优先原则过滤）；
+- 若自身文本与引用内容配合形成协同推广（跟评引流/接话揽客/暗号互动/复述广告要点），按反规避识别处理，能认定广告/引流意图的不得低于 B。
+
 反规避识别（须先经反误伤优先原则过滤，再识别规避手法并把刻意规避的字面还原为真实意图，最后走决策树定档）：
 - 判定对象是"被举报资料整体"：以消息文字为主；若同时提供被举报用户昵称/用户名/简介/头衔，一并纳入判断。其中的广告、引流、联系方式、主页引导和暗语同样计入违规；但不得依据身份/职业等正常信息（如"自由职业""博主"）判违规。
 - 识别以下规避手法；识别到后按还原出的真实意图定档，并在 reason 中点明规避词及其含义（如"竹叶=主页"）：
@@ -4180,12 +4186,25 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 	const replyToMessageId = replyMsg?.message_id;
 	let messagePreview = '';
 	let reportContent = ''; // 发送给 AI 判断威胁评级的被举报消息内容
+	let quoteContext = ''; // 回复引用语境:被举报消息自身回复引用的他人消息文本(2026-09-08 新增)
 	if (replyMsg) {
 		const src = (typeof replyMsg.text === 'string' && replyMsg.text.length > 0)
 			? replyMsg.text
 			: (typeof replyMsg.caption === 'string' && replyMsg.caption.length > 0 ? replyMsg.caption : '');
 		messagePreview = src.slice(0, 50);
 		reportContent = src.slice(0, AD_AI_MAX_CONTENT_CHARS);
+		// 回复引用语境(2026-09-08):被举报消息若本身是对他人消息的回复,Telegram 会在
+		// replyMsg.reply_to_message 下发被引用的完整消息对象(仅取一层,不递归更上层)。
+		// 真实案例:群成员回复广告消息只输入"c",AI 仅评"c"得 E 无害,完全看不到引用里的
+		// 广告内容。此处提取引用文本(无 text 则 caption,再无则不产生语境块),供下方
+		// 有举报权限通道组装进 aiContentParts;普通用户举报通道保持旧评级口径,不纳入。
+		if (replyMsg.reply_to_message) {
+			const quotedMsg = replyMsg.reply_to_message;
+			const quoteSrc = (typeof quotedMsg.text === 'string' && quotedMsg.text.length > 0)
+				? quotedMsg.text
+				: (typeof quotedMsg.caption === 'string' && quotedMsg.caption.length > 0 ? quotedMsg.caption : '');
+			quoteContext = quoteSrc.slice(0, AD_AI_MAX_QUOTE_CONTEXT_CHARS);
+		}
 	}
 
 	// 被举报用户资料(昵称/用户名/简介):广告常把内容藏匿于其中,一并发给 AI 判断。
@@ -4196,6 +4215,12 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 	const aiContentParts = [];
 	if (reportContent) {
 		aiContentParts.push(`被举报消息内容:\n${reportContent}`);
+	}
+	// 回复引用语境(2026-09-08):仅管理员/有举报权限通道纳入(与下方"不把目标用户资料纳入评级输入"
+	// 的既有决策同构——普通用户举报保持旧评级口径,避免扩大"谁能触发投票"的边界);
+	// 标注明确该文本来自他人消息、非被举报人原文,仅供 AI 做语境判断(提示词有"回复引用语境说明")。
+	if (!userReportMode && quoteContext) {
+		aiContentParts.push(`被举报消息回复引用的他人消息内容(非被举报人原文,仅供语境判断):\n${quoteContext}`);
 	}
 	if (!userReportMode && profileText) {
 		aiContentParts.push(`被举报用户资料:\n${profileText}`);
