@@ -3529,6 +3529,83 @@ async function clearActiveAdVoteIndex(env, chatId, targetUserId) {
 	}
 }
 
+// ---- /ad 评级中预登记索引(ad_vote_pending:<chatId>:<targetUserId> → { reportedMessageId, pendingApprovers }) ----
+// 用途:第一条举报尚在 AI 评级中(投票 state 尚未创建)时,第二人对**同一条消息**的重复举报
+// 无法转赞成票(active 索引不存在),故先预登记其赞成票快照;评级完成创建投票时自动合入
+// (合票逻辑见 handleAdCommand 内 state 构造后段落);评级收尾(无害/无法评级)则清理失效。
+// 注:常量就近定义于本区而非顶部 AD_VOTE_* 常量区——仅 saveAdVotePendingIndex 使用,且避免扩大顶部改动面。
+// env.KV 未绑定时全部静默降级,不阻断主流程。
+const AD_VOTE_PENDING_INDEX_TTL_SECONDS = 10 * 60; // 评级窗口 TTL(覆盖 AI 评级耗时+缓冲);正常由创建投票合票/收尾清理,残留靠 TTL 过期
+
+// 读取某主群某目标用户的评级中预登记索引,返回 { reportedMessageId, pendingApprovers };
+// 未绑定 KV/未写入/异常均返回 null(风格与 getActiveAdVoteIndex 一致)
+async function getAdVotePendingIndex(env, chatId, targetUserId) {
+	if (!env.KV) {
+		return null;
+	}
+	try {
+		const data = await env.KV.get(`ad_vote_pending:${chatId}:${targetUserId}`, { type: 'json' });
+		return data || null;
+	} catch (error) {
+		console.error('[/ad] 读取评级中预登记索引失败(按无预登记处理):', error.message);
+		return null;
+	}
+}
+
+// 写入评级中预登记索引初始结构(仅 handleAdCommand 在 willRunAi 时调用,标记评级窗口开启);
+// 失败仅记日志并返回 false,不阻断评级主流程(残留由 TTL 兜底)
+async function saveAdVotePendingIndex(env, chatId, targetUserId, reportedMessageId) {
+	if (!env.KV) {
+		return false;
+	}
+	try {
+		const payload = { reportedMessageId: reportedMessageId || null, pendingApprovers: [] };
+		await env.KV.put(`ad_vote_pending:${chatId}:${targetUserId}`, JSON.stringify(payload), {
+			expiration_ttl: AD_VOTE_PENDING_INDEX_TTL_SECONDS
+		});
+		return true;
+	} catch (error) {
+		console.error('[/ad] 写入评级中预登记索引失败:', error.message);
+		return false;
+	}
+}
+
+// 向评级中预登记索引追加一张赞成票快照(同一条消息的重复举报转赞成票);
+// 旧索引不存在(评级窗口已关闭)返回 false;追加按 id 去重;失败仅记日志,不阻断主流程
+async function addAdVotePendingApprover(env, chatId, targetUserId, userSnapshot) {
+	if (!env.KV) {
+		return false;
+	}
+	try {
+		const pending = await env.KV.get(`ad_vote_pending:${chatId}:${targetUserId}`, { type: 'json' });
+		if (!pending || !Array.isArray(pending.pendingApprovers)) {
+			return false;
+		}
+		if (userSnapshot && !pending.pendingApprovers.some((v) => String(v.id) === String(userSnapshot.id))) {
+			pending.pendingApprovers.push(userSnapshot);
+		}
+		await env.KV.put(`ad_vote_pending:${chatId}:${targetUserId}`, JSON.stringify(pending), {
+			expiration_ttl: AD_VOTE_PENDING_INDEX_TTL_SECONDS
+		});
+		return true;
+	} catch (error) {
+		console.error('[/ad] 追加评级中预登记赞成票失败:', error.message);
+		return false;
+	}
+}
+
+// 清理评级中预登记索引(创建投票合票完成 / 评级收尾时调用);失败仅记日志,由索引 TTL 兜底过期
+async function clearAdVotePendingIndex(env, chatId, targetUserId) {
+	if (!env.KV) {
+		return;
+	}
+	try {
+		await env.KV.delete(`ad_vote_pending:${chatId}:${targetUserId}`);
+	} catch (error) {
+		console.error('[/ad] 清理评级中预登记索引失败(由索引 TTL 兜底):', error.message);
+	}
+}
+
 // ---- /add_ad_admin /del_ad_admin 热心群友白名单 ----
 
 async function getAdAdminList(env) {
@@ -4238,23 +4315,88 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		return;
 	}
 
-	// 进行中投票防重:同一目标用户在同一主群同时只允许一个未完结的举报投票,防止多个热心群众
-	// 对同一条广告重复发起投票导致票数分裂/重复处理(2026-09-09)。
-	// 索引 key=ad_vote_active:<chatId>:<targetUserId>;读到 token 后回查投票 state 确认"存在且未
-	// finalized"才拦截,索引残留(写入后投票 state 缺失/已完结但清理失败)一律放行(TTL 兜底过期)。
+	// 两级防重+合票:①active 索引(投票进行中)→同一条消息的重复举报自动转为赞成票;
+	// ②pending 索引(AI 评级中,投票未创建)→同一条消息的重复举报预登记赞成票,评级完成创建投票时自动合入。
+	// 消息不匹配(同目标不同消息/纯 tgid 直发)维持拦截提示,不误合票(2026-09-09)。
 	// 以 typeof 探测而非直接引用:符号缺失时(QA verbatim 切片沙箱未注入)按无索引处理,降级放行不报错。
 	const activeVoteToken = typeof getActiveAdVoteIndex === 'function'
 		? await getActiveAdVoteIndex(env, chatId, targetUserId)
 		: null;
-	if (activeVoteToken) {
-		const activeState = typeof getAdVoteState === 'function'
-			? await getAdVoteState(env, activeVoteToken)
-			: null;
-		if (activeState && !activeState.finalized) {
-			console.log(`[/ad] 防重拦截 tgid=${targetUserId} 已有进行中投票 token=${activeVoteToken}`);
-			await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已有进行中的举报投票，请直接在投票消息中参与，无需重复发起`);
+	let activeState = null;
+	if (activeVoteToken && typeof getAdVoteState === 'function') {
+		activeState = await getAdVoteState(env, activeVoteToken);
+	}
+	const pendingIndex = typeof getAdVotePendingIndex === 'function'
+		? await getAdVotePendingIndex(env, chatId, targetUserId)
+		: null;
+	// 本处位于下方"4. 被举报消息"段之前,replyToMessageId 尚未声明(const TDZ),
+	// 故从原始 update 就地提取本次举报的回复目标消息 id 供合票匹配(语义与下方提取一致)。
+	const interceptReplyToMessageId = message.reply_to_message?.message_id || null;
+
+	// 分支 1:active 投票进行中且本次举报回复的是同一条消息 → 自动转为赞成票(合票)
+	if (activeState && !activeState.finalized && interceptReplyToMessageId && activeState.reportedMessageId
+		&& String(interceptReplyToMessageId) === String(activeState.reportedMessageId)) {
+		const alreadyParticipated = (activeState.approvers || []).some((v) => String(v.id) === String(userId))
+			|| (activeState.rejecters || []).some((v) => String(v.id) === String(userId));
+		if (alreadyParticipated) {
+			await sendTelegramMessage(chatId, '✅ 你已参与过该举报投票，无需重复参与');
 			return;
 		}
+		const approverSnapshot = snapshotTelegramUser(message.from);
+		if (approverSnapshot) {
+			activeState.approvers.push(approverSnapshot);
+		}
+		if (activeState.approvers.length >= activeState.threshold) {
+			// 转票即达标:直接 finalize 通过(内部编辑终态消息+执行封禁+saveAdVoteState 联动清 active 索引)
+			console.log(`[/ad] 重复举报转赞成票即达标 tgid=${targetUserId} 票数=${activeState.approvers.length}/${activeState.threshold}`);
+			if (activeState.messageId) {
+				await finalizeAdVote(env, activeState, chatId, activeState.messageId, 'approved');
+				await sendTelegramMessage(chatId, '✅ 重复举报已自动计为赞成票，投票达到阈值，已执行封禁流程');
+			} else {
+				// 极端:投票消息从未落地,无法编辑终态,仅落库(索引联动清理由 saveAdVoteState 内部完成)
+				await saveAdVoteState(env, activeState);
+				await sendTelegramMessage(chatId, '✅ 重复举报已自动计为赞成票');
+			}
+			return;
+		}
+		// 未达标:落库(联动刷新 active 索引)+ 刷新投票消息展示;编辑失败仅记日志不阻断
+		await saveAdVoteState(env, activeState);
+		if (activeState.messageId) {
+			try {
+				const refreshed = await editMessageText(chatId, activeState.messageId, buildAdVoteMessageText(activeState), buildAdVoteInlineKeyboard(activeState.voteToken, activeState));
+				if (!refreshed || !refreshed.ok) {
+					console.error('[/ad] 转赞成票后刷新投票消息失败(不阻断):', JSON.stringify(refreshed));
+				}
+			} catch (error) {
+				console.error('[/ad] 转赞成票后刷新投票消息异常(不阻断):', error.message);
+			}
+		}
+		await sendTelegramMessage(chatId, '✅ 你对同一条广告的举报已自动计为赞成票，可在投票消息中查看');
+		return;
+	}
+
+	// 分支 2:active 投票进行中但消息不匹配(同目标不同消息/纯 tgid 直发)→ 维持既有拦截提示
+	if (activeState && !activeState.finalized) {
+		console.log(`[/ad] 防重拦截 tgid=${targetUserId} 已有进行中投票 token=${activeVoteToken}`);
+		await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已有进行中的举报投票，请直接在投票消息中参与，无需重复发起`);
+		return;
+	}
+
+	// 分支 3:pending 评级中且本次举报回复的是同一条消息 → 预登记赞成票,评级完成创建投票时自动合入
+	if (pendingIndex && interceptReplyToMessageId && pendingIndex.reportedMessageId
+		&& String(interceptReplyToMessageId) === String(pendingIndex.reportedMessageId)) {
+		const pendingSnapshot = snapshotTelegramUser(message.from);
+		if (pendingSnapshot) {
+			await addAdVotePendingApprover(env, chatId, targetUserId, pendingSnapshot);
+		}
+		await sendTelegramMessage(chatId, '✅ 已记录你对同一条广告的举报赞成票，AI 评级完成后将自动计入投票');
+		return;
+	}
+
+	// 分支 4:pending 评级中但消息不匹配 → 拦截提示,避免评级完成后产生重复投票
+	if (pendingIndex) {
+		await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已有举报正在 AI 评级中，请稍候，无需重复发起`);
+		return;
 	}
 
 	const creatorUserSnapshot = snapshotTelegramUser(message.from);
@@ -4329,6 +4471,12 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 			// 占位发送失败:不阻断,后续投票路径走"另发投票消息"兜底 / 无害路径仅打日志静默收尾
 			console.error('[/ad] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
 		}
+	}
+
+	// 评级窗口开启:仅将调用 AI 的场景(willRunAi)预写 pending 索引,窗口内第二人对同一条消息的
+	// 重复举报可预登记赞成票,评级完成创建投票时自动合入(纯 tgid 直发/外部已评级 willRunAi=false 不写)。
+	if (willRunAi && typeof saveAdVotePendingIndex === 'function') {
+		await saveAdVotePendingIndex(env, chatId, targetUserId, replyToMessageId || null);
 	}
 
 	// 6. 调用 Workers AI 判断威胁评级(普通用户通道的评级也收敛至此,不再在 handleMessage 外层预评级)。
@@ -4429,6 +4577,10 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		} else {
 			console.log('[ad-user-report] 无占位可编辑,静默收尾 closeKind=', closeKind);
 		}
+		// 评级未触发投票(无害/无法评级收尾):清 pending 预登记索引,窗口内已登记的赞成票随之失效
+		if (typeof clearAdVotePendingIndex === 'function') {
+			await clearAdVotePendingIndex(env, chatId, targetUserId);
+		}
 		return;
 	}
 
@@ -4484,6 +4636,32 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		result: null
 	};
 
+	// 合入评级中窗口内预登记的赞成票(同一条消息的重复举报自动转为赞成票,2026-09-09):
+	// 按 id 去重并排除发起人本人,合票后若直接达标则跳过中间投票态,创建消息后立即 finalize 通过。
+	let immediateApprove = false;
+	if (typeof getAdVotePendingIndex === 'function') {
+		const pendingVotes = await getAdVotePendingIndex(env, chatId, targetUserId);
+		if (pendingVotes) {
+			// 只要走到建票,评级窗口即告关闭:无论有无预登记票均清 pending,防止空窗口索引残留
+			// 至 TTL 过期,导致投票 finalize 后窗口内同目标新举报被误报"AI 评级中"
+			if (typeof clearAdVotePendingIndex === 'function') {
+				await clearAdVotePendingIndex(env, chatId, targetUserId);
+			}
+			if (Array.isArray(pendingVotes.pendingApprovers) && pendingVotes.pendingApprovers.length > 0) {
+				for (const pv of pendingVotes.pendingApprovers) {
+					if (!pv || pv.id === undefined || pv.id === null) continue;
+					if (String(pv.id) === String(userId)) continue; // 发起人本人不重复计票
+					if (state.approvers.some((v) => String(v.id) === String(pv.id))) continue;
+					state.approvers.push(pv);
+				}
+				console.log(`[/ad] 评级窗口合票 tgid=${targetUserId} 预登记赞成票=${pendingVotes.pendingApprovers.length} 合票后=${state.approvers.length}/${state.threshold}`);
+				if (state.approvers.length >= state.threshold) {
+					immediateApprove = true;
+				}
+			}
+		}
+	}
+
 	const initialText = buildAdVoteMessageText(state);
 
 	// 先用 token 存 KV(确保按钮点击时 state 已存在),再把占位编辑为投票 / 或另发投票消息
@@ -4524,6 +4702,16 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 
 	// 回填 messageId,用于后续 editMessageText(投票按钮回调 / 刷新 / finalize 复用既有状态机)
 	state.messageId = voteMessageId;
+
+	// 创建即达标:评级窗口合票后赞成数已达阈值 → 不展示中间投票态,直接 finalize 通过
+	// (封禁动作+终态消息由 finalizeAdVote 完成;其内部 saveAdVoteState 置 finalized=true 联动清 active 索引,
+	// 故 finalize 路径 return 后不再走下方常规保存,避免二次落库覆盖终态)
+	if (immediateApprove && voteMessageId) {
+		console.log(`[/ad] 创建即达标 tgid=${targetUserId} 票数=${state.approvers.length}/${state.threshold} 直接通过`);
+		await finalizeAdVote(env, state, chatId, voteMessageId, 'approved');
+		return;
+	}
+
 	await saveAdVoteState(env, state);
 }
 
