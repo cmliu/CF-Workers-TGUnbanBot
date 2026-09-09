@@ -5183,20 +5183,37 @@ async function restrictUserInChat(chatId, userId) {
 	return result;
 }
 
-// 构建联网查杀通知文案 + 操作按钮(仅本群管理员可点,业务侧校验)。
-// 主群与非主群均带按钮,按钮集与语义按群类型区分(isMain 参数):
-// - 主群: 🔨 永久封禁 → 加入联网黑名单(等价主群 /ban)、♻️ 移除黑名单 → 移出联网黑名单并恢复全部主群状态(等价主群 /unban)。
-// - 非主群: 🔨 永久封禁 → 本地黑名单封禁、✅ 加入白名单 → 本群白名单(仅维护本群状态)。
-function buildNetKillNotification(tgid, member, { isMain = false } = {}) {
-	const mention = formatUserMention(member)
+// 联网查杀"检测详情块"(通知与回调结果文案共用,保证操作后消息上半部分 UI 连续不跳变):
+// ⚠️ 标签行 + 联网黑名单命中说明 + 用户/TGID 详情。member 为被查杀用户对象(可为 null,兜底 tgid 链接)。
+function buildNetKillDetailSection(member, tgid) {
+	const mention = (member && formatUserMention(member))
 		|| `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
-	let text = `⚠️ <b>#黑名单用户检测</b>
+	return `⚠️ <b>#黑名单用户检测</b>
 
 🚫 该用户存在于 <b>联网黑名单</b> 中，已在本群禁言处理。
 
 👤 用户: ${mention}
 📋 TGID: <code>${escapeHtml(tgid)}</code>`;
-	text += `
+}
+
+// 从原查杀通知消息实体中恢复被查杀用户对象(text_mention 实体携带 user),
+// 供回调结果文案重建详情块以保留用户名显示;找不到(实体缺失/异常)返回 null,由详情块兜底 tgid 链接。
+function extractNetKillMemberFromMessage(message, tgid) {
+	const entities = message?.entities || [];
+	for (const entity of entities) {
+		if (entity.type === 'text_mention' && entity.user && String(entity.user.id) === String(tgid)) {
+			return entity.user;
+		}
+	}
+	return null;
+}
+
+// 构建联网查杀通知文案 + 操作按钮(仅本群管理员可点,业务侧校验)。
+// 主群与非主群均带按钮,按钮集与语义按群类型区分(isMain 参数):
+// - 主群: 🔨 永久封禁 → 加入联网黑名单(等价主群 /ban)、♻️ 移除黑名单 → 移出联网黑名单并恢复全部主群状态(等价主群 /unban)。
+// - 非主群: 🔨 永久封禁 → 本地黑名单封禁、✅ 加入白名单 → 本群白名单(仅维护本群状态)。
+function buildNetKillNotification(tgid, member, { isMain = false } = {}) {
+	const text = `${buildNetKillDetailSection(member, tgid)}
 
 👇 仅限本群管理员操作：`;
 	const replyMarkup = {
@@ -5325,10 +5342,12 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 
 	const messageId = message.message_id;
 	const removeButtons = { inline_keyboard: [] };
-	const mention = `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
 	// 操作人 mention(callbackQuery.from 必有 id,formatUserMention 不会返回 null;兜底仅防御异常数据)
 	const operatorMention = formatUserMention(callbackQuery.from)
 		|| `<a href="tg://user?id=${escapeHtml(operatorId)}">${escapeHtml(operatorId)}</a>`;
+	// 重建检测详情块(从原消息实体恢复被查杀用户,保留用户名显示):回调结果 = 详情块 + 操作结果,UI 连续不跳变
+	const netkillMember = extractNetKillMemberFromMessage(message, tgid);
+	const detailSection = buildNetKillDetailSection(netkillMember, tgid);
 
 	if (action === 'ban') {
 		logNetKill('callback:ban:start', { tgid, chatId: chatId.toString(), operatorId, inGroupId });
@@ -5338,7 +5357,11 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 				const result = await addToBlacklist(tgid, env, 'ban', operatorId);
 				if (result.success || result.alreadyExists) {
 					await editMessageText(chatId, messageId,
-						`⚠️ <b>#黑名单用户检测</b>\n\n🔨 <b>已永久封禁</b>\n\n${mention} 已加入联网黑名单。\n👮 操作人: ${operatorMention}（永久封禁 → 加入联网黑名单）\n📌 联网黑名单: 已加入`, removeButtons);
+						`${detailSection}
+
+🔨 <b>已执行 永久封禁</b>
+👮 操作人: ${operatorMention}
+📌 联网黑名单: 已加入`, removeButtons);
 					logNetKill('callback:ban:success', { tgid, chatId: chatId.toString(), operatorId, alreadyExists: Boolean(result.alreadyExists) });
 					try { await answerCallbackQuery(callbackQuery.id, result.alreadyExists ? '该用户已在联网黑名单中' : '已永久封禁该用户'); } catch (_) { }
 				} else {
@@ -5350,7 +5373,11 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 				await banUserPermanently(chatId, tgid);
 				await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.BANNED);
 				await editMessageText(chatId, messageId,
-					`⚠️ <b>#黑名单用户检测</b>\n\n🔨 <b>已永久封禁</b>\n\n${mention} 已移出本群。\n👮 操作人: ${operatorMention}（永久封禁 → 本地黑名单）\n📌 本地黑名单: 封禁`, removeButtons);
+					`${detailSection}
+
+🔨 <b>已执行 永久封禁</b>
+👮 操作人: ${operatorMention}
+📌 本地黑名单: 封禁（已移出本群）`, removeButtons);
 				logNetKill('callback:ban:success', { tgid, chatId: chatId.toString(), operatorId });
 				try { await answerCallbackQuery(callbackQuery.id, '已永久封禁该用户'); } catch (_) { }
 			}
@@ -5376,7 +5403,11 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 					return true;
 				}
 				await editMessageText(chatId, messageId,
-					`⚠️ <b>#黑名单用户检测</b>\n\n✅ <b>已移出联网黑名单</b>\n\n${mention} 已解除全部主群限制。\n👮 操作人: ${operatorMention}（移出联网黑名单）\n📌 联网黑名单: 已移除`, removeButtons);
+					`${detailSection}
+
+♻️ <b>已执行 移除黑名单</b>
+👮 操作人: ${operatorMention}
+📌 联网黑名单: 已移除（已解除全部主群限制）`, removeButtons);
 				logNetKill('callback:rm:success', { tgid, chatId: chatId.toString(), operatorId, notFound: Boolean(result.notFound) });
 				try { await answerCallbackQuery(callbackQuery.id, '已移出联网黑名单'); } catch (_) { }
 			} else {
@@ -5403,7 +5434,11 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 		}
 		await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.WHITELISTED);
 		await editMessageText(chatId, messageId,
-			`⚠️ <b>#黑名单用户检测</b>\n\n✅ <b>已加入本群白名单</b>\n\n${mention} 已解除封禁/禁言，后续不再自动查杀。\n👮 操作人: ${operatorMention}（加入白名单）\n📌 本群状态: 白名单`, removeButtons);
+			`${detailSection}
+
+✅ <b>已执行 加入白名单</b>
+👮 操作人: ${operatorMention}
+📌 本群状态: 白名单（已解除封禁/禁言，后续不再自动查杀）`, removeButtons);
 		logNetKill('callback:wl:success', { tgid, chatId: chatId.toString(), operatorId });
 		try { await answerCallbackQuery(callbackQuery.id, '已加入白名单并解除限制'); } catch (_) { }
 	} catch (error) {
