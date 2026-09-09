@@ -5055,6 +5055,8 @@ const NETKILL_LOG_LABELS = {
 	'action:mute:success': '成功:已禁言并同步本群状态为"禁言"',
 	'action:mute:failed': '失败:禁言失败(不写状态、不通知)',
 	'action:mute:skipped-banned': '跳过:目标已被封禁,不执行禁言(避免封禁降级为受限),本群状态记为"封禁"',
+	'action:delete-message:success': '成功:发言触发的违规消息已删除(防广告在管理员处理前留存)',
+	'action:delete-message:failed': '失败:违规消息删除失败(bot 权限不足或消息过老),通知照发',
 	'status:admin-detected': '检测:目标用户实为本群管理员,禁言被 TG API 拒绝,记录状态"管理员"避免重复尝试',
 	'notify:sent': '已发送联网黑名单通知(主群(任一)无按钮,其他群带管理员按钮)',
 	'callback:ban:start': '按钮:本群管理员点击"永久封禁"',
@@ -5278,6 +5280,15 @@ async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) 
 			await muteChatMember(chatId, member.id);
 			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.MUTED);
 			logNetKill('action:mute:success', { tgid, chatId: chatId.toString() });
+			// 发言触发(replyToMessageId 存在)时,被查杀消息本身可能就是广告:禁言生效后先删除该消息
+			// 再发通知,避免管理员未处理期间广告一直留在群内;入群触发无消息可删。
+			// mute 失败路径(含目标实为本群管理员)不删除,避免误删管理员消息。
+			// deleteMessage 内部自带容错(失败返回 false 不抛错),删除失败仅记日志、通知照发。
+			if (replyToMessageId) {
+				const deleted = await deleteMessage(chatId, replyToMessageId);
+				logNetKill(deleted ? 'action:delete-message:success' : 'action:delete-message:failed',
+					{ tgid, chatId: chatId.toString(), messageId: replyToMessageId });
+			}
 			// 主群与非主群均带按钮,按钮集与语义按群类型区分(主群: ban+rm;非主群: ban+wl)。
 			// 变量名 inGroupId 保留(netkill QA 源码锚点依赖),判断来源已改为多主群集合语义
 			const inGroupId = isMainGroup(chatId);
