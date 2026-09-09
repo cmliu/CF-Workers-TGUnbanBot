@@ -3463,10 +3463,69 @@ async function saveAdVoteState(env, state) {
 		await env.KV.put(`ad_vote:${key}`, JSON.stringify(state), {
 			expiration_ttl: AD_VOTE_TTL_SECONDS
 		});
+		// 进行中投票索引联动(2026-09-09 /ad 防重):投票 state 落地成功后——
+		// 未完结(创建/投票刷新)→ 写/刷新索引供 handleAdCommand 拦截同群同目标的重复举报;
+		// 已完结(finalizeAdVote 通过/否决/放弃/管理员否决统一置 finalized=true 后走此保存)→ 清理索引,
+		// 允许后续重新发起举报。两操作失败均由各自 helper 记日志并由索引 TTL 兜底,不阻断主流程。
+		if (state.finalized) {
+			await clearActiveAdVoteIndex(env, state.chatId, state.targetUserId);
+		} else if (state.chatId && state.targetUserId && state.voteToken) {
+			await saveActiveAdVoteIndex(env, state.chatId, state.targetUserId, state.voteToken);
+		}
 		return true;
 	} catch (error) {
 		console.error('[/ad] 保存投票状态失败:', error.message);
 		return false;
+	}
+}
+
+// ---- /ad 进行中投票索引(ad_vote_active:<chatId>:<targetUserId> → voteToken) ----
+// 用途:同一目标用户在同一主群的举报投票未完结期间,阻止重复发起(防票数分裂/重复处理)。
+// 读写统一收敛在 saveAdVoteState 内联动:投票 state 落地成功后,未完结 → 写/刷新索引(创建/投票刷新路径),
+// 已完结 → 清理索引(finalizeAdVote 通过/否决/放弃/管理员否决路径);清理失败或极端残留由下方 TTL 兜底过期。
+// 注:常量就近定义于本区而非顶部 AD_VOTE_* 常量区——仅 saveActiveAdVoteIndex 使用,且避免扩大顶部改动面。
+// env.KV 未绑定时全部静默降级,不阻断主流程。
+const AD_VOTE_ACTIVE_INDEX_TTL_SECONDS = 2 * 60 * 60; // 进行中投票索引 TTL 兜底(投票显示时限1小时+缓冲);finalize 正常清理,残留靠 TTL 过期
+
+// 读取某主群某目标用户的进行中投票索引,返回 voteToken;未绑定 KV/未写入/异常均返回 null
+async function getActiveAdVoteIndex(env, chatId, targetUserId) {
+	if (!env.KV) {
+		return null;
+	}
+	try {
+		const token = await env.KV.get(`ad_vote_active:${chatId}:${targetUserId}`);
+		return token || null;
+	} catch (error) {
+		console.error('[/ad] 读取进行中投票索引失败(按无进行中投票处理):', error.message);
+		return null;
+	}
+}
+
+// 写入进行中投票索引;失败仅记日志并返回 false,不阻断投票主流程(残留由 TTL 兜底)
+async function saveActiveAdVoteIndex(env, chatId, targetUserId, voteToken) {
+	if (!env.KV) {
+		return false;
+	}
+	try {
+		await env.KV.put(`ad_vote_active:${chatId}:${targetUserId}`, voteToken, {
+			expiration_ttl: AD_VOTE_ACTIVE_INDEX_TTL_SECONDS
+		});
+		return true;
+	} catch (error) {
+		console.error('[/ad] 写入进行中投票索引失败:', error.message);
+		return false;
+	}
+}
+
+// 清理进行中投票索引(投票完结时调用);失败仅记日志,由索引 TTL 兜底过期
+async function clearActiveAdVoteIndex(env, chatId, targetUserId) {
+	if (!env.KV) {
+		return;
+	}
+	try {
+		await env.KV.delete(`ad_vote_active:${chatId}:${targetUserId}`);
+	} catch (error) {
+		console.error('[/ad] 清理进行中投票索引失败(由索引 TTL 兜底):', error.message);
 	}
 }
 
@@ -4177,6 +4236,25 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 			await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已在本群被禁言或被封禁，且已在联网黑名单中，无需重复发起举报投票`);
 		}
 		return;
+	}
+
+	// 进行中投票防重:同一目标用户在同一主群同时只允许一个未完结的举报投票,防止多个热心群众
+	// 对同一条广告重复发起投票导致票数分裂/重复处理(2026-09-09)。
+	// 索引 key=ad_vote_active:<chatId>:<targetUserId>;读到 token 后回查投票 state 确认"存在且未
+	// finalized"才拦截,索引残留(写入后投票 state 缺失/已完结但清理失败)一律放行(TTL 兜底过期)。
+	// 以 typeof 探测而非直接引用:符号缺失时(QA verbatim 切片沙箱未注入)按无索引处理,降级放行不报错。
+	const activeVoteToken = typeof getActiveAdVoteIndex === 'function'
+		? await getActiveAdVoteIndex(env, chatId, targetUserId)
+		: null;
+	if (activeVoteToken) {
+		const activeState = typeof getAdVoteState === 'function'
+			? await getAdVoteState(env, activeVoteToken)
+			: null;
+		if (activeState && !activeState.finalized) {
+			console.log(`[/ad] 防重拦截 tgid=${targetUserId} 已有进行中投票 token=${activeVoteToken}`);
+			await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已有进行中的举报投票，请直接在投票消息中参与，无需重复发起`);
+			return;
+		}
 	}
 
 	const creatorUserSnapshot = snapshotTelegramUser(message.from);
