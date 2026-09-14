@@ -15,10 +15,16 @@ let BOT_ID = null;
 // 概要:
 // - 任一主群(GROUP_ID_SET 内)管理员回复消息(或带参数)发送 /ad,发起一次隐藏的举报投票。
 //   /ad 动作只在其发起的主群内生效/展示,不跨群广播。
-// - 回复场景:把被举报内容发给 Workers AI(模型由 AD_AI_MODEL 配置,默认 @cf/openai/gpt-oss-20b),
+// - 回复场景:把被举报内容发给 Workers AI(模型列表由 AD_AI_MODEL 配置,默认按序容灾:
+//   gemma-4-26b-a4b-it → gpt-oss-20b;env.AD_AI_MODEL 以英文逗号分隔/JSON 数组可整体替换,
+//   仅当某模型"超时或抛异常"[基础设施失败]时切换下一个;unrecognized[有响应但拒答/无法识别]不切换,立即落定),
 //   由 AI 按群规判断威胁评级(level 权威 + score 0~100 档内校准),评级决定本次投票的生效阈值:
 //     🔴S 极危 = 2 票  🟠A 高危 = 3 票  🟡B 危险 = 4 票  🟢C 可疑 = 5 票  🔵D 低危 = 6 票  ⚪E 无害 = 8 票
-//   AI 同时给出简短理由说明,仅记录在 Workers 日志中,不展示在投票消息里。
+//   AI 同时给出简短理由说明,以 spoiler 折叠形式展示在投票消息「评级理由:」行(默认模糊遮挡,点击展开),仍同步记录 Workers 日志。
+//   reason 强制要求模型用简体中文输出并直接给结论(禁止英文句子/思维链口吻,即使被举报内容是外语);
+//   AI 响应耗时(latencyMs)只统计"实际产出该次结果的那次模型尝试"(超时/异常的尝试不计入),随投票 state 展示,
+//   在「威胁评级:」行追加显示"· 耗时 N ms";实际产出评级的模型 ID 存 aiModel,投票消息在「评级理由:」行之后
+//   以「评级模型:」行展示其短名(如 gemma-4-26b-a4b-it;仅 AI 有响应路径携带,旧 KV 状态无此字段不显示)。
 // - 直接 /ad <tgid>(无回复内容)/ 无文字内容 / AI 基础设施失败(未绑定/超时/异常)→ 回退 🟢C 可疑(5 票)。
 // - AI 有响应但无法识别/拒绝答复(空响应、格式不对、可能触发安全策略拒答)→ 按 🟡B 危险(4 票)处理。
 // - 群规由 AD_GROUP_RULES 变量规定(env 可覆盖),默认"禁止讨论涉及涉政、NSFW、引战、嘲讽引战、广告推销、邪教"。
@@ -43,12 +49,42 @@ const AD_VOTE_BUTTON_PREFIX = 'adv:'; // callback_data 前缀
 const AD_VOTE_MAX_VOTES = 10;
 
 // ---- AI 威胁评级配置(env 均可覆盖) ----
-// 主模型:可用 env.AD_AI_MODEL 覆盖(如 @cf/qwen/qwen3-30b-a3b-fp8)。
-// 默认 @cf/openai/gpt-oss-20b:实测延迟约 2s,稳定性好;此前默认的
-// @cf/zai-org/glm-4.7-flash 在部分账号/区域持续超时(>12s 无响应)。
-let AD_AI_MODEL = '@cf/openai/gpt-oss-20b';
-let AD_AI_TIMEOUT_MS = 12000; // 单次调用超时,超时/异常回退 C 可疑(12s + 发送消息 < Worker 30s 墙钟上限)
+// 模型列表(数组,按序容灾):env.AD_AI_MODEL 可整体替换——支持英文逗号分隔多模型 / JSON 字符串数组 / 单个模型名;
+// 解析后为空(未配置/全空串) → 回退内置默认列表 AD_AI_DEFAULT_MODELS。顺序即用户配置顺序。
+// 调用按数组顺序逐个尝试:仅当某模型"超时或抛异常"(基础设施失败)时切换下一个;unrecognized(有响应但
+// 空文本/无法解析/拒答/道德围墙)不切换,立即按既有语义落定(拒答本身即评级结论)。
+// 内置默认(顺序为用户指定,保持不动):gemma-4-26b-a4b-it 最先;gpt-oss-20b 实测延迟约 2s、稳定性好放最后兜底;
+// 原首位的 glm-4.7-flash 在部分账号/区域持续超时(>12s 无响应),2026-09-08 已从默认列表移除。
+const AD_AI_DEFAULT_MODELS = [
+	'@cf/google/gemma-4-26b-a4b-it',
+	'@cf/openai/gpt-oss-20b'
+];
+let AD_AI_MODELS = AD_AI_DEFAULT_MODELS.slice(); // 实际生效的模型列表:fetch 阶段按 env.AD_AI_MODEL 整体替换;未覆盖时=内置默认
+let AD_AI_TIMEOUT_MS = 12000; // 单次调用超时(每个模型的单次尝试独立计时),超时/异常切换下一个;全部失败回退 C 可疑(两次最坏 ~24s 接近 Worker 30s 墙钟上限,残余风险见头注)
+
+// 解析 env.AD_AI_MODEL 为"本次要用的模型数组"(纯逻辑,便于 QA 直接测):
+// - 输入先 String()+trim;空 → 回退内置默认;
+// - 先尝试 JSON.parse:若结果是字符串数组 → 用之(允许 env 配 JSON 数组);
+// - 否则按英文逗号 , split → 逐项 trim → 过滤空串;
+// - 解析后仍为空 → 回退内置默认。顺序即用户配置顺序。
+function resolveAdAiModels(envValue) {
+	const raw = String(envValue == null ? '' : envValue).trim();
+	if (!raw) return AD_AI_DEFAULT_MODELS.slice();
+	let candidates = null;
+	try {
+		const parsed = JSON.parse(raw);
+		if (Array.isArray(parsed)) candidates = parsed;
+	} catch (_) {
+		candidates = null; // 非 JSON(普通逗号分隔串 / 单个模型名)→ 走 split 分支
+	}
+	const list = Array.isArray(candidates) ? candidates : raw.split(',');
+	const models = list
+		.map((item) => String(item).trim())
+		.filter((item) => item.length > 0);
+	return models.length > 0 ? models : AD_AI_DEFAULT_MODELS.slice();
+}
 const AD_AI_MAX_CONTENT_CHARS = 500; // 发送给 AI 的被举报内容最大长度
+const AD_AI_MAX_QUOTE_CONTEXT_CHARS = 300; // 回复引用语境(被举报消息自身 reply_to_message 引用的他人消息文本)最大长度(2026-09-08)
 // 评级表(6 档,AI 威胁评级的权威数据源;key=level 大写字母,score 0~100 越高越危险):
 // - minScore/maxScore 定义分数区间;AI 判定采用"level 权威 + score 档内校准":level 定档,
 //   score 只 clamp 到所选档的 [minScore,maxScore] 区间内,不允许越档。
@@ -1348,7 +1384,7 @@ export default {
 		const url = new URL(request.url);
 		AD_VOTE_THRESHOLD = parseInt(env.AD_VOTE_THRESHOLD) || AD_VOTE_THRESHOLD;
 		AD_GROUP_RULES = String(env.AD_GROUP_RULES || '').trim() || AD_GROUP_RULES;
-		AD_AI_MODEL = String(env.AD_AI_MODEL || '').trim() || AD_AI_MODEL;
+		AD_AI_MODELS = resolveAdAiModels(env.AD_AI_MODEL); // 整体替换模型列表(逗号分隔/JSON 数组/单模型;空回退内置默认)
 		AD_AI_TIMEOUT_MS = parseInt(env.AD_AI_TIMEOUT_MS) || AD_AI_TIMEOUT_MS;
 		const path = url.pathname.slice(1); // 移除开头的斜杠
 		let TOKEN;
@@ -2315,7 +2351,16 @@ async function handleMessage(message, env) {
 			}
 			await sendTelegramMessage(chatId, responseMessage);
 		} else {
-			await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}`);
+			// 2026-09-08 修复:addToBlacklist 返回 alreadyExists(该用户已在联网黑名单)时,
+			// 被回复的这条消息即违规内容 → 同样先删除再提示(与 /ban 主群 alreadyExists 分支一致),
+			// 避免 /spam 重复举报时被回复的广告消息残留群内;非 alreadyExists 的真实失败
+			// (未绑定 KV/D1、写入异常等)保持原样只提示不删除(deleteMessage 内部已 try-catch)。
+			if (result.alreadyExists && message.reply_to_message) {
+				await deleteMessage(chatId, message.reply_to_message.message_id);
+				await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}\n✅ 已删除被举报的违规消息`);
+			} else {
+				await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}`);
+			}
 		}
 		return;
 	}
@@ -3418,10 +3463,146 @@ async function saveAdVoteState(env, state) {
 		await env.KV.put(`ad_vote:${key}`, JSON.stringify(state), {
 			expiration_ttl: AD_VOTE_TTL_SECONDS
 		});
+		// 进行中投票索引联动(2026-09-09 /ad 防重):投票 state 落地成功后——
+		// 未完结(创建/投票刷新)→ 写/刷新索引供 handleAdCommand 拦截同群同目标的重复举报;
+		// 已完结(finalizeAdVote 通过/否决/放弃/管理员否决统一置 finalized=true 后走此保存)→ 清理索引,
+		// 允许后续重新发起举报。两操作失败均由各自 helper 记日志并由索引 TTL 兜底,不阻断主流程。
+		if (state.finalized) {
+			await clearActiveAdVoteIndex(env, state.chatId, state.targetUserId);
+		} else if (state.chatId && state.targetUserId && state.voteToken) {
+			await saveActiveAdVoteIndex(env, state.chatId, state.targetUserId, state.voteToken);
+		}
 		return true;
 	} catch (error) {
 		console.error('[/ad] 保存投票状态失败:', error.message);
 		return false;
+	}
+}
+
+// ---- /ad 进行中投票索引(ad_vote_active:<chatId>:<targetUserId> → voteToken) ----
+// 用途:同一目标用户在同一主群的举报投票未完结期间,阻止重复发起(防票数分裂/重复处理)。
+// 读写统一收敛在 saveAdVoteState 内联动:投票 state 落地成功后,未完结 → 写/刷新索引(创建/投票刷新路径),
+// 已完结 → 清理索引(finalizeAdVote 通过/否决/放弃/管理员否决路径);清理失败或极端残留由下方 TTL 兜底过期。
+// 注:常量就近定义于本区而非顶部 AD_VOTE_* 常量区——仅 saveActiveAdVoteIndex 使用,且避免扩大顶部改动面。
+// env.KV 未绑定时全部静默降级,不阻断主流程。
+const AD_VOTE_ACTIVE_INDEX_TTL_SECONDS = 2 * 60 * 60; // 进行中投票索引 TTL 兜底(投票显示时限1小时+缓冲);finalize 正常清理,残留靠 TTL 过期
+
+// 读取某主群某目标用户的进行中投票索引,返回 voteToken;未绑定 KV/未写入/异常均返回 null
+async function getActiveAdVoteIndex(env, chatId, targetUserId) {
+	if (!env.KV) {
+		return null;
+	}
+	try {
+		const token = await env.KV.get(`ad_vote_active:${chatId}:${targetUserId}`);
+		return token || null;
+	} catch (error) {
+		console.error('[/ad] 读取进行中投票索引失败(按无进行中投票处理):', error.message);
+		return null;
+	}
+}
+
+// 写入进行中投票索引;失败仅记日志并返回 false,不阻断投票主流程(残留由 TTL 兜底)
+async function saveActiveAdVoteIndex(env, chatId, targetUserId, voteToken) {
+	if (!env.KV) {
+		return false;
+	}
+	try {
+		await env.KV.put(`ad_vote_active:${chatId}:${targetUserId}`, voteToken, {
+			expiration_ttl: AD_VOTE_ACTIVE_INDEX_TTL_SECONDS
+		});
+		return true;
+	} catch (error) {
+		console.error('[/ad] 写入进行中投票索引失败:', error.message);
+		return false;
+	}
+}
+
+// 清理进行中投票索引(投票完结时调用);失败仅记日志,由索引 TTL 兜底过期
+async function clearActiveAdVoteIndex(env, chatId, targetUserId) {
+	if (!env.KV) {
+		return;
+	}
+	try {
+		await env.KV.delete(`ad_vote_active:${chatId}:${targetUserId}`);
+	} catch (error) {
+		console.error('[/ad] 清理进行中投票索引失败(由索引 TTL 兜底):', error.message);
+	}
+}
+
+// ---- /ad 评级中预登记索引(ad_vote_pending:<chatId>:<targetUserId> → { reportedMessageId, pendingApprovers }) ----
+// 用途:第一条举报尚在 AI 评级中(投票 state 尚未创建)时,第二人对**同一条消息**的重复举报
+// 无法转赞成票(active 索引不存在),故先预登记其赞成票快照;评级完成创建投票时自动合入
+// (合票逻辑见 handleAdCommand 内 state 构造后段落);评级收尾(无害/无法评级)则清理失效。
+// 注:常量就近定义于本区而非顶部 AD_VOTE_* 常量区——仅 saveAdVotePendingIndex 使用,且避免扩大顶部改动面。
+// env.KV 未绑定时全部静默降级,不阻断主流程。
+const AD_VOTE_PENDING_INDEX_TTL_SECONDS = 10 * 60; // 评级窗口 TTL(覆盖 AI 评级耗时+缓冲);正常由创建投票合票/收尾清理,残留靠 TTL 过期
+
+// 读取某主群某目标用户的评级中预登记索引,返回 { reportedMessageId, pendingApprovers };
+// 未绑定 KV/未写入/异常均返回 null(风格与 getActiveAdVoteIndex 一致)
+async function getAdVotePendingIndex(env, chatId, targetUserId) {
+	if (!env.KV) {
+		return null;
+	}
+	try {
+		const data = await env.KV.get(`ad_vote_pending:${chatId}:${targetUserId}`, { type: 'json' });
+		return data || null;
+	} catch (error) {
+		console.error('[/ad] 读取评级中预登记索引失败(按无预登记处理):', error.message);
+		return null;
+	}
+}
+
+// 写入评级中预登记索引初始结构(仅 handleAdCommand 在 willRunAi 时调用,标记评级窗口开启);
+// 失败仅记日志并返回 false,不阻断评级主流程(残留由 TTL 兜底)
+async function saveAdVotePendingIndex(env, chatId, targetUserId, reportedMessageId) {
+	if (!env.KV) {
+		return false;
+	}
+	try {
+		const payload = { reportedMessageId: reportedMessageId || null, pendingApprovers: [] };
+		await env.KV.put(`ad_vote_pending:${chatId}:${targetUserId}`, JSON.stringify(payload), {
+			expiration_ttl: AD_VOTE_PENDING_INDEX_TTL_SECONDS
+		});
+		return true;
+	} catch (error) {
+		console.error('[/ad] 写入评级中预登记索引失败:', error.message);
+		return false;
+	}
+}
+
+// 向评级中预登记索引追加一张赞成票快照(同一条消息的重复举报转赞成票);
+// 旧索引不存在(评级窗口已关闭)返回 false;追加按 id 去重;失败仅记日志,不阻断主流程
+async function addAdVotePendingApprover(env, chatId, targetUserId, userSnapshot) {
+	if (!env.KV) {
+		return false;
+	}
+	try {
+		const pending = await env.KV.get(`ad_vote_pending:${chatId}:${targetUserId}`, { type: 'json' });
+		if (!pending || !Array.isArray(pending.pendingApprovers)) {
+			return false;
+		}
+		if (userSnapshot && !pending.pendingApprovers.some((v) => String(v.id) === String(userSnapshot.id))) {
+			pending.pendingApprovers.push(userSnapshot);
+		}
+		await env.KV.put(`ad_vote_pending:${chatId}:${targetUserId}`, JSON.stringify(pending), {
+			expiration_ttl: AD_VOTE_PENDING_INDEX_TTL_SECONDS
+		});
+		return true;
+	} catch (error) {
+		console.error('[/ad] 追加评级中预登记赞成票失败:', error.message);
+		return false;
+	}
+}
+
+// 清理评级中预登记索引(创建投票合票完成 / 评级收尾时调用);失败仅记日志,由索引 TTL 兜底过期
+async function clearAdVotePendingIndex(env, chatId, targetUserId) {
+	if (!env.KV) {
+		return;
+	}
+	try {
+		await env.KV.delete(`ad_vote_pending:${chatId}:${targetUserId}`);
+	} catch (error) {
+		console.error('[/ad] 清理评级中预登记索引失败(由索引 TTL 兜底):', error.message);
 	}
 }
 
@@ -3504,6 +3685,15 @@ function buildAdTargetText(state, mask) {
 	return `<a href="tg://user?id=${escapeHtml(state.targetUserId)}">${escapeHtml(maskDisplayName(displayName))}</a>`;
 }
 
+// 从模型 ID 中提取用于展示的短名:取最后一个 '/' 之后的子串(如 '@cf/zai-org/glm-4.7-flash' → 'glm-4.7-flash');
+// 若不含 '/' 则原样返回;空/非字符串返回空串(调用方据此不渲染「评级模型:」行)。
+function extractAiModelShortName(modelId) {
+	const s = String(modelId == null ? '' : modelId).trim();
+	if (!s) return '';
+	const idx = s.lastIndexOf('/');
+	return idx === -1 ? s : s.slice(idx + 1);
+}
+
 function buildAdVoteMessageText(state) {
 	const isApproved = state.result === 'approved';
 	const isRejected = state.result === 'rejected';
@@ -3558,6 +3748,20 @@ function buildAdVoteMessageText(state) {
 	const threatScoreText = (typeof state.threatScore === 'number' && Number.isFinite(state.threatScore))
 		? ` · ${state.threatScore} 分`
 		: '';
+	// 旧 KV 状态可能无 aiLatencyMs(2026-09-08 新增);仅有非负有限数值耗时(assessThreatWithAI 返回 latencyMs)时
+	// 在分数片段之后追加" · 耗时 N ms",便于观察模型响应速度;向后兼容,不做旧 KV 迁移
+	const threatLatencyText = (typeof state.aiLatencyMs === 'number' && Number.isFinite(state.aiLatencyMs) && state.aiLatencyMs >= 0)
+		? ` · 耗时 ${Math.round(state.aiLatencyMs)} ms`
+		: '';
+	// 旧 KV 状态可能无 threatReason;仅有非空理由时在评级行下方插入 spoiler 折叠行(点击展开)
+	const threatReasonText = (typeof state.threatReason === 'string' && state.threatReason.trim())
+		? `\n<b>评级理由:</b> <tg-spoiler>${escapeHtml(state.threatReason.trim())}</tg-spoiler>`
+		: '';
+	// 旧 KV 状态可能无 aiModel(2026-09-08 新增);仅当状态里存在非空 aiModel 时,在「评级理由:」spoiler 行之后
+	// 追加一行「评级模型:」,展示实际产出该评级的模型短名(取最后一个 '/' 之后,便于识别由哪个模型落定)
+	const threatModelText = (typeof state.aiModel === 'string' && state.aiModel.trim())
+		? `\n<b>评级模型:</b> <code>${escapeHtml(extractAiModelShortName(state.aiModel))}</code>`
+		: '';
 	const threshold = state.threshold || AD_VOTE_THRESHOLD;
 	const rejectThreshold = (typeof state.rejectThreshold === 'number' && Number.isFinite(state.rejectThreshold))
 		? state.rejectThreshold
@@ -3569,7 +3773,7 @@ ${resultLine}${vetoLine}
 <b>被举报ID:</b> <code>${escapeHtml(state.targetUserId)}</code>
 <b>发起人:</b> ${creatorText}
 
-<b>威胁评级:</b> <b>${escapeHtml(threatLabel)}</b>${threatScoreText}
+<b>威胁评级:</b> <b>${escapeHtml(threatLabel)}</b>${threatScoreText}${threatLatencyText}${threatReasonText}${threatModelText}
 <b>截止时间:</b> <code>${escapeHtml(deadlineStr)}</code>
 
 <b>赞成:</b> ${approverCount}/${threshold}
@@ -3627,46 +3831,72 @@ function buildAiSystemPrompt(groupRules) {
 	return `你是群管理员举报审核助手。群规如下（编号供引用）：
 ${numberedRules}
 
-反规避识别（先执行本段：把刻意规避的字面还原为真实意图，再走决策树定档）：
+反误伤优先原则（最高优先级，先于反规避识别与决策树执行；避免把普通用户误判为 S 极危）：被举报人若**无变现目标**（无返利/无低价/无出售/无教程/无资源/无具体投资诱导），则：
+- 不得仅凭谐音/暗语/字面联想到 S 极危（诈骗/硬核NSFW/涉政/邪教/人肉威胁）；
+- 群内"求币/求带/求资源/大佬们/带带我"等口癖不视为违规；
+- 昵称/简介仅是口癖/昵称重复/卖萌/无变现目标，不算引流钩子；
+- 当存在多个合理解读时，选择更保守的评级（宁漏勿杀）。
+- 含 NSFW 元素的 emoji/头像/昵称/简介(比基尼/泳装/内衣/胸罩/表情/艺术照/动漫/二次元等)属个人偏好或审美表达,**不直接视为违规证据**;仅当头像/昵称/简介本身含明确引流意图(联系方式/主页引导/交易/暗号指向变现)才算钩子。
+- 群内玩笑/口癖/吐槽/讽刺(含 bot 命令名 ad/spam/ban 字样)、纯 emoji 表情、单字符或短词起哄,均不视为违规,也不视为规避广告。
+- 当被举报人**无变现目标**且消息内容为**纯 emoji / 玩笑 / 口癖 / 简短调侃**时,直接判 E 无害(0~20 分),无需走决策树 c/d。
+
+回复引用语境说明（2026-09-08 新增；仅当输入含"被举报消息回复引用的他人消息内容"标注块时适用）：
+- 该内容来自他人消息，不是被举报人发送的原文，不得仅凭引用内容本身对被举报人定档；
+- 评级以被举报人自身文本为准：自身文本无害、仅对广告做普通回复互动且无自身引流/变现意图 → 不得因引用内容升档（仍先经反误伤优先原则过滤）；
+- 若自身文本与引用内容配合形成协同推广（跟评引流/接话揽客/暗号互动/复述广告要点），按反规避识别处理，能认定广告/引流意图的不得低于 B。
+
+反规避识别（须先经反误伤优先原则过滤，再识别规避手法并把刻意规避的字面还原为真实意图，最后走决策树定档）：
 - 判定对象是"被举报资料整体"：以消息文字为主；若同时提供被举报用户昵称/用户名/简介/头衔，一并纳入判断。其中的广告、引流、联系方式、主页引导和暗语同样计入违规；但不得依据身份/职业等正常信息（如"自由职业""博主"）判违规。
 - 识别以下规避手法；识别到后按还原出的真实意图定档，并在 reason 中点明规避词及其含义（如"竹叶=主页"）：
   ① 谐音/错别字/同音字：如"竹叶"=主页，"薇/威/葳/薇芯/威杏"=微信；
   ② 拼音缩写：如 vx/VX/wx/WX/V=微信，tb=淘宝，zfb=支付宝，yy=语音；
   ③ emoji 替代：如 🛰️/💬/📱 代"微信/联系"，🔗/📣 代"链接/广告/公告"；
   ④ 符号拆解/混排：词内插入空格、横线、点、繁体/异体字干扰识别，如"微 信""微-信""v/x""薇❤信"；
-  ⑤ 隐喻代称/行话暗语：如"私我/加我/上车/带飞/懂的都懂/看主页/主页有惊喜"引导私聊或跳主页；品牌与违禁物常用代称规避敏感词，如"葡桃"=苹果，"茶叶/资源/福利/教程"=商品或灰产。
+  ⑤ 隐喻代称/行话暗语：如"私我/加我/上车/带飞/懂的都懂/看主页/主页有惊喜"引导私聊或跳主页；品牌与违禁物常用代称规避敏感词，如"葡桃"=苹果，"茶叶/资源/福利/教程"=商品或灰产；虚拟货币投资引流常用代称与变体字，如"幣圖群/币图群/币圈群/合约群/带单群/一级市场"=投资荐币群，"老师/主理人/带单"=荐币带单者；"主贡曲/主推/挺牛逼的/带你吃肉/超稳"等夸赞语配合@具体账号或群名，实为拉人进投资群的引流话术。
 - 资料同时出现 引流钩子（加好友/私聊/点链接/看主页）+ 变现目标（返利/兼职/福利/资源/出教程/比官网便宜）即可认定广告/引流意图，即使关键词被规避改写。
-- 昵称/简介/头衔本身即引流钩子（如昵称就叫"加我领福利"）同样视为规避，按真实意图定档。
+- 昵称/简介/头衔本身即引流钩子（如昵称就叫"加我领福利"）同样视为规避，按真实意图定档；但若仅为口癖/昵称重复/卖萌且无变现目标，不算引流钩子（见反误伤优先原则）。
 
 判定步骤（决策树，严格按顺序执行；先定档，再在档内按严重程度给分）：
 a. 是否明确违反任一编号群规？
    - 完全未违反且无任何不适语气/轻微不适 → E（0~20 分），reason 写"未违反群规"；
+   - 纯 emoji 消息、群内玩笑/口癖/起哄/吐槽(含 bot 命令名 ad/spam/ban)、单字符或短词表达,不视为违反群规,直接归 E；
 b. 疑似违规/擦边/证据不足（疑似广告、疑似软广、疑似引战等）→ C（41~60 分）；
    不要因为"可能""疑似"而升到 B 或更高；截断导致无法判断时也选 C；
    例外：疑似违规且识别到规避手法（谐音/错别字/拼音缩写/emoji 替代/符号拆解/隐喻代称/昵称简介暗语之一，见"反规避识别"）→ 升为 B（61~75 分）：疑似+刻意规避比普通疑似更可疑；
+   例外前提：升 B 须能认定广告/引流意图（有变现目标等佐证）；仅有规避字面、无变现目标佐证的疑似广告/引流仍按 C 处理（宁漏勿杀）；
 c. 明确违规，且性质命中恶性清单（诈骗/硬核NSFW/涉政/邪教/人肉威胁/恶意骚扰）→ S（91~100 分）或 A（76~90 分）：
-   情节极重、针对多目标、批量刷屏 → S；其余明确恶性但未到极重 → A；
+   明确证据门槛：判 S 极危必须有明确证据——具体链接/图片/已实施行为（实际诈骗话术/诈骗平台/违规图片/涉政文字/已发出的具体威胁等）；情节极重、针对多目标、批量刷屏 → S；
+   硬核NSFW 类：必须为**实际色情内容**——露骨的性行为描写、性器官描写、裸聊/卖淫/色情交易/换妻/色情网站引流等;**仅 emoji/头像/昵称/简介含 NSFW 元素(比基尼/泳装/内衣/胸罩/艺术照/动漫)不算** S 极危证据,至多判 A(76~90)或更低。
+   S 极危的所有恶性类别(诈骗/硬核NSFW/涉政/邪教/人肉)都必须有可被"具体词/具体链接/具体图片/具体行为"佐证的实质内容;**仅靠 emoji/头像/昵称/文字暗示/字面联想不得升 S**。
+   仅凭暗示/暗语/谐音/字面联想到恶性清单、无上述具体证据 → 不得判 S，至多 A（76~90 分）；
+   其余明确恶性但未到极重 → A；
 d. 明确违规，但不在恶性清单（一般违规：广告推销/引战/嘲讽引战/软色情）→ B（61~75 分）；
-   含规避手法的明确广告/引流 → B 偏高段（70~75）；叠加辱骂/骚扰/诈骗暗示 → 按 c 升至 A 或 S；
-e. 未违反群规但语气不佳/轻微不适（不构成实质违规）→ D（21~40 分）；不得因语气升到 C 或更高。
+   含规避手法的明确广告/引流 → B 偏高段（70~75）；叠加辱骂/骚扰 → 升 A；
+   疑似诈骗但无具体证据（链接/图片/平台）→ 仍按 d 判 B 偏高段（不得升 S/A）；
+   虚拟货币/区块链投资引流：拉人进币圈/合约/带单类投资群（含"幣圖群/币图群"等变体代称）、@荐币"老师"/带单账号、推荐投资社群或交易所 → 属"具体投资诱导"型变现目标，与推荐语/@账号等引流钩子配合即认定广告引流意图 → B 偏高段（70~75）；话术叠加稳赚不赔/保本/晒收益/内幕消息 → 升 A（76~90）；含具体诈骗平台链接/已实施诈骗行为 → 按恶性清单 c 判 S；
+   反例（防误伤）：仅正常讨论币价行情/自己的持仓/行业新闻，无拉群、无@荐币账号、无联系方式等主动引流钩子 → 不按投资诱导处理（按 a/e 判 E/D）；群友被动"求带/求带单/求资源"属口癖，见反误伤优先原则。
+e. 未违反群规但语气不佳/轻微不适（不构成实质违规）→ D（21~40 分）；不得因语气升到 C 或更高；仅 emoji 表达情绪/玩笑/吐槽,不构成实质违规,不视为引战。
 
 评级标准（level 决定投票门槛；score 只用于档内区分轻重，必须落在所选 level 的区间内）：
 - S 极危（91~100）：恶性且明确（诈骗/硬核NSFW/涉政/邪教/人肉威胁等），越接近 100 越重
 - A 高危（76~90）：恶意骚扰/广告+辱骂叠加/软色情等较严重违规，越接近 90 越重
-- B 危险（61~75）：广告推销/引战/嘲讽引战等一般违规，越接近 75 越重；疑似+规避手法、明确广告+规避手法 不得低于 B（见反规避识别）
+- B 危险（61~75）：广告推销/引战/嘲讽引战等一般违规，越接近 75 越重；疑似+规避手法、明确广告+规避手法 不得低于 B（见反规避识别；前提是存在变现目标/可认定的广告引流意图，无变现目标佐证的疑似广告/引流不直接判 B，按 C 处理，见反误伤优先原则）
 - C 可疑（41~60）：疑似擦边/疑似广告/疑似引战，证据不足；越接近 60 嫌疑越强
 - D 低危（21~40）：语气不佳/轻微不适，不构成违规；越接近 40 越接近违规边界
 - E 无害（0~20）：未违反群规；越接近 20 越接近违规边界
 
 一致性硬约束：score 必须落在所选 level 的区间内，输出前自查；区间：S=91~100、A=76~90、B=61~75、C=41~60、D=21~40、E=0~20。
-反规避硬约束：识别到规避手法后不得按字面把内容判为 E/D；疑似违规+规避手法不得低于 B；reason 必须点出规避词及其含义（如"竹叶=主页"），再按真实意图（广告/引流等）定档。
+反规避硬约束：识别到规避手法后不得按字面把内容判为 E/D；疑似违规+规避手法且能认定广告/引流意图（有变现目标等佐证）不得低于 B；仅有规避字面、无变现目标佐证的疑似广告/引流仍按疑似处理（至多 C）；reason 必须点出规避词及其含义（如"竹叶=主页"），再按真实意图（广告/引流等）定档。
+反误伤硬约束：仅凭暗示/暗语/谐音/字面猜测，不得判 S 极危（无明确证据至多 A）；群内求币/求带/口癖/昵称重复/卖萌非违规；reason 需说明判定依据（必须引用具体证据，如具体词、具体引流动作），不得仅以"疑似/可能"作为 S/A 依据。仅凭 emoji/头像/昵称/简介含 NSFW 元素(比基尼/泳装/内衣/胸罩/艺术照/动漫/二次元)不得判 S 极危,无具体色情文字/图片/行为描述至多 A(76~90);reason 必须引用具体证据(露骨色情文字/具体引流动作/具体行为),不得仅以 emoji 头像或文字暗示作为 S/A 依据。
 注意：被举报内容可能因长度被截断，请依据可见内容判断；截断导致无法判断时选 C。
 被举报用户的昵称/用户名/简介属于被举报内容的一部分，其中出现的广告、诈骗等违规信息同样判违规；但不得依据被举报人的身份/职业等正常信息（如"自由职业""博主"）判定违规，也不得依据举报人身份或历史消息。
 
-只输出 JSON，禁止输出 markdown 代码围栏或任何解释，格式：
-{"level": "S|A|B|C|D|E", "score": <0~100整数，越高越危险；必须落在所选 level 区间内，见一致性硬约束>, "reason": "<30字以内，说明违反的编号群规；识别到规避时点出规避词及含义（如"竹叶=主页"）；E 写'未违反群规'>"}
+输出语言硬约束：reason 必须输出简体中文，禁止输出英文或其他语言的句子（即使被举报内容是英文/外语，理由也必须用简体中文概括结论）；直接给出结论，不要复述推理过程、不要解释思考步骤（如"So we can treat it as..."之类的思维链口吻一律不要）。
 
-示例（覆盖全部 6 档 + 反规避识别）：
+只输出 JSON，禁止输出 markdown 代码围栏或任何解释，格式：
+{"level": "S|A|B|C|D|E", "score": <0~100整数，越高越危险；必须落在所选 level 区间内，见一致性硬约束>, "reason": "<30字以内，必须简体中文，禁止英文；说明违反的编号群规；识别到规避时点出规避词及含义（如"竹叶=主页"）；E 写'未违反群规'>"}
+
+示例（覆盖全部 6 档 + 反规避识别 + 防误伤示例 + emoji/玩笑示例）：
 被举报消息：点击 t.me/xxx 充值返利稳赚不赔，先到先得手慢无
 输出：{"level": "S", "score": 95, "reason": "违反群规5：诈骗链接"}
 被举报消息：加微信 xxx 免费领福利，不领是傻逼
@@ -3682,7 +3912,19 @@ e. 未违反群规但语气不佳/轻微不适（不构成实质违规）→ D�
 被举报消息：能不能别老刷屏，看着就烦
 输出：{"level": "D", "score": 30, "reason": "语气不佳，不构成违规"}
 被举报消息：哈哈哈哈哈哈哈
-输出：{"level": "E", "score": 8, "reason": "未违反群规"}`;
+输出：{"level": "E", "score": 8, "reason": "未违反群规"}
+被举报消息：大佬们，发个真新币出来；用户资料：昵称"菲菲菲菲 菲"，简介"在线"
+输出：{"level": "D", "score": 25, "reason": "求币口癖无变现目标，昵称/简介无引流意图，非违规"}
+被举报消息：微 信 加 我 看 主 页 有 福 利；用户资料：昵称"小明"，简介"旅游爱好者"（无变现目标）
+输出：{"level": "C", "score": 50, "reason": "疑似广告+规避，但无变现目标佐证，本例按C"}
+被举报消息：👙或🔥（纯 emoji）；用户资料：昵称"Silent"，头像含比基尼 emoji
+输出：{"level": "E", "score": 10, "reason": "纯 emoji 无具体内容,头像含 NSFW 元素属个人偏好,非违规"}
+被举报消息：杠ad起飞；用户资料：昵称"Silent"（无变现目标）
+输出：{"level": "E", "score": 8, "reason": "群内玩笑/口癖,ad 命令名出现在聊天中不视为规避广告"}
+被举报消息：這個人主貢曲的幣圖群挺牛逼的 @Liam2477
+输出：{"level": "B", "score": 72, "reason": "投资群引流：幣圖群=币圈群，@账号荐币带单"}
+被举报消息：比特币最近跌成狗，我已经躺平不管了
+输出：{"level": "E", "score": 5, "reason": "正常讨论行情持仓，无引流钩子，未违反群规"}`;
 }
 
 // 容错解析 AI 返回的 JSON(兼容 markdown 代码围栏 / 前后多余文本 / 中文键名)
@@ -3766,22 +4008,26 @@ function extractAiResponseText(result) {
 	return '';
 }
 
-// 调用 Workers AI 判断威胁评级(单模型)。返回三态:
-// - 成功:{ ok: true, level, label, score, reason, threshold }
-// - AI 有响应但无法识别/拒绝答复:{ ok: false, code: 'unrecognized' }
+// 调用 Workers AI 判断威胁评级(模型数组按序容灾)。返回三态:
+// - 成功:{ ok: true, level, label, score, reason, threshold, model, latencyMs }
+// - AI 有响应但无法识别/拒绝答复:{ ok: false, code: 'unrecognized', model, latencyMs }
 //   → 调用方按 🟡B 危险处理(内容可能触发了安全策略拒答;
-//     含 AI 调用抛"内容安全拒绝"类异常——能触发道德围栏本身就是高危信号)
-// - 基础设施失败(无 AI 绑定 / 超时 / 网络 / 限流等,不含内容安全拒绝):null
+//     含 AI 调用抛"内容安全拒绝"类异常——能触发道德围栏本身就是高危信号);
+//     unrecognized 是终点:该模型"有响应",只是内容触发拒答/无法解析,不切换后续模型
+// - 基础设施失败(无 AI 绑定 / 全部模型超时 / 网络 / 限流等,不含内容安全拒绝):null
 //   → 调用方按 🟢C 可疑中性回退
+// model 为"实际产出该次评级的模型 ID"(仅 AI 有响应的成功/拒答路径携带,含超时/异常切换后命中的模型);
+// latencyMs 只统计"实际产出结果的那次模型尝试"的耗时(毫秒,从该次尝试发出请求到拿到答复),
+// 超时/异常尝试的耗时不计入;null 路径(全部基础设施失败)不携带 model/latencyMs,调用方按 C 兜底时无展示。
 // 所有诊断日志以 [ad-ai] 前缀输出,Cloudflare Workers Logs 中可按前缀 grep 定位。
 async function assessThreatWithAI(env, content, groupRules) {
-	// 入口诊断:env/AI 绑定状态、消息长度、模型名
+	// 入口诊断:env/AI 绑定状态、消息长度、本次模型列表
 	console.log('[ad-ai] === 评估入口 ===', JSON.stringify({
 		hasEnv: Boolean(env),
 		hasAIBinding: Boolean(env && env.AI),
 		aiType: env?.AI ? typeof env.AI : 'undefined',
 		hasRunMethod: env?.AI ? typeof env.AI.run : 'undefined',
-		model: AD_AI_MODEL,
+		models: AD_AI_MODELS,
 		contentLength: content ? content.length : 0,
 		contentPreview: content ? content.slice(0, 80).replace(/\n/g, '\\n') : '',
 		rulesLength: (groupRules || AD_GROUP_RULES).length,
@@ -3803,110 +4049,154 @@ async function assessThreatWithAI(env, content, groupRules) {
 
 	const systemPrompt = buildAiSystemPrompt(groupRules || AD_GROUP_RULES);
 	const userContent = `被举报消息内容:\n${content}`;
-	const runOptions = buildAiRunOptions(AD_AI_MODEL, systemPrompt, userContent);
+	// 本次要用的模型列表:fetch 阶段已按 env.AD_AI_MODEL 解析到 AD_AI_MODELS(空回退内置默认);
+	// 此处兜底再解析一次,避免"未经 fetch 直接调用"时拿到空列表。
+	const models = (Array.isArray(AD_AI_MODELS) && AD_AI_MODELS.length > 0)
+		? AD_AI_MODELS
+		: resolveAdAiModels(env && env.AD_AI_MODEL);
 
-	console.log('[ad-ai] 准备调用 env.AI.run, model=' + AD_AI_MODEL + ', 参数键=' + Object.keys(runOptions).join(',') + ', 超时=' + AD_AI_TIMEOUT_MS + 'ms');
+	// 单模型尝试(内层):每次尝试独立计时 + 独立超时(各自 timerId,结束即清理)。返回三态:
+	//   { kind:'ok', level, label, score, reason, threshold, model, latencyMs } → 解析成功
+	//   { kind:'unrecognized', model, latencyMs }  → 有响应但空文本/无法解析/level+score 均非法/道德围墙拒绝
+	//   { kind:'infra', model, isTimeout, errorMessage } → 超时/网络/限流等基础设施失败 → 外层切换下一模型
+	// latencyMs 仅统计"本次尝试"耗时(aiStart 在每次尝试开始时重置);infra 尝试耗时不计入最终结果。
+	const attemptSingleModel = async (model) => {
+		const aiStart = Date.now();
+		const aiLatencyMs = () => Math.max(0, Math.round(Date.now() - aiStart));
+		const runOptions = buildAiRunOptions(model, systemPrompt, userContent);
 
-	let timerId;
-	try {
-		const result = await Promise.race([
-			env.AI.run(AD_AI_MODEL, runOptions),
-			new Promise((_, reject) => {
-				timerId = setTimeout(
-					() => reject(new Error('AI 调用超时(>' + AD_AI_TIMEOUT_MS + 'ms)')),
-					AD_AI_TIMEOUT_MS
-				);
-			})
-		]);
-		if (timerId) clearTimeout(timerId);
+		console.log('[ad-ai] 准备调用 env.AI.run, model=' + model + ', 参数键=' + Object.keys(runOptions).join(',') + ', 超时=' + AD_AI_TIMEOUT_MS + 'ms');
 
-		// 完整打印 AI.run 原始返回(便于诊断格式异常),截断 500 字符
-		let rawStr;
+		let timerId;
 		try {
-			rawStr = JSON.stringify(result);
-		} catch (jsonErr) {
-			rawStr = '[无法 JSON.stringify] typeof=' + typeof result + ', String()=' + String(result);
-		}
-		console.log('[ad-ai] AI.run 已返回, 截断 500:', rawStr.slice(0, 500));
+			const result = await Promise.race([
+				env.AI.run(model, runOptions),
+				new Promise((_, reject) => {
+					timerId = setTimeout(
+						() => reject(new Error('AI 调用超时(>' + AD_AI_TIMEOUT_MS + 'ms)')),
+						AD_AI_TIMEOUT_MS
+					);
+				})
+			]);
+			if (timerId) clearTimeout(timerId);
 
-		// 多格式提取文本(传统 Chat / Responses API / Chat Completions)
-		const text = extractAiResponseText(result);
-		console.log('[ad-ai] 提取的 response 文本: 长度=' + text.length + ', 前300字符=' + text.slice(0, 300));
-
-		if (!text || !text.trim()) {
-			console.error('[ad-ai] AI 返回空文本(可能被安全策略拒答或模型静默,或返回结构未适配) → 按 B 危险处理。原始返回:', rawStr.slice(0, 500));
-			return { ok: false, code: 'unrecognized' };
-		}
-		const parsed = parseAiThreatJson(text);
-		if (!parsed) {
-			console.error('[ad-ai] AI 返回无法解析为 JSON(可能为拒答/乱码/格式错误) → 按 B 危险处理。完整 text:', text);
-			return { ok: false, code: 'unrecognized' };
-		}
-		// level 权威 + score 档内校准:
-		// - AI 显式给出合法 level(S/A/B/C/D/E)→ 以 level 定档,分数(若有)clamp 到该档 [minScore,maxScore];
-		// - level 缺失/非法但 score 合法 → 退化用 scoreToRating 由分数定档(兼容路径,记 warn 便于观测漂移);
-		// - level 与 score 皆不可用 → 维持 unrecognized 语义。
-		const AD_VALID_LEVELS = ['S', 'A', 'B', 'C', 'D', 'E'];
-		const rawLevel = typeof parsed.level === 'string' ? parsed.level.trim().toUpperCase() : '';
-		const levelValid = AD_VALID_LEVELS.includes(rawLevel);
-		const rawScore = Math.round(Number(parsed.score));
-		const scoreValid = Number.isFinite(rawScore);
-		if (!levelValid && !scoreValid) {
-			console.error('[ad-ai] AI 返回的 level 非法且分数非数字 → 按 B 危险处理。parsed:', JSON.stringify(parsed));
-			return { ok: false, code: 'unrecognized' };
-		}
-		let rating;
-		let finalScore;
-		let calibrated = false;
-		if (levelValid) {
-			rating = AD_THREAT_RATINGS[rawLevel];
-			if (scoreValid && (rawScore < rating.minScore || rawScore > rating.maxScore)) {
-				calibrated = true;
-				finalScore = Math.max(rating.minScore, Math.min(rating.maxScore, rawScore));
-				console.warn('[ad-ai] AI 分数与等级不一致,已校准: level=' + rawLevel + ' rawScore=' + rawScore + ' → clampedScore=' + finalScore);
-			} else {
-				finalScore = scoreValid ? rawScore : null;
+			// 完整打印 AI.run 原始返回(便于诊断格式异常),截断 500 字符
+			let rawStr;
+			try {
+				rawStr = JSON.stringify(result);
+			} catch (jsonErr) {
+				rawStr = '[无法 JSON.stringify] typeof=' + typeof result + ', String()=' + String(result);
 			}
-		} else {
-			// level 缺失/非法但 score 合法 → 按分数兜底定级(分数越高越危险)
-			finalScore = Math.max(0, Math.min(100, rawScore));
-			rating = scoreToRating(finalScore);
-			console.warn('[ad-ai] AI 未返回合法 level,按 score 兜底定级: rawLevel="' + (parsed.level === undefined ? '(缺失)' : String(parsed.level)) + '" score=' + finalScore + ' → 评级=' + rating.level);
-		}
-		console.log('[ad-ai] 解析成功: level=' + rating.level + ' score=' + finalScore + (calibrated ? '(档内校准)' : '') + ' → 评级=' + rating.label + ' → 票数=' + rating.votes + ', reason="' + (parsed.reason || '') + '"');
-		return {
-			ok: true,
-			level: rating.level,
-			label: rating.label,
-			score: finalScore,
-			reason: String(parsed.reason || '').slice(0, 80) || '未提供理由',
-			threshold: rating.votes
-		};
-	} catch (error) {
-		if (timerId) clearTimeout(timerId);
-		const isTimeout = error && error.message && error.message.includes('AI 调用超时');
-		// 内容安全拒绝检测:能触发道德围栏(如 NSFW)本身就是"内容足够劲爆"的强信号,
-		// 模型/API 常因此直接抛 400/403 或安全策略报错 → 与拒答同等对待,按 B 危险处理。
-		// 超时永远不算内容拒绝(超时不携带内容违规信息),即使 message 含其它词也保持 null→C。
-		const SAFETY_PATTERN = /(?:content|safety|policy|filter|moderat|block|inappropriat|disallow|NSFW|400|403)/i;
-		const isSafetyRejection = !isTimeout && Boolean(error?.message) && SAFETY_PATTERN.test(error.message);
-		if (isSafetyRejection) {
-			console.error('[ad-ai] AI.run 疑似触发道德围栏/内容安全拒绝 → 按 B 危险处理。诊断信息:', JSON.stringify({
+			console.log('[ad-ai] AI.run 已返回, 耗时=' + aiLatencyMs() + 'ms, 截断 500:', rawStr.slice(0, 500));
+
+			// 多格式提取文本(传统 Chat / Responses API / Chat Completions)
+			const text = extractAiResponseText(result);
+			console.log('[ad-ai] 提取的 response 文本: 长度=' + text.length + ', 前300字符=' + text.slice(0, 300));
+
+			if (!text || !text.trim()) {
+				console.error('[ad-ai] AI 返回空文本(可能被安全策略拒答或模型静默,或返回结构未适配) → 按 B 危险处理。model=' + model + ' 原始返回:', rawStr.slice(0, 500));
+				return { kind: 'unrecognized', model, latencyMs: aiLatencyMs() };
+			}
+			const parsed = parseAiThreatJson(text);
+			if (!parsed) {
+				console.error('[ad-ai] AI 返回无法解析为 JSON(可能为拒答/乱码/格式错误) → 按 B 危险处理。model=' + model + ' 完整 text:', text);
+				return { kind: 'unrecognized', model, latencyMs: aiLatencyMs() };
+			}
+			// level 权威 + score 档内校准:
+			// - AI 显式给出合法 level(S/A/B/C/D/E)→ 以 level 定档,分数(若有)clamp 到该档 [minScore,maxScore];
+			// - level 缺失/非法但 score 合法 → 退化用 scoreToRating 由分数定档(兼容路径,记 warn 便于观测漂移);
+			// - level 与 score 皆不可用 → 维持 unrecognized 语义。
+			const AD_VALID_LEVELS = ['S', 'A', 'B', 'C', 'D', 'E'];
+			const rawLevel = typeof parsed.level === 'string' ? parsed.level.trim().toUpperCase() : '';
+			const levelValid = AD_VALID_LEVELS.includes(rawLevel);
+			const rawScore = Math.round(Number(parsed.score));
+			const scoreValid = Number.isFinite(rawScore);
+			if (!levelValid && !scoreValid) {
+				console.error('[ad-ai] AI 返回的 level 非法且分数非数字 → 按 B 危险处理。model=' + model + ' parsed:', JSON.stringify(parsed));
+				return { kind: 'unrecognized', model, latencyMs: aiLatencyMs() };
+			}
+			let rating;
+			let finalScore;
+			let calibrated = false;
+			if (levelValid) {
+				rating = AD_THREAT_RATINGS[rawLevel];
+				if (scoreValid && (rawScore < rating.minScore || rawScore > rating.maxScore)) {
+					calibrated = true;
+					finalScore = Math.max(rating.minScore, Math.min(rating.maxScore, rawScore));
+					console.warn('[ad-ai] AI 分数与等级不一致,已校准: level=' + rawLevel + ' rawScore=' + rawScore + ' → clampedScore=' + finalScore);
+				} else {
+					finalScore = scoreValid ? rawScore : null;
+				}
+			} else {
+				// level 缺失/非法但 score 合法 → 按分数兜底定级(分数越高越危险)
+				finalScore = Math.max(0, Math.min(100, rawScore));
+				rating = scoreToRating(finalScore);
+				console.warn('[ad-ai] AI 未返回合法 level,按 score 兜底定级: rawLevel="' + (parsed.level === undefined ? '(缺失)' : String(parsed.level)) + '" score=' + finalScore + ' → 评级=' + rating.level);
+			}
+			console.log('[ad-ai] 解析成功: model=' + model + ' level=' + rating.level + ' score=' + finalScore + (calibrated ? '(档内校准)' : '') + ' → 评级=' + rating.label + ' → 票数=' + rating.votes + ', reason="' + (parsed.reason || '') + '"');
+			return {
+				kind: 'ok',
+				level: rating.level,
+				label: rating.label,
+				score: finalScore,
+				reason: String(parsed.reason || '').slice(0, 80) || '未提供理由',
+				threshold: rating.votes,
+				model,
+				latencyMs: aiLatencyMs()
+			};
+		} catch (error) {
+			if (timerId) clearTimeout(timerId);
+			const isTimeout = error && error.message && error.message.includes('AI 调用超时');
+			// 内容安全拒绝检测:能触发道德围栏(如 NSFW)本身就是"内容足够劲爆"的强信号,
+			// 模型/API 常因此直接抛 400/403 或安全策略报错 → 与拒答同等对待,按 B 危险处理(终点,不切换模型)。
+			// 超时永远不算内容拒绝(超时不携带内容违规信息),即使 message 含其它词也保持 infra → 切换下一模型。
+			const SAFETY_PATTERN = /(?:content|safety|policy|filter|moderat|block|inappropriat|disallow|NSFW|400|403)/i;
+			const isSafetyRejection = !isTimeout && Boolean(error?.message) && SAFETY_PATTERN.test(error.message);
+			if (isSafetyRejection) {
+				console.error('[ad-ai] AI.run 疑似触发道德围栏/内容安全拒绝 → 按 B 危险处理(终点,不切换模型)。model=' + model + ' 诊断信息:', JSON.stringify({
+					isTimeout,
+					errorName: error?.name,
+					errorMessage: error?.message,
+					errorStackHead: (error?.stack || '').split('\n').slice(0, 4).join(' | ')
+				}));
+				// 安全拒绝也是"AI 有响应"的路径(能触发道德围栏本身即高危信号),携带 model + 本次尝试耗时
+				return { kind: 'unrecognized', model, latencyMs: aiLatencyMs() };
+			}
+			console.error('[ad-ai] AI.run 抛异常(基础设施失败:超时/网络/限流/未知) → 切换下一模型。model=' + model + ' 诊断信息:', JSON.stringify({
 				isTimeout,
 				errorName: error?.name,
 				errorMessage: error?.message,
 				errorStackHead: (error?.stack || '').split('\n').slice(0, 4).join(' | ')
 			}));
-			return { ok: false, code: 'unrecognized' };
+			return { kind: 'infra', model, isTimeout, errorMessage: error && error.message ? String(error.message) : '' };
 		}
-		console.error('[ad-ai] AI.run 抛异常(基础设施失败:超时/网络/限流/未知) → 回退 C 可疑。诊断信息:', JSON.stringify({
-			isTimeout,
-			errorName: error?.name,
-			errorMessage: error?.message,
-			errorStackHead: (error?.stack || '').split('\n').slice(0, 4).join(' | ')
-		}));
-		return null;
+	};
+
+	// 外层:按模型列表顺序逐个尝试。仅 infra(超时/异常)切换下一个;成功/unrecognized 立即返回。
+	for (const model of models) {
+		const attempt = await attemptSingleModel(model);
+		if (attempt.kind === 'infra') {
+			// infra 尝试的耗时不计入最终结果,继续尝试下一个模型
+			continue;
+		}
+		if (attempt.kind === 'unrecognized') {
+			// 有响应但无法识别/拒答:unrecognized 是终点,不尝试后续模型(拒答本身即评级结论)
+			return { ok: false, code: 'unrecognized', model: attempt.model, latencyMs: attempt.latencyMs };
+		}
+		// 成功:携带实际响应模型与本次尝试耗时
+		return {
+			ok: true,
+			level: attempt.level,
+			label: attempt.label,
+			score: attempt.score,
+			reason: attempt.reason,
+			threshold: attempt.threshold,
+			model: attempt.model,
+			latencyMs: attempt.latencyMs
+		};
 	}
+	console.error('[ad-ai] 全部 ' + models.length + ' 个模型均基础设施失败(超时/异常) → 回退 C 可疑(null),不带模型/耗时。models=' + JSON.stringify(models));
+	return null;
 }
 
 // 预检目标用户在本群(当前主群 chatId)是否已被禁言或被 ban(mutedOrBanned)且已存在于本地 KV 黑名单(isBlacklisted)。
@@ -4018,7 +4308,100 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 	const duplicateCheck = await checkAdDuplicate(chatId, targetUserId, env);
 	console.log(`[/ad] 重复预检 tgid=${targetUserId} 已禁言或被ban=${duplicateCheck.mutedOrBanned} 联网黑名单=${duplicateCheck.localBlacklisted} 跳过=${duplicateCheck.shouldSkip}`);
 	if (duplicateCheck.shouldSkip) {
-		await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已在本群被禁言或被封禁，且已在联网黑名单中，无需重复发起举报投票`);
+		// 2026-09-08 修复:直发 /ad <tgid>(无回复对象)举报通过后广告消息无法被删除;群友改为
+		// "回复广告消息 + /ad(/ban /spam)"再次举报时,目标已在本群被禁言/封禁且已在联网黑名单
+		// → 不再只是提示早退,确认后先删除被回复的这条违规消息再返回,避免违规内容残留群内
+		// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程;无回复场景保持原"无需重复举报"语义)。
+		if (message.reply_to_message) {
+			await deleteMessage(chatId, message.reply_to_message.message_id);
+			await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已确认在联网黑名单中，已删除被举报的违规消息`);
+		} else {
+			await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已在本群被禁言或被封禁，且已在联网黑名单中，无需重复发起举报投票`);
+		}
+		return;
+	}
+
+	// 两级防重+合票:①active 索引(投票进行中)→同一条消息的重复举报自动转为赞成票;
+	// ②pending 索引(AI 评级中,投票未创建)→同一条消息的重复举报预登记赞成票,评级完成创建投票时自动合入。
+	// 消息不匹配(同目标不同消息/纯 tgid 直发)维持拦截提示,不误合票(2026-09-09)。
+	// 以 typeof 探测而非直接引用:符号缺失时(QA verbatim 切片沙箱未注入)按无索引处理,降级放行不报错。
+	const activeVoteToken = typeof getActiveAdVoteIndex === 'function'
+		? await getActiveAdVoteIndex(env, chatId, targetUserId)
+		: null;
+	let activeState = null;
+	if (activeVoteToken && typeof getAdVoteState === 'function') {
+		activeState = await getAdVoteState(env, activeVoteToken);
+	}
+	const pendingIndex = typeof getAdVotePendingIndex === 'function'
+		? await getAdVotePendingIndex(env, chatId, targetUserId)
+		: null;
+	// 本处位于下方"4. 被举报消息"段之前,replyToMessageId 尚未声明(const TDZ),
+	// 故从原始 update 就地提取本次举报的回复目标消息 id 供合票匹配(语义与下方提取一致)。
+	const interceptReplyToMessageId = message.reply_to_message?.message_id || null;
+
+	// 分支 1:active 投票进行中且本次举报回复的是同一条消息 → 自动转为赞成票(合票)
+	if (activeState && !activeState.finalized && interceptReplyToMessageId && activeState.reportedMessageId
+		&& String(interceptReplyToMessageId) === String(activeState.reportedMessageId)) {
+		const alreadyParticipated = (activeState.approvers || []).some((v) => String(v.id) === String(userId))
+			|| (activeState.rejecters || []).some((v) => String(v.id) === String(userId));
+		if (alreadyParticipated) {
+			await sendTelegramMessage(chatId, '✅ 你已参与过该举报投票，无需重复参与');
+			return;
+		}
+		const approverSnapshot = snapshotTelegramUser(message.from);
+		if (approverSnapshot) {
+			activeState.approvers.push(approverSnapshot);
+		}
+		if (activeState.approvers.length >= activeState.threshold) {
+			// 转票即达标:直接 finalize 通过(内部编辑终态消息+执行封禁+saveAdVoteState 联动清 active 索引)
+			console.log(`[/ad] 重复举报转赞成票即达标 tgid=${targetUserId} 票数=${activeState.approvers.length}/${activeState.threshold}`);
+			if (activeState.messageId) {
+				await finalizeAdVote(env, activeState, chatId, activeState.messageId, 'approved');
+				await sendTelegramMessage(chatId, '✅ 重复举报已自动计为赞成票，投票达到阈值，已执行封禁流程');
+			} else {
+				// 极端:投票消息从未落地,无法编辑终态,仅落库(索引联动清理由 saveAdVoteState 内部完成)
+				await saveAdVoteState(env, activeState);
+				await sendTelegramMessage(chatId, '✅ 重复举报已自动计为赞成票');
+			}
+			return;
+		}
+		// 未达标:落库(联动刷新 active 索引)+ 刷新投票消息展示;编辑失败仅记日志不阻断
+		await saveAdVoteState(env, activeState);
+		if (activeState.messageId) {
+			try {
+				const refreshed = await editMessageText(chatId, activeState.messageId, buildAdVoteMessageText(activeState), buildAdVoteInlineKeyboard(activeState.voteToken, activeState));
+				if (!refreshed || !refreshed.ok) {
+					console.error('[/ad] 转赞成票后刷新投票消息失败(不阻断):', JSON.stringify(refreshed));
+				}
+			} catch (error) {
+				console.error('[/ad] 转赞成票后刷新投票消息异常(不阻断):', error.message);
+			}
+		}
+		await sendTelegramMessage(chatId, '✅ 你对同一条广告的举报已自动计为赞成票，可在投票消息中查看');
+		return;
+	}
+
+	// 分支 2:active 投票进行中但消息不匹配(同目标不同消息/纯 tgid 直发)→ 维持既有拦截提示
+	if (activeState && !activeState.finalized) {
+		console.log(`[/ad] 防重拦截 tgid=${targetUserId} 已有进行中投票 token=${activeVoteToken}`);
+		await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已有进行中的举报投票，请直接在投票消息中参与，无需重复发起`);
+		return;
+	}
+
+	// 分支 3:pending 评级中且本次举报回复的是同一条消息 → 预登记赞成票,评级完成创建投票时自动合入
+	if (pendingIndex && interceptReplyToMessageId && pendingIndex.reportedMessageId
+		&& String(interceptReplyToMessageId) === String(pendingIndex.reportedMessageId)) {
+		const pendingSnapshot = snapshotTelegramUser(message.from);
+		if (pendingSnapshot) {
+			await addAdVotePendingApprover(env, chatId, targetUserId, pendingSnapshot);
+		}
+		await sendTelegramMessage(chatId, '✅ 已记录你对同一条广告的举报赞成票，AI 评级完成后将自动计入投票');
+		return;
+	}
+
+	// 分支 4:pending 评级中但消息不匹配 → 拦截提示,避免评级完成后产生重复投票
+	if (pendingIndex) {
+		await sendTelegramMessage(chatId, `⚠️ <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 已有举报正在 AI 评级中，请稍候，无需重复发起`);
 		return;
 	}
 
@@ -4029,12 +4412,25 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 	const replyToMessageId = replyMsg?.message_id;
 	let messagePreview = '';
 	let reportContent = ''; // 发送给 AI 判断威胁评级的被举报消息内容
+	let quoteContext = ''; // 回复引用语境:被举报消息自身回复引用的他人消息文本(2026-09-08 新增)
 	if (replyMsg) {
 		const src = (typeof replyMsg.text === 'string' && replyMsg.text.length > 0)
 			? replyMsg.text
 			: (typeof replyMsg.caption === 'string' && replyMsg.caption.length > 0 ? replyMsg.caption : '');
 		messagePreview = src.slice(0, 50);
 		reportContent = src.slice(0, AD_AI_MAX_CONTENT_CHARS);
+		// 回复引用语境(2026-09-08):被举报消息若本身是对他人消息的回复,Telegram 会在
+		// replyMsg.reply_to_message 下发被引用的完整消息对象(仅取一层,不递归更上层)。
+		// 真实案例:群成员回复广告消息只输入"c",AI 仅评"c"得 E 无害,完全看不到引用里的
+		// 广告内容。此处提取引用文本(无 text 则 caption,再无则不产生语境块),供下方
+		// 有举报权限通道组装进 aiContentParts;普通用户举报通道保持旧评级口径,不纳入。
+		if (replyMsg.reply_to_message) {
+			const quotedMsg = replyMsg.reply_to_message;
+			const quoteSrc = (typeof quotedMsg.text === 'string' && quotedMsg.text.length > 0)
+				? quotedMsg.text
+				: (typeof quotedMsg.caption === 'string' && quotedMsg.caption.length > 0 ? quotedMsg.caption : '');
+			quoteContext = quoteSrc.slice(0, AD_AI_MAX_QUOTE_CONTEXT_CHARS);
+		}
 	}
 
 	// 被举报用户资料(昵称/用户名/简介):广告常把内容藏匿于其中,一并发给 AI 判断。
@@ -4045,6 +4441,12 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 	const aiContentParts = [];
 	if (reportContent) {
 		aiContentParts.push(`被举报消息内容:\n${reportContent}`);
+	}
+	// 回复引用语境(2026-09-08):仅管理员/有举报权限通道纳入(与下方"不把目标用户资料纳入评级输入"
+	// 的既有决策同构——普通用户举报保持旧评级口径,避免扩大"谁能触发投票"的边界);
+	// 标注明确该文本来自他人消息、非被举报人原文,仅供 AI 做语境判断(提示词有"回复引用语境说明")。
+	if (!userReportMode && quoteContext) {
+		aiContentParts.push(`被举报消息回复引用的他人消息内容(非被举报人原文,仅供语境判断):\n${quoteContext}`);
 	}
 	if (!userReportMode && profileText) {
 		aiContentParts.push(`被举报用户资料:\n${profileText}`);
@@ -4075,6 +4477,12 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 			// 占位发送失败:不阻断,后续投票路径走"另发投票消息"兜底 / 无害路径仅打日志静默收尾
 			console.error('[/ad] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
 		}
+	}
+
+	// 评级窗口开启:仅将调用 AI 的场景(willRunAi)预写 pending 索引,窗口内第二人对同一条消息的
+	// 重复举报可预登记赞成票,评级完成创建投票时自动合入(纯 tgid 直发/外部已评级 willRunAi=false 不写)。
+	if (willRunAi && typeof saveAdVotePendingIndex === 'function') {
+		await saveAdVotePendingIndex(env, chatId, targetUserId, replyToMessageId || null);
 	}
 
 	// 6. 调用 Workers AI 判断威胁评级(普通用户通道的评级也收敛至此,不再在 handleMessage 外层预评级)。
@@ -4118,7 +4526,9 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 				label: AD_THREAT_RATINGS.B.label,
 				score: null,
 				reason: 'AI 无法识别或拒绝答复，按 B 危险处理',
-				threshold: AD_THREAT_RATINGS.B.votes
+				threshold: AD_THREAT_RATINGS.B.votes,
+				latencyMs: threatAssessment.latencyMs, // AI 有响应(拒答)路径的耗时透传,供投票消息展示
+				model: threatAssessment.model // 实际产出该拒答评级的模型ID(仅 AI 有响应路径;可能 undefined → state.aiModel 为空 → 渲染不显示)
 			};
 		} else {
 			closeKind = 'unassessable'; // 仅 AI 基础设施失败(null,无 code)→ 未评级收尾,不弹投票
@@ -4132,7 +4542,9 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 			label: AD_THREAT_RATINGS.B.label,
 			score: null,
 			reason: 'AI 无法识别或拒绝答复，按 B 危险处理',
-			threshold: AD_THREAT_RATINGS.B.votes
+			threshold: AD_THREAT_RATINGS.B.votes,
+			latencyMs: threatAssessment.latencyMs, // AI 有响应(拒答)路径的耗时透传,供投票消息展示
+			model: threatAssessment.model // 实际产出该拒答评级的模型ID(仅 AI 有响应路径;可能 undefined → state.aiModel 为空 → 渲染不显示)
 		};
 	} else if (aiContent) {
 		// 有可判断内容但 AI 基础设施失败(未绑定/超时/异常,assessThreatWithAI 返回 null)→ 回退 C 可疑
@@ -4171,6 +4583,10 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		} else {
 			console.log('[ad-user-report] 无占位可编辑,静默收尾 closeKind=', closeKind);
 		}
+		// 评级未触发投票(无害/无法评级收尾):清 pending 预登记索引,窗口内已登记的赞成票随之失效
+		if (typeof clearAdVotePendingIndex === 'function') {
+			await clearAdVotePendingIndex(env, chatId, targetUserId);
+		}
 		return;
 	}
 
@@ -4191,6 +4607,8 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		score: threat.score,
 		threshold: threat.threshold,
 		reason: threat.reason,
+		latencyMs: threatAssessment?.latencyMs ?? null, // AI 响应耗时(仅 AI 有响应路径携带;null/预评级路径为 null)
+		model: threatAssessment?.model ?? null, // 实际产出评级的模型ID(仅 AI 有响应路径携带;null/预评级路径为 null)
 		userReportMode
 	}));
 
@@ -4216,11 +4634,39 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 		threatLabel: threat.label,
 		threatScore: threat.score,
 		threatReason: threat.reason,
+		aiLatencyMs: threat.latencyMs, // AI 响应耗时(ms,仅统计"实际产出该次结果的那次模型尝试";可能 undefined);旧 KV 状态无此字段 → 渲染时不显示,向后兼容
+		aiModel: threat.model, // 本次实际产出评级的模型ID(仅AI有响应路径;可能 undefined → 渲染时不显示);旧 KV 状态无此字段 → 渲染时不显示,向后兼容
 		createdAt: now,
 		deadlineAt: now + AD_VOTE_DURATION_HOURS * 3600,
 		finalized: false,
 		result: null
 	};
+
+	// 合入评级中窗口内预登记的赞成票(同一条消息的重复举报自动转为赞成票,2026-09-09):
+	// 按 id 去重并排除发起人本人,合票后若直接达标则跳过中间投票态,创建消息后立即 finalize 通过。
+	let immediateApprove = false;
+	if (typeof getAdVotePendingIndex === 'function') {
+		const pendingVotes = await getAdVotePendingIndex(env, chatId, targetUserId);
+		if (pendingVotes) {
+			// 只要走到建票,评级窗口即告关闭:无论有无预登记票均清 pending,防止空窗口索引残留
+			// 至 TTL 过期,导致投票 finalize 后窗口内同目标新举报被误报"AI 评级中"
+			if (typeof clearAdVotePendingIndex === 'function') {
+				await clearAdVotePendingIndex(env, chatId, targetUserId);
+			}
+			if (Array.isArray(pendingVotes.pendingApprovers) && pendingVotes.pendingApprovers.length > 0) {
+				for (const pv of pendingVotes.pendingApprovers) {
+					if (!pv || pv.id === undefined || pv.id === null) continue;
+					if (String(pv.id) === String(userId)) continue; // 发起人本人不重复计票
+					if (state.approvers.some((v) => String(v.id) === String(pv.id))) continue;
+					state.approvers.push(pv);
+				}
+				console.log(`[/ad] 评级窗口合票 tgid=${targetUserId} 预登记赞成票=${pendingVotes.pendingApprovers.length} 合票后=${state.approvers.length}/${state.threshold}`);
+				if (state.approvers.length >= state.threshold) {
+					immediateApprove = true;
+				}
+			}
+		}
+	}
 
 	const initialText = buildAdVoteMessageText(state);
 
@@ -4262,6 +4708,16 @@ async function handleAdCommand(message, env, preAssessedThreat = null, options =
 
 	// 回填 messageId,用于后续 editMessageText(投票按钮回调 / 刷新 / finalize 复用既有状态机)
 	state.messageId = voteMessageId;
+
+	// 创建即达标:评级窗口合票后赞成数已达阈值 → 不展示中间投票态,直接 finalize 通过
+	// (封禁动作+终态消息由 finalizeAdVote 完成;其内部 saveAdVoteState 置 finalized=true 联动清 active 索引,
+	// 故 finalize 路径 return 后不再走下方常规保存,避免二次落库覆盖终态)
+	if (immediateApprove && voteMessageId) {
+		console.log(`[/ad] 创建即达标 tgid=${targetUserId} 票数=${state.approvers.length}/${state.threshold} 直接通过`);
+		await finalizeAdVote(env, state, chatId, voteMessageId, 'approved');
+		return;
+	}
+
 	await saveAdVoteState(env, state);
 }
 
@@ -4599,6 +5055,8 @@ const NETKILL_LOG_LABELS = {
 	'action:mute:success': '成功:已禁言并同步本群状态为"禁言"',
 	'action:mute:failed': '失败:禁言失败(不写状态、不通知)',
 	'action:mute:skipped-banned': '跳过:目标已被封禁,不执行禁言(避免封禁降级为受限),本群状态记为"封禁"',
+	'action:delete-message:success': '成功:发言触发的违规消息已删除(防广告在管理员处理前留存)',
+	'action:delete-message:failed': '失败:违规消息删除失败(bot 权限不足或消息过老),通知照发',
 	'status:admin-detected': '检测:目标用户实为本群管理员,禁言被 TG API 拒绝,记录状态"管理员"避免重复尝试',
 	'notify:sent': '已发送联网黑名单通知(主群(任一)无按钮,其他群带管理员按钮)',
 	'callback:ban:start': '按钮:本群管理员点击"永久封禁"',
@@ -4727,20 +5185,37 @@ async function restrictUserInChat(chatId, userId) {
 	return result;
 }
 
-// 构建联网查杀通知文案 + 操作按钮(仅本群管理员可点,业务侧校验)。
-// 主群与非主群均带按钮,按钮集与语义按群类型区分(isMain 参数):
-// - 主群: 🔨 永久封禁 → 加入联网黑名单(等价主群 /ban)、♻️ 移除黑名单 → 移出联网黑名单并恢复全部主群状态(等价主群 /unban)。
-// - 非主群: 🔨 永久封禁 → 本地黑名单封禁、✅ 加入白名单 → 本群白名单(仅维护本群状态)。
-function buildNetKillNotification(tgid, member, { isMain = false } = {}) {
-	const mention = formatUserMention(member)
+// 联网查杀"检测详情块"(通知与回调结果文案共用,保证操作后消息上半部分 UI 连续不跳变):
+// ⚠️ 标签行 + 联网黑名单命中说明 + 用户/TGID 详情。member 为被查杀用户对象(可为 null,兜底 tgid 链接)。
+function buildNetKillDetailSection(member, tgid) {
+	const mention = (member && formatUserMention(member))
 		|| `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
-	let text = `⚠️ <b>#黑名单用户检测</b>
+	return `⚠️ <b>#黑名单用户检测</b>
 
 🚫 该用户存在于 <b>联网黑名单</b> 中，已在本群禁言处理。
 
 👤 用户: ${mention}
 📋 TGID: <code>${escapeHtml(tgid)}</code>`;
-	text += `
+}
+
+// 从原查杀通知消息实体中恢复被查杀用户对象(text_mention 实体携带 user),
+// 供回调结果文案重建详情块以保留用户名显示;找不到(实体缺失/异常)返回 null,由详情块兜底 tgid 链接。
+function extractNetKillMemberFromMessage(message, tgid) {
+	const entities = message?.entities || [];
+	for (const entity of entities) {
+		if (entity.type === 'text_mention' && entity.user && String(entity.user.id) === String(tgid)) {
+			return entity.user;
+		}
+	}
+	return null;
+}
+
+// 构建联网查杀通知文案 + 操作按钮(仅本群管理员可点,业务侧校验)。
+// 主群与非主群均带按钮,按钮集与语义按群类型区分(isMain 参数):
+// - 主群: 🔨 永久封禁 → 加入联网黑名单(等价主群 /ban)、♻️ 移除黑名单 → 移出联网黑名单并恢复全部主群状态(等价主群 /unban)。
+// - 非主群: 🔨 永久封禁 → 本地黑名单封禁、✅ 加入白名单 → 本群白名单(仅维护本群状态)。
+function buildNetKillNotification(tgid, member, { isMain = false } = {}) {
+	const text = `${buildNetKillDetailSection(member, tgid)}
 
 👇 仅限本群管理员操作：`;
 	const replyMarkup = {
@@ -4805,6 +5280,15 @@ async function handleNetworkBlacklistKill(chat, members, env, replyToMessageId) 
 			await muteChatMember(chatId, member.id);
 			await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.MUTED);
 			logNetKill('action:mute:success', { tgid, chatId: chatId.toString() });
+			// 发言触发(replyToMessageId 存在)时,被查杀消息本身可能就是广告:禁言生效后先删除该消息
+			// 再发通知,避免管理员未处理期间广告一直留在群内;入群触发无消息可删。
+			// mute 失败路径(含目标实为本群管理员)不删除,避免误删管理员消息。
+			// deleteMessage 内部自带容错(失败返回 false 不抛错),删除失败仅记日志、通知照发。
+			if (replyToMessageId) {
+				const deleted = await deleteMessage(chatId, replyToMessageId);
+				logNetKill(deleted ? 'action:delete-message:success' : 'action:delete-message:failed',
+					{ tgid, chatId: chatId.toString(), messageId: replyToMessageId });
+			}
 			// 主群与非主群均带按钮,按钮集与语义按群类型区分(主群: ban+rm;非主群: ban+wl)。
 			// 变量名 inGroupId 保留(netkill QA 源码锚点依赖),判断来源已改为多主群集合语义
 			const inGroupId = isMainGroup(chatId);
@@ -4869,7 +5353,12 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 
 	const messageId = message.message_id;
 	const removeButtons = { inline_keyboard: [] };
-	const mention = `<a href="tg://user?id=${escapeHtml(tgid)}">${escapeHtml(tgid)}</a>`;
+	// 操作人 mention(callbackQuery.from 必有 id,formatUserMention 不会返回 null;兜底仅防御异常数据)
+	const operatorMention = formatUserMention(callbackQuery.from)
+		|| `<a href="tg://user?id=${escapeHtml(operatorId)}">${escapeHtml(operatorId)}</a>`;
+	// 重建检测详情块(从原消息实体恢复被查杀用户,保留用户名显示):回调结果 = 详情块 + 操作结果,UI 连续不跳变
+	const netkillMember = extractNetKillMemberFromMessage(message, tgid);
+	const detailSection = buildNetKillDetailSection(netkillMember, tgid);
 
 	if (action === 'ban') {
 		logNetKill('callback:ban:start', { tgid, chatId: chatId.toString(), operatorId, inGroupId });
@@ -4879,7 +5368,11 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 				const result = await addToBlacklist(tgid, env, 'ban', operatorId);
 				if (result.success || result.alreadyExists) {
 					await editMessageText(chatId, messageId,
-						`🔨 <b>已永久封禁</b>\n\n${mention} 已加入联网黑名单。\n📌 联网黑名单: 已加入`, removeButtons);
+						`${detailSection}
+
+🔨 <b>已执行 永久封禁</b>
+👮 操作人: ${operatorMention}
+📌 联网黑名单: 已加入`, removeButtons);
 					logNetKill('callback:ban:success', { tgid, chatId: chatId.toString(), operatorId, alreadyExists: Boolean(result.alreadyExists) });
 					try { await answerCallbackQuery(callbackQuery.id, result.alreadyExists ? '该用户已在联网黑名单中' : '已永久封禁该用户'); } catch (_) { }
 				} else {
@@ -4891,7 +5384,11 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 				await banUserPermanently(chatId, tgid);
 				await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.BANNED);
 				await editMessageText(chatId, messageId,
-					`🔨 <b>已永久封禁</b>\n\n${mention} 已移出本群。\n📌 本地黑名单: 封禁`, removeButtons);
+					`${detailSection}
+
+🔨 <b>已执行 永久封禁</b>
+👮 操作人: ${operatorMention}
+📌 本地黑名单: 封禁（已移出本群）`, removeButtons);
 				logNetKill('callback:ban:success', { tgid, chatId: chatId.toString(), operatorId });
 				try { await answerCallbackQuery(callbackQuery.id, '已永久封禁该用户'); } catch (_) { }
 			}
@@ -4917,7 +5414,11 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 					return true;
 				}
 				await editMessageText(chatId, messageId,
-					`✅ <b>已移出联网黑名单</b>\n\n${mention} 已解除全部主群限制。\n📌 联网黑名单: 已移除`, removeButtons);
+					`${detailSection}
+
+♻️ <b>已执行 移除黑名单</b>
+👮 操作人: ${operatorMention}
+📌 联网黑名单: 已移除（已解除全部主群限制）`, removeButtons);
 				logNetKill('callback:rm:success', { tgid, chatId: chatId.toString(), operatorId, notFound: Boolean(result.notFound) });
 				try { await answerCallbackQuery(callbackQuery.id, '已移出联网黑名单'); } catch (_) { }
 			} else {
@@ -4944,7 +5445,11 @@ async function handleNetworkKillCallbackQuery(callbackQuery, env) {
 		}
 		await dbSetUserGroupStatus(env, tgid, chatId, GROUP_MEMBER_STATUS.WHITELISTED);
 		await editMessageText(chatId, messageId,
-			`✅ <b>已加入本群白名单</b>\n\n${mention} 已解除封禁/禁言，后续不再自动查杀。\n📌 本群状态: 白名单`, removeButtons);
+			`${detailSection}
+
+✅ <b>已执行 加入白名单</b>
+👮 操作人: ${operatorMention}
+📌 本群状态: 白名单（已解除封禁/禁言，后续不再自动查杀）`, removeButtons);
 		logNetKill('callback:wl:success', { tgid, chatId: chatId.toString(), operatorId });
 		try { await answerCallbackQuery(callbackQuery.id, '已加入白名单并解除限制'); } catch (_) { }
 	} catch (error) {
