@@ -179,12 +179,15 @@ const DB_BAN_REASON_MAP = {
 // 用户在群组内的健康状态(active_group_ids 数组元素 status 字段取值):
 // 管理员=群主/管理员(可发言,豁免黑名单), 健康=普通正常成员(可发言),
 // 禁言=被 restrictChatMember 禁发消息, 封禁=被 banChatMember 踢出群组(含被踢后尚未重新加入)。
+// NOT_IN_CHAT 为 /check 群内现状展示专用的"未在该群"态:不写入 DB(不在 active_group_ids 允许值内),
+// 仅由 getChatMember 实时结果(left / 接口 400)推导,故 normalizeGroupStatus 不承认该值。
 const GROUP_MEMBER_STATUS = {
 	ADMIN: '管理员',
 	HEALTHY: '健康',
 	MUTED: '禁言',
 	BANNED: '封禁',
-	WHITELISTED: '白名单'
+	WHITELISTED: '白名单',
+	NOT_IN_CHAT: '未在该群'
 };
 
 // 群组管理员判定钩子(黑名单豁免 / 管理员状态标记用):
@@ -255,6 +258,34 @@ function mapTgStatusToGroupStatus(status, canSendMessages) {
 	if (status === 'restricted' && canSendMessages === false) return GROUP_MEMBER_STATUS.MUTED;
 	if (status === 'administrator' || status === 'creator') return GROUP_MEMBER_STATUS.ADMIN;
 	return GROUP_MEMBER_STATUS.HEALTHY;
+}
+
+// /check 群内现状展示:状态 → 图标 + 专业表述(2026-09-23 新增)。
+// 与 GROUP_MEMBER_STATUS 五态一一对应,并额外支持"未在该群"(非五态,不写入 DB,仅用于 /check 实时展示):
+//   管理员/健康 → 可正常发言;禁言 → 被限制发言权限;封禁 → 已被踢出该群;
+//   白名单   → 本群黑名单豁免;未在该群 → getChatMember 判定非群成员(left 或接口 400)。
+// 语义说明(用户口径"怎么描述专业你就怎么来"):
+//   - "健康"面向管理员可读性弱,展示为「正常」并补一句"账号在本群无异常限制";
+//   - "封禁"严格表述为"已被移出该群"(Telegram banChatMember 即踢出+禁止再加入),不用"账号被封";
+//   - "未在该群"覆盖三种成因:主动退群(left)、从未加入(400)、被踢且未重新加入(400);
+//     不臆断成因,统一按"当前不在该群成员列表中"表述,避免误标为封禁。
+// 返回 { icon, label, desc }:desc 为纯中文描述(不含树形前缀),由调用方统一挂 " └ " 树形行。
+function describeCurrentChatStatus(chatStatus) {
+	switch (chatStatus) {
+		case GROUP_MEMBER_STATUS.ADMIN:
+			return { icon: '👑', label: '管理员', desc: '本群管理成员，不受联网黑名单限制' };
+		case GROUP_MEMBER_STATUS.MUTED:
+			return { icon: '🔇', label: '禁言', desc: '已被限制发言权限（可查看消息，无法发言）' };
+		case GROUP_MEMBER_STATUS.BANNED:
+			return { icon: '🚫', label: '封禁', desc: '已被移出本群并禁止重新加入' };
+		case GROUP_MEMBER_STATUS.WHITELISTED:
+			return { icon: '✅', label: '白名单', desc: '本群黑名单豁免成员' };
+		case GROUP_MEMBER_STATUS.NOT_IN_CHAT:
+			return { icon: '➖', label: '未在该群', desc: '当前不在本群成员列表中' };
+		case GROUP_MEMBER_STATUS.HEALTHY:
+		default:
+			return { icon: '✅', label: '正常', desc: '账号在本群无异常限制，可正常发言' };
+	}
 }
 
 // 标记用户在某群组的状态(写入 active_group_ids 数组元素的 status):
@@ -1802,6 +1833,29 @@ async function getManagedGroupUser(userId) {
 	return null;
 }
 
+// 查询某用户在"指定单个群"的实时群内状态(/check 群内顺带展示用,2026-09-23 新增):
+// 返回 GROUP_MEMBER_STATUS 之一(含 NOT_IN_CHAT);任何异常都不抛错,按"未在该群"降级。
+// 判定链:
+//   1) getChatMember 抛错(含 HTTP 400:用户不在群/群不存在)→ 未在该群;
+//   2) result.ok === false → 未在该群;
+//   3) 取 result.status('left'/'kicked'/'member'/'restricted'/'administrator'/'creator')与 can_send_messages
+//      走 mapTgStatusToGroupStatus;其中 'left' 明确表示已离开 → 未在该群(优先于"健康"兜底)。
+// 说明:DB 本地记录(dbGetUserGroupStatus)仅作辅助,不参与本函数判定——DB 可能滞后于 Telegram 实时状态,
+// "当前群组状态"以实时接口为准,DB 记录转而作为提示明细("本地记录: xxx")由上层拼装。
+async function resolveUserGroupStatusInChat(chatId, userId) {
+	try {
+		const statusResult = await checkUserStatusInChat(chatId, userId);
+		if (!statusResult?.result) return GROUP_MEMBER_STATUS.NOT_IN_CHAT;
+		const member = statusResult.result;
+		if (member.status === 'left') return GROUP_MEMBER_STATUS.NOT_IN_CHAT;
+		return mapTgStatusToGroupStatus(member.status, member.can_send_messages);
+	} catch (error) {
+		// getChatMember 失败(用户不在群 400 / 网络异常)统一按"未在该群"降级,不阻断 /check 主流程
+		console.log(`查询用户群内状态失败(chat ${chatId}, user ${userId}):`, error.message);
+		return GROUP_MEMBER_STATUS.NOT_IN_CHAT;
+	}
+}
+
 // 恢复用户在全部主群的状态(restoreUserInAllMainGroups)已在多主群核心辅助区定义,
 // 旧单群版 restoreUserInManagedGroup 已废弃删除(调用点统一改走逐主群恢复)。
 function escapeHtml(value) {
@@ -1929,6 +1983,30 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	// TGID 用 <code> 包裹(长按可复制纯数字),替代此前的 <a href="tg://user?id=..."> 链接;
 	// 用户反馈:管理员核对 TGID 时直接长按复制比"点击链接展开用户信息"更顺手。
 	responseMessage += `📋 <b>TGID:</b> <code>${escapeHtml(tgidToCheck)}</code>\n\n`;
+
+	// 当前群组状态(2026-09-23 新增):仅"群内 /check"场景输出(私聊场景无"当前群"语义,多主群会导致状态歧义)。
+	// 判定来源 = options.chatInfo(由调用方传入当前会话所在群 chat 对象),以 getChatMember 实时结果为准;
+	// DB 本地记录(dbGetUserGroupStatus)仅作辅助明细,避免实时状态与本地记录不一致时误导管理员。
+	// 位置:TGID 行与联网黑名单区块之间,既紧随用户标识便于横向核对,又不打乱既有两个黑名单区块的相对顺序。
+	if (options.chatInfo) {
+		const currentChatId = options.chatInfo.id;
+		const liveStatus = await resolveUserGroupStatusInChat(currentChatId, tgidToCheck);
+		// DB 本地记录:仅在与实时状态不同且确实存在记录时,作为提示明细附在状态行下
+		let statusNote = '';
+		if (options.env) {
+			const recordedStatus = await dbGetUserGroupStatus(options.env, tgidToCheck, currentChatId);
+			if (recordedStatus && recordedStatus !== liveStatus) {
+				statusNote = `本地记录：${describeCurrentChatStatus(recordedStatus).label}（与实时状态不一致，以实时为准）`;
+			}
+		}
+		const described = describeCurrentChatStatus(liveStatus);
+		responseMessage += `🧭 <b>当前群组状态:</b> ${described.icon} <b>${described.label}</b>\n`;
+		responseMessage += ` └ ${escapeHtml(described.desc)}\n`;
+		if (statusNote) {
+			responseMessage += ` └ ${escapeHtml(statusNote)}\n`;
+		}
+		responseMessage += '\n';
+	}
 
 	// 联网黑名单状态(数据库版可附带封禁原因与时间;KV 版仅 ID 数组,无原因字段)
 	// 2026-09-06 用户定版:联网黑名单区块排在 GKY黑名单 之前
@@ -2490,6 +2568,8 @@ async function handleMessage(message, env) {
 		targetUser,
 		includeReviewAction: true,
 		actionInCurrentChat: isManagedGroupMessage(message),
+		// 群内场景顺带展示"该用户在当前群组的实时状态";私聊场景传 null(无"当前群"语义,多主群会歧义)
+		chatInfo: isManagedGroupMessage(message) ? message.chat : null,
 		env
 	});
 	// 编辑占位为最终结果(失败兜底:fallback 另发一条)
@@ -2549,7 +2629,12 @@ async function handleMessage(message, env) {
 			if (!placeholderMessageId) {
 				console.error('[/check deep-link] 占位消息发送失败(继续流程):', JSON.stringify(placeholderSent));
 			}
-			const response = await buildBanlistCheckResponse(tgidToCheck, { includeReviewAction: true, env });
+			// 主群群内 deep-link 同样顺带展示"该用户在当前群组的实时状态";私聊场景传 null(无"当前群"语义)
+			const response = await buildBanlistCheckResponse(tgidToCheck, {
+				includeReviewAction: true,
+				chatInfo: isMainGroupChatHere ? message.chat : null,
+				env
+			});
 			if (placeholderMessageId) {
 				await editMessageText(chatId, placeholderMessageId, response.text, response.replyMarkup);
 			} else {
@@ -3030,6 +3115,7 @@ async function muteChatMember(chatId, userId) {
 	// 但覆盖了确定性场景(nmBot 等已封禁后本 bot 再禁言)。
 	const memberInfo = await getChatMemberInfo(chatId, userId);
 	if (memberInfo?.status === 'kicked') {
+		/** @type {Error & { code?: string }} */
 		const error = new Error('TARGET_ALREADY_BANNED: 用户已被封禁,跳过禁言(避免封禁被降级为受限)');
 		error.code = 'TARGET_ALREADY_BANNED';
 		throw error;
