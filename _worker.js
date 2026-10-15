@@ -3828,27 +3828,31 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	if (banlistData.success) {
 		if (banlistData.banned) {
 			responseMessage += `🌐 <b>GKY黑名单:</b> 🚫 <b>已封禁</b>\n`;
-			// 树形层级排版:明细行(ChatID/MsgID/日期/原因/内容)先收集进数组再统一挂靠,每行仅在对应数据存在时收集
-			const gkyDetailLines = [];
-			if (banlistData.chatId) {
-				const chatInfo = await getChatInfoFromId(banlistData.chatId);
-				let chatLine = `💬 <b>ChatID:</b> <code>${escapeHtml(banlistData.chatId)}</code>`;
-				if (chatInfo && chatInfo.title) {
-					chatLine += chatInfo.link
-						? ` (<a href="${escapeHtml(chatInfo.link)}">${escapeHtml(chatInfo.title)}</a>)`
-						: ` (${escapeHtml(chatInfo.title)})`;
+			// 2026-10-15 用户定版:副群隐藏 GKY 明细树(options.hideGkyDetails=true 时只保留上方布尔结论行,
+			// 跳过整段明细构建与输出,含 getChatInfoFromId 调用);缺省 falsy → 主群/私聊旧行为逐字不变。
+			if (!options.hideGkyDetails) {
+				// 树形层级排版:明细行(ChatID/MsgID/日期/原因/内容)先收集进数组再统一挂靠,每行仅在对应数据存在时收集
+				const gkyDetailLines = [];
+				if (banlistData.chatId) {
+					const chatInfo = await getChatInfoFromId(banlistData.chatId);
+					let chatLine = `💬 <b>ChatID:</b> <code>${escapeHtml(banlistData.chatId)}</code>`;
+					if (chatInfo && chatInfo.title) {
+						chatLine += chatInfo.link
+							? ` (<a href="${escapeHtml(chatInfo.link)}">${escapeHtml(chatInfo.title)}</a>)`
+							: ` (${escapeHtml(chatInfo.title)})`;
+					}
+					gkyDetailLines.push(chatLine);
 				}
-				gkyDetailLines.push(chatLine);
+				if (banlistData.msgId) gkyDetailLines.push(`📨 <b>MsgID:</b> <code>${escapeHtml(banlistData.msgId)}</code>`);
+				// recordedDate 规范化为 "YYYY-MM-DD HH:MM"(formatGkyRecordedDate 提取失败时原样返回原始串)
+				const gkyRecordedDate = formatGkyRecordedDate(banlistData.recordedDate);
+				if (gkyRecordedDate) gkyDetailLines.push(`📅 <b>封禁日期:</b> ${escapeHtml(gkyRecordedDate)}`);
+				if (banlistData.reason) gkyDetailLines.push(`⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}`);
+				if (banlistData.info) gkyDetailLines.push(`📝 <b>封禁内容:</b> <tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>`);
+				gkyDetailLines.forEach((line, i) => {
+					responseMessage += `${i === gkyDetailLines.length - 1 ? ' └ ' : ' ├ '}${line}\n`;
+				});
 			}
-			if (banlistData.msgId) gkyDetailLines.push(`📨 <b>MsgID:</b> <code>${escapeHtml(banlistData.msgId)}</code>`);
-			// recordedDate 规范化为 "YYYY-MM-DD HH:MM"(formatGkyRecordedDate 提取失败时原样返回原始串)
-			const gkyRecordedDate = formatGkyRecordedDate(banlistData.recordedDate);
-			if (gkyRecordedDate) gkyDetailLines.push(`📅 <b>封禁日期:</b> ${escapeHtml(gkyRecordedDate)}`);
-			if (banlistData.reason) gkyDetailLines.push(`⚠️ <b>封禁原因:</b> ${escapeHtml(banlistData.reason)}`);
-			if (banlistData.info) gkyDetailLines.push(`📝 <b>封禁内容:</b> <tg-spoiler>${escapeHtml(banlistData.info)}</tg-spoiler>`);
-			gkyDetailLines.forEach((line, i) => {
-				responseMessage += `${i === gkyDetailLines.length - 1 ? ' └ ' : ' ├ '}${line}\n`;
-			});
 		} else {
 			responseMessage += `🌐 <b>GKY黑名单:</b> ✅ 正常\n`;
 		}
@@ -4354,13 +4358,27 @@ async function handleMessage(message, env, ctx) {
 	const checkCommand = parseCommand(text, 'check');
 	// 处理管理员 /check - 支持回复用户或直接传入用户ID查询封禁状态
 	if (checkCommand) {
-		if (!isPrivateOrManagedGroup(message)) {
+		// 副群(非主群)判定(2026-10-15):/check 扩展至全部群;副群仅"该群管理员"可发起,
+		// 且只返回查询结果、不返回解封按钮。
+		const isGroupChatHere = message.chat?.type === 'group' || message.chat?.type === 'supergroup';
+		const isSubGroupHere = isGroupChatHere && !isMainGroup(chatId);
+
+		if (!isPrivateOrManagedGroup(message) && !isSubGroupHere) {
 			return;
 		}
 
-		// /check 主群群内与私聊都可达 → 按场景分流(规则 1/2):
-		//   私聊 → 任一主群管理员;主群群内 → 仅该主群管理员;其它群已被上方 isPrivateOrManagedGroup 拦截。
-		const isAdmin = await checkCommandAdmin(userId, message);
+		// 鉴权分流(2026-10-15):私聊 → 任一主群管理员;主群群内 → 仅该主群管理员;
+		// 副群 → bot 须为该群管理员(模式总闸,与 /ban 非主群分支一致)+ 发起人须为该群管理员。
+		// 保持 /check 既有"鉴权失败静默 return"行为(不输出权限提示)。
+		let isAdmin;
+		if (isSubGroupHere) {
+			if (!(await checkIfBotIsAdminInChat(chatId))) {
+				return;
+			}
+			isAdmin = await checkIfUserIsAdminInChat(userId, chatId);
+		} else {
+			isAdmin = await checkCommandAdmin(userId, message);
+		}
 		if (!isAdmin) {
 			return;
 		}
@@ -4395,10 +4413,13 @@ async function handleMessage(message, env, ctx) {
 
 		const response = await buildBanlistCheckResponse(tgidToCheck, {
 			targetUser,
-			includeReviewAction: true,
+			// 副群只返回查询结果、不返回解封按钮(2026-10-15 用户定版);主群/私聊保持 true
+			includeReviewAction: !isSubGroupHere,
 			actionInCurrentChat: isManagedGroupMessage(message),
-			// 群内场景顺带展示"该用户在当前群组的实时状态";私聊场景传 null(无"当前群"语义,多主群会歧义)
-			chatInfo: isManagedGroupMessage(message) ? message.chat : null,
+			// 群内场景(主群或副群)顺带展示"该用户在当前群组的实时状态";私聊场景传 null(无"当前群"语义,多主群会歧义)
+			chatInfo: (isManagedGroupMessage(message) || isSubGroupHere) ? message.chat : null,
+			// 副群隐藏 GKY 明细树,只输出布尔结论行;主群/私聊缺省 falsy → 旧行为逐字不变(2026-10-15 用户定版)
+			hideGkyDetails: isSubGroupHere,
 			env
 		});
 		// 编辑占位为最终结果(失败兜底:fallback 另发一条)
