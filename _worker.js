@@ -4816,7 +4816,9 @@ async function handleMessage(message, env, ctx) {
 				// "用户名(TGID)" 格式,比裸 TGID 更直观(用户反馈);getChatMember 之类的额外 API 不需要。
 				for (const { chatId, text } of restoreResult.broadcastPerGroup) {
 					try {
-						await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封\n${text}`);
+						const sent = await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封\n${text}`);
+						// 自助解封主群广播纳入自动删除:群内通知 3~6 分钟后由 cron 清扫(用户反馈)。
+						await scheduleNoticeAutoDelete(env, chatId, sent);
 					} catch (error) {
 						// 单群发送失败仅记日志,不中断其余主群的定向通知(与 broadcastToMainGroups 同策略)。
 						console.error(`[自助解封广播] 向主群 ${chatId} 发送通知失败:`, error.message);
@@ -4832,7 +4834,9 @@ async function handleMessage(message, env, ctx) {
 				if (restoreResult.notifyMainGroups) {
 					for (const { chatId, text } of restoreResult.broadcastPerGroup) {
 						try {
-							await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封(降级路径)\n${text}`);
+							const sent = await sendTelegramMessage(chatId, `用户 ${formatUserLabel(message.from)} 已通过自助解封(降级路径)\n${text}`);
+							// 自助解封主群广播纳入自动删除:群内通知 3~6 分钟后由 cron 清扫(用户反馈)。
+							await scheduleNoticeAutoDelete(env, chatId, sent);
 						} catch (error) {
 							console.error(`[自助解封广播-降级] 向主群 ${chatId} 发送通知失败:`, error.message);
 						}
