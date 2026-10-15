@@ -3662,7 +3662,7 @@ async function mtpRunJoinedAtBackfillTask(env, params) {
 		console.error('[MTProto] 后台补录异常(已忽略):', error && error.message);
 	}
 	const newLine = (final.status === 'ready' && final.joinedAt > 0)
-		? `入群时间: <b>${formatTimestamp(final.joinedAt).slice(0, 16)}</b>（${formatRelativeTime(final.joinedAt)}）`
+		? `📅<b>入群时间</b>: ${formatTimestamp(final.joinedAt).slice(0, 16)}（${formatRelativeTime(final.joinedAt)}）`
 		: MTPROTO_FAILED_LINE;
 	const newText = baseText.replace(MTPROTO_QUERYING_LINE, newLine);
 	try {
@@ -3738,7 +3738,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		if (options.env) {
 			const recordedStatus = await dbGetUserGroupStatus(options.env, tgidToCheck, currentChatId);
 			if (recordedStatus && recordedStatus !== liveStatus) {
-				statusNote = `本地记录: <b>${escapeHtml(describeCurrentChatStatus(recordedStatus).label)}</b>（与实时状态不一致，以实时为准）`;
+				statusNote = `💾<b>本地记录</b>: ${escapeHtml(describeCurrentChatStatus(recordedStatus).label)}（与实时状态不一致，以实时为准）`;
 			}
 		}
 		// 入群时间(2026-10-13 新增):仅当 DB 已就绪且能读到本群 joinedAt>0 时展示该行;
@@ -3769,8 +3769,8 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 		const statusDetailLines = [escapeHtml(described.desc)];
 		if (joinedAtSec > 0) {
 			// 该行内容全部由代码生成(数字 + 固定中文),无用户可控文本,故无需 escapeHtml;
-			// 格式:入群时间: YYYY-MM-DD HH:MM（相对时长）—— 冒号半角+空格、时长无空格、括号全角。
-			statusDetailLines.push(`入群时间: <b>${formatTimestamp(joinedAtSec).slice(0, 16)}</b>（${formatRelativeTime(joinedAtSec)}）`);
+			// 格式:📅<b>入群时间</b>: YYYY-MM-DD HH:MM（相对时长）—— 加粗在 label、冒号半角+空格、时长无空格、括号全角。
+			statusDetailLines.push(`📅<b>入群时间</b>: ${formatTimestamp(joinedAtSec).slice(0, 16)}（${formatRelativeTime(joinedAtSec)}）`);
 		} else if (mtpPending) {
 			// [MTProto] 存在但 joinedAt<=0 且通道可用 → 占位行(与入群时间行同位置;后台完成后 editMessageText
 			// 逐字替换本行, 行数恒为 1, 不增删行、不改 ├/└ 前缀, 树形结构稳定)。
