@@ -120,6 +120,14 @@ const BLACKLIST_CACHE_TTL_MS = 5000; // 5 秒,写入后跨实例最长延迟
 let blacklistCache = { data: null, fetchedAt: 0 };
 
 // ========================================================
+// 群内通知消息自动删除(D1 待删队列 + 每 3 分钟 cron 清扫)
+// ========================================================
+// 概要:群内 /ban、/spam 的操作结果通知发出后,登记到 D1 待删队列,由每 3 分钟一轮的 cron 清扫删除;
+// 3 分钟延迟为"发出后最早删除时间",实际删除发生在到期后的下一轮清扫(3~6 分钟内删除)。
+const NOTICE_AUTO_DELETE_DELAY_MS = 3 * 60 * 1000; // 群内 /ban、/spam 操作结果通知发出后自动删除延迟(3 分钟)
+const NOTICE_SWEEP_MAX_BATCH = 20; // 单轮清扫最多处理条数(防单次 cron 超预算,剩余下轮继续)
+
+// ========================================================
 // D1 数据库层(数据访问 + KV→D1 自动迁移)
 // [DB-LAYER-START] 边界标记,QA 切片依赖,勿改动此行
 // ========================================================
@@ -157,6 +165,15 @@ CREATE TABLE IF NOT EXISTS schema_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pending_message_deletions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id TEXT NOT NULL,
+  message_id INTEGER NOT NULL,
+  delete_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_del_due ON pending_message_deletions(delete_at);
 `;
 // schema_meta 中 KV 导入完成标记 key
 const DB_KV_IMPORT_KEY = 'kv_imported_v1';
@@ -1037,6 +1054,70 @@ async function dbIsAdAllowlisted(env, userId) {
 		return false;
 	}
 }
+
+// 登记一条待自动删除的群内通知消息(chat_id 存字符串,delete_at = 当前时间 + delayMs)。
+// - 无 D1 绑定 / 无有效 chatId 或 messageId → 返回 false(静默降级,不抛错);
+// - 本层只做数据访问,不调用 Telegram API;失败仅记日志并返回 false。
+async function dbAddPendingMessageDeletion(env, chatId, messageId, delayMs) {
+	if (!hasDb(env)) return false;
+	const chatIdNum = Number(chatId);
+	const messageIdNum = Number(messageId);
+	if (!Number.isFinite(chatIdNum) || !Number.isFinite(messageIdNum) || messageIdNum <= 0) return false;
+	const delay = Number.isFinite(delayMs) && delayMs > 0 ? Math.floor(delayMs) : 0;
+	const now = Date.now();
+	try {
+		await env.DB.prepare(
+			'INSERT INTO pending_message_deletions (chat_id, message_id, delete_at, attempts, created_at) VALUES (?, ?, ?, 0, ?)'
+		).bind(String(chatId), messageIdNum, now + delay, now).run();
+		return true;
+	} catch (error) {
+		console.error('[DB] 登记待删通知失败:', error.message);
+		return false;
+	}
+}
+
+// 取出已到期的待删通知(delete_at <= nowMs),按到期时间升序最多 limit 条。
+// - 无 D1 绑定 / 查询异常 → 返回 [](静默降级,不抛错);
+// - limit 归一化为正整数(非法 / 缺省按 NOTICE_SWEEP_MAX_BATCH)。
+async function dbListDueMessageDeletions(env, nowMs, limit) {
+	if (!hasDb(env)) return [];
+	const max = Number.isInteger(limit) && limit > 0 ? limit : NOTICE_SWEEP_MAX_BATCH;
+	try {
+		const res = await env.DB.prepare(
+			'SELECT id, chat_id, message_id FROM pending_message_deletions WHERE delete_at <= ? ORDER BY delete_at LIMIT ?'
+		).bind(Number(nowMs) || 0, max).all();
+		return res?.results || [];
+	} catch (error) {
+		console.error('[DB] 读取待删通知失败:', error.message);
+		return [];
+	}
+}
+
+// 删除一条待删通知(清扫成功后调用):失败仅记日志并返回 false,不抛错。
+async function dbRemovePendingMessageDeletion(env, id) {
+	if (!hasDb(env)) return false;
+	try {
+		await env.DB.prepare('DELETE FROM pending_message_deletions WHERE id = ?').bind(id).run();
+		return true;
+	} catch (error) {
+		console.error('[DB] 移除待删通知失败:', error.message);
+		return false;
+	}
+}
+
+// 标记一条待删通知本轮删除失败:attempts + 1;累计达到 5 次后直接丢弃该行,防止失败项永久堆积。
+// - 无 D1 绑定 → 返回 false;整体 try/catch,失败仅记日志,不抛错。
+async function dbFailPendingMessageDeletion(env, id) {
+	if (!hasDb(env)) return false;
+	try {
+		await env.DB.prepare('UPDATE pending_message_deletions SET attempts = attempts + 1 WHERE id = ?').bind(id).run();
+		await env.DB.prepare('DELETE FROM pending_message_deletions WHERE id = ? AND attempts >= 5').bind(id).run();
+		return true;
+	} catch (error) {
+		console.error('[DB] 标记待删通知失败:', error.message);
+		return false;
+	}
+}
 // [DB-LAYER-END]
 
 // ========================================================
@@ -1580,6 +1661,19 @@ export default {
 		}
 
 		return new Response('Method Not Allowed', { status: 405 });
+	},
+
+	async scheduled(event, env, ctx) {
+		// cron 触发为全新实例:BOT_TOKEN 等模块级全局必须先重新初始化(deleteMessage 依赖 BOT_TOKEN),
+		// 否则清扫会以空 token 调用 TG API 而静默失败;此处初始化失败直接放弃本轮,等下次 cron 重试。
+		try {
+			const config = loadRequiredConfig(env);
+			BOT_TOKEN = config.BOT_TOKEN;
+		} catch (error) {
+			console.error('[自动删除] 定时任务配置加载失败:', error.message);
+			return;
+		}
+		await runNoticeAutoDeleteSweep(env);
 	}
 };
 
@@ -4084,7 +4178,7 @@ async function handleMessage(message, env, ctx) {
 				const muteUserLabel = message.reply_to_message?.from
 					? formatBannedUserLabel(message.reply_to_message.from)
 					: `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
-				await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本地黑名单: 禁言`);
+				await scheduleNoticeAutoDelete(env, chatId, await sendTelegramMessage(chatId, `✅ 已在群内禁言 ${muteUserLabel}\n📌 本地黑名单: 禁言`));
 				// 回复 /spam 场景:被回复的这条消息即违规内容,处理成功后同步删除
 				// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
 				await deleteMessage(chatId, message.reply_to_message.message_id);
@@ -4092,11 +4186,11 @@ async function handleMessage(message, env, ctx) {
 				// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁",提示后照旧删除被回复消息
 				if (error && error.code === 'TARGET_ALREADY_BANNED') {
 					await dbSetUserGroupStatus(env, repliedUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
-					await sendTelegramMessage(chatId, 'ℹ️ 该用户已被封禁，无需禁言');
+					await scheduleNoticeAutoDelete(env, chatId, await sendTelegramMessage(chatId, 'ℹ️ 该用户已被封禁，无需禁言'));
 					// deleteMessage 内部已 try-catch,独立于禁言成败
 					await deleteMessage(chatId, message.reply_to_message.message_id);
 				} else {
-					await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`);
+					await scheduleNoticeAutoDelete(env, chatId, await sendTelegramMessage(chatId, `⚠️ 禁言失败: ${escapeHtml(error.message)}`));
 				}
 			}
 			return;
@@ -4162,7 +4256,7 @@ async function handleMessage(message, env, ctx) {
 			if (message.reply_to_message) {
 				await deleteMessage(chatId, message.reply_to_message.message_id);
 			}
-			await sendTelegramMessage(chatId, responseMessage);
+			await scheduleNoticeAutoDelete(env, chatId, await sendTelegramMessage(chatId, responseMessage));
 		} else {
 			// 2026-09-08 修复:addToBlacklist 返回 alreadyExists(该用户已在联网黑名单)时,
 			// 被回复的这条消息即违规内容 → 同样先删除再提示(与 /ban 主群 alreadyExists 分支一致),
@@ -4170,9 +4264,9 @@ async function handleMessage(message, env, ctx) {
 			// (未绑定 KV/D1、写入异常等)保持原样只提示不删除(deleteMessage 内部已 try-catch)。
 			if (result.alreadyExists && message.reply_to_message) {
 				await deleteMessage(chatId, message.reply_to_message.message_id);
-				await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}\n✅ 已删除被举报的违规消息`);
+				await scheduleNoticeAutoDelete(env, chatId, await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}\n✅ 已删除被举报的违规消息`));
 			} else {
-				await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}`);
+				await scheduleNoticeAutoDelete(env, chatId, await sendTelegramMessage(chatId, `${result.message}\nTG ID: ${spamUserLabel}`));
 			}
 		}
 		return;
@@ -4442,14 +4536,14 @@ async function handleMessage(message, env, ctx) {
 			try {
 				await banUserPermanently(chatId, targetUserId);
 				await dbSetUserGroupStatus(env, targetUserId, chatId, GROUP_MEMBER_STATUS.BANNED);
-				await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本地黑名单: 封禁`);
+				await scheduleNoticeAutoDelete(env, chatId, await sendTelegramMessage(chatId, `✅ 已封禁 <a href="tg://user?id=${targetUserId}">${targetUserId}</a> 并移出本群\n📌 本地黑名单: 封禁`));
 				// 回复 /ban 场景:被回复的这条消息即违规内容,封禁成功后同步删除
 				// (deleteMessage 内部已 try-catch,失败仅记日志,不阻塞主流程)。
 				if (message.reply_to_message) {
 					await deleteMessage(chatId, message.reply_to_message.message_id);
 				}
 			} catch (error) {
-				await sendTelegramMessage(chatId, `⚠️ 封禁失败: ${escapeHtml(error.message)}`);
+				await scheduleNoticeAutoDelete(env, chatId, await sendTelegramMessage(chatId, `⚠️ 封禁失败: ${escapeHtml(error.message)}`));
 			}
 			return;
 		}
@@ -4528,7 +4622,7 @@ async function handleMessage(message, env, ctx) {
 			}
 		}
 
-		await sendTelegramMessage(chatId, responseMessage);
+		await scheduleNoticeAutoDelete(env, chatId, await sendTelegramMessage(chatId, responseMessage));
 		return;
 	}
 
@@ -4866,6 +4960,47 @@ async function deleteMessage(chatId, messageId) {
 	} catch (error) {
 		console.error('deleteMessage 调用失败:', error.message);
 		return false;
+	}
+}
+
+// 登记群内操作结果通知的自动删除(发送成功后调用)。
+// - 仅群聊(chatId < 0)登记,私聊通知不登记;
+// - 从 sendMessage 返回中取 message_id,缺失则跳过;
+// - 永不抛错、绝不阻断主流程:任何异常仅记日志。
+async function scheduleNoticeAutoDelete(env, chatId, sentResult) {
+	if (!(Number(chatId) < 0)) return;
+	const messageId = sentResult?.result?.message_id;
+	if (!messageId) return;
+	try {
+		const ok = await dbAddPendingMessageDeletion(env, chatId, messageId, NOTICE_AUTO_DELETE_DELAY_MS);
+		if (ok) {
+			console.log(`[自动删除] 已登记通知删除: chat=${chatId} msg=${messageId}`);
+		}
+	} catch (error) {
+		console.error('[自动删除] 登记通知删除失败:', error.message);
+	}
+}
+
+// 清扫到期待删通知:取到期行(≤NOTICE_SWEEP_MAX_BATCH),逐条 deleteMessage;
+// 成功 → 移除,失败 → 累加 attempts(达上限由 DB 层丢弃)。整体 try/catch,不抛错。
+// - 无 D1 绑定静默降级(ensureDbReady 返回 false 直接 return);
+// - 不改动 deleteMessage 语义。
+async function runNoticeAutoDeleteSweep(env) {
+	const ready = await ensureDbReady(env);
+	if (!ready) return;
+	try {
+		const now = Date.now();
+		const due = await dbListDueMessageDeletions(env, now, NOTICE_SWEEP_MAX_BATCH);
+		for (const item of due) {
+			const deleted = await deleteMessage(item.chat_id, item.message_id);
+			if (deleted) {
+				await dbRemovePendingMessageDeletion(env, item.id);
+			} else {
+				await dbFailPendingMessageDeletion(env, item.id);
+			}
+		}
+	} catch (error) {
+		console.error(`[自动删除] 清扫失败: ${error.message}`);
 	}
 }
 
