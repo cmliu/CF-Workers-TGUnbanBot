@@ -1689,8 +1689,11 @@ export default {
 					const activityInfo = await recordUserActivity(update.message, env);
 					await handleMessage(update.message, env, ctx, activityInfo);
 				} else if (update.callback_query) {
-					// 优先处理联网查杀按钮回调(cmk: 前缀),未被消费再交给 /ad 投票回调
-					const consumed = await handleNetworkKillCallbackQuery(update.callback_query, env);
+					// 依次尝试:入群关键词处罚按钮(jkb:)→ 联网查杀按钮(cmk:)→ /ad 投票回调(adv:)
+					let consumed = await handleJoinKeywordCallbackQuery(update.callback_query, env);
+					if (!consumed) {
+						consumed = await handleNetworkKillCallbackQuery(update.callback_query, env);
+					}
 					if (!consumed) {
 						await handleAdCallbackQuery(update.callback_query, env);
 					}
@@ -2076,10 +2079,26 @@ let JOIN_BAN_KEYWORD_PATTERN = JOIN_BAN_KEYWORD_DEFAULT_PATTERN;
 // 编译后的正则(无 /g 标志,test 无状态);null = 未编译或编译失败,本功能禁用
 let joinBanKeywordRegex = null;
 // 命中处罚的群内提示文案(reply 到触发的那条消息)。
-// ⚠️ 解封路径必须写"完整自助解封口令":私聊发 /unban 只会回欢迎词(提示用户输入口令),
-// 真正的解封动作要求文本同时包含 `我不是广告狗` + `我是误封的` + `希望可以解封`(见 handleMessage 的 else-if 分支),
-// 故文案直接给出整句口令,让用户一步到位,避免"发 /unban 还要再发一次口令"的额外步骤与不实承诺。
-const JOIN_BAN_KEYWORD_NOTICE = '🚫 <b>疑似广告账号，已自动禁言</b>\n\n检测到该账号在入群后的前 2 条消息中命中风控关键词。\n如系误判，请私聊我发送：<code>我不是广告狗，我是误封的，希望可以解封。</code>';
+// 2026-11 调整:文案不再内嵌完整解封口令,改为"私聊我自助解封"的泛指表述——
+//   普通成员可通过私聊自助解封链路自行处理,群内管理员也可直接点下方操作按钮一键处置;
+//   文案未承诺"发 /unban 即可解封",与私聊 /unban 仅回欢迎词的实际行为不冲突。
+const JOIN_BAN_KEYWORD_NOTICE = '🚫 <b>疑似广告账号，已自动禁言</b>\n\n如系误判，请私聊我自助解封';
+// 处罚通知下方的管理员操作按钮(callback_data 前缀 jkb:):
+//   误封解封 → jkb:ok:<chatId>:<userId>   解除本群禁言 + 写回"健康"
+//   永久封禁 → jkb:ban:<chatId>:<userId>  删除违规消息 + 踢出 + 写入联网黑名单
+// 仅当前主群管理员可点(回调内以 checkIfUserIsAdminInChat 校验);点击后编辑原消息写操作人并移除按钮。
+// 长度约束:Telegram callback_data 上限 64 字节,`jkb:ok:-1001234567890123:1234567890` 约 36 字节,安全。
+const JOIN_BAN_BUTTON_PREFIX = 'jkb:';
+
+// 构建处罚通知的管理员操作键盘(误封解封 / 永久封禁)
+function buildJoinBanNoticeKeyboard(chatId, userId) {
+	return {
+		inline_keyboard: [[
+			{ text: '✅ 误封解封', callback_data: `${JOIN_BAN_BUTTON_PREFIX}ok:${chatId}:${userId}` },
+			{ text: '🔨 永久封禁', callback_data: `${JOIN_BAN_BUTTON_PREFIX}ban:${chatId}:${userId}` }
+		]]
+	};
+}
 
 // 编译入群关键词正则(纯逻辑,无 IO,可单测):
 // - 入参先 String()+trim;空 → 用默认规则;
@@ -4334,10 +4353,115 @@ async function handleJoinBanKeyword(message, env, activityInfo) {
 	// ---- 处罚:2) 写本群状态"禁言" + 3) 回复被处罚的那条消息 ----
 	try {
 		await dbSetUserGroupStatus(env, userId, chatId, GROUP_MEMBER_STATUS.MUTED);
-		await sendTelegramMessage(chatId, JOIN_BAN_KEYWORD_NOTICE, undefined, message.message_id);
+		await sendTelegramMessage(chatId, JOIN_BAN_KEYWORD_NOTICE, buildJoinBanNoticeKeyboard(chatId, userId), message.message_id);
 		console.log(`[入群关键词] 命中并已禁言: tgid=${userId}, chatId=${chatId}, speakCount=${speakCount}, joinedAt=${joinedAt}, 状态=MUTED`);
 	} catch (error) {
 		console.error(`[入群关键词] 禁言后处理失败(禁言已生效): tgid=${userId}, chatId=${chatId}, error=${error && error.message}`);
+	}
+	return true;
+}
+
+// 入群关键词处罚通知的管理员操作回调(jkb: 前缀):
+//   jkb:ok:<chatId>:<userId>   误封解封 → 解除本群封禁 + 恢复发言 + 状态写回"健康"
+//   jkb:ban:<chatId>:<userId>  永久封禁 → 删除违规消息 + 踢出本群 + 写入联网黑名单
+// 权限:仅"当前主群"的管理员可操作(checkIfUserIsAdminInChat 实时校验,空名单 fail-closed)。
+// 结果:编辑原通知消息,追加操作人与执行结果,并移除按钮(inline_keyboard 置空),防止重复点击。
+// 返回 true 表示已消费该回调(成功/失败/越权均算),调用方不再交给后续回调处理器。
+async function handleJoinKeywordCallbackQuery(callbackQuery, env) {
+	const data = callbackQuery?.data || '';
+	if (!data.startsWith(JOIN_BAN_BUTTON_PREFIX)) return false;
+
+	// callback_data 固定 4 段:jkb:<action>:<chatId>:<userId>(chatId 为负数,userId 为纯数字)
+	const parts = data.split(':');
+	const action = parts[1];
+	const chatIdRaw = parts[2];
+	const userIdRaw = parts[3];
+	const chatId = Number(chatIdRaw);
+	const userId = String(userIdRaw || '');
+
+	const message = callbackQuery?.message;
+	const noticeChatId = message?.chat?.id;
+
+	// 仅主群内生效:通知必然发在主群,且 chatId 必须与通知所在群一致(防跨群构造 callback_data)
+	if (!Number.isFinite(chatId) || !/^\d+$/.test(userId)
+		|| noticeChatId === undefined || noticeChatId === null
+		|| String(noticeChatId) !== String(chatId)
+		|| !isMainGroup(chatId)) {
+		try { await answerCallbackQuery(callbackQuery.id, '无效操作', true); } catch (_) { }
+		return true;
+	}
+	if (action !== 'ok' && action !== 'ban') {
+		try { await answerCallbackQuery(callbackQuery.id, '无效操作', true); } catch (_) { }
+		return true;
+	}
+
+	// 权限:仅当前主群管理员(实时查 getChatAdministrators,空名单 fail-closed)
+	const operatorId = callbackQuery?.from?.id;
+	let isAdmin = false;
+	try {
+		isAdmin = await checkIfUserIsAdminInChat(operatorId, chatId);
+	} catch (error) {
+		console.error(`[入群关键词回调] 管理员判定失败(按非管理员处理): tgid=${operatorId}, chatId=${chatId}, error=${error && error.message}`);
+	}
+	if (!isAdmin) {
+		try { await answerCallbackQuery(callbackQuery.id, '仅限本群管理员操作', true); } catch (_) { }
+		return true;
+	}
+
+	const messageId = message.message_id;
+	const removeButtons = { inline_keyboard: [] };
+	const operatorMention = formatUserMention(callbackQuery.from)
+		|| `<a href="tg://user?id=${escapeHtml(operatorId)}">${escapeHtml(operatorId)}</a>`;
+	// 通知消息以 reply 形式挂在违规消息上 → 从 reply_to_message 还原要删除的违规消息 ID
+	const violationMessageId = message?.reply_to_message?.message_id;
+
+	if (action === 'ok') {
+		// 误封解封:解除本群封禁(幂等)+ 恢复全部发言权限 + 状态写回"健康"(不改联网黑名单)
+		console.log(`[入群关键词回调] 误封解封开始: tgid=${userId}, chatId=${chatId}, operator=${operatorId}`);
+		try {
+			await unbanUserInChat(chatId, userId);
+			await restrictUserInChat(chatId, userId);
+			await dbSetUserGroupStatus(env, userId, chatId, GROUP_MEMBER_STATUS.HEALTHY);
+			await editMessageText(chatId, messageId,
+				`${JOIN_BAN_KEYWORD_NOTICE}
+
+✅ <b>已执行 误封解封</b>
+👮 操作人: ${operatorMention}
+📌 本群状态: 已恢复发言`, removeButtons);
+			console.log(`[入群关键词回调] 误封解封成功: tgid=${userId}, chatId=${chatId}, operator=${operatorId}`);
+			try { await answerCallbackQuery(callbackQuery.id, '已解除禁言'); } catch (_) { }
+		} catch (error) {
+			console.error(`[入群关键词回调] 误封解封失败: tgid=${userId}, chatId=${chatId}, error=${error && error.message}`);
+			try { await answerCallbackQuery(callbackQuery.id, `解封失败: ${String(error.message).slice(0, 80)}`, true); } catch (_) { }
+		}
+		return true;
+	}
+
+	// 永久封禁:删除违规消息 → 踢出本群 → 状态"封禁" → 写入联网黑名单
+	console.log(`[入群关键词回调] 永久封禁开始: tgid=${userId}, chatId=${chatId}, operator=${operatorId}`);
+	try {
+		let violationDeleted = false;
+		if (violationMessageId) {
+			violationDeleted = await deleteMessage(chatId, violationMessageId);
+		}
+		await banUserPermanently(chatId, userId);
+		await dbSetUserGroupStatus(env, userId, chatId, GROUP_MEMBER_STATUS.BANNED);
+		const result = await addToBlacklist(userId, env, 'ban', operatorId);
+		const blacklistLine = (result.success || result.alreadyExists)
+			? '已加入'
+			: `写入失败(${escapeHtml(String(result.message || '未知原因'))})`;
+		await editMessageText(chatId, messageId,
+			`${JOIN_BAN_KEYWORD_NOTICE}
+
+🔨 <b>已执行 永久封禁</b>
+👮 操作人: ${operatorMention}
+📌 联网黑名单: ${blacklistLine}
+🗑 违规消息: ${violationDeleted ? '已删除' : '未删除(可能已被删除或缺少消息ID)'}`, removeButtons);
+		console.log(`[入群关键词回调] 永久封禁成功: tgid=${userId}, chatId=${chatId}, operator=${operatorId}, 黑名单=${result.success ? 'new' : (result.alreadyExists ? 'exists' : 'failed')}`);
+		try { await answerCallbackQuery(callbackQuery.id, '已永久封禁并加入联网黑名单'); } catch (_) { }
+	} catch (error) {
+		console.error(`[入群关键词回调] 永久封禁失败: tgid=${userId}, chatId=${chatId}, error=${error && error.message}`);
+		try { await answerCallbackQuery(callbackQuery.id, `封禁失败: ${String(error.message).slice(0, 80)}`, true); } catch (_) { }
 	}
 	return true;
 }
