@@ -20,6 +20,9 @@ database_id = "1d59961b-b96e-4561-add3-72774b03cc18"
 [ai]
 binding = "AI"								#Workers AI 绑定(用于 /ad 举报内容 AI 威胁评级,@cf/zai-org/glm-4.7-flash)
 
+[triggers]
+crons = ["*/3 * * * *"]			# 每 3 分钟触发:清扫到期的群内通知自动删除(发出后 3~6 分钟内删除)
+
 [observability]
 enabled = false			# 顶层 Observability 配置。当前配置不通过顶层开关一次性启用，下面单独开启 logs、关闭 traces。
 head_sampling_rate = 1	# 顶层采样率，范围 0~1；1 表示 100% 采样，0.1 表示 10% 采样。
