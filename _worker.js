@@ -237,11 +237,16 @@ function normalizeGroupStatus(status) {
 	return GROUP_MEMBER_STATUS.HEALTHY;
 }
 
-// 解析 active_group_ids 字段(JSON 字符串)→ 规范化数组 [{ id, status, joinedAt }]:
-// - 旧格式(纯字符串数组 ["-1001", ...])→ 元素转 { id, status: '健康', joinedAt: 0 }(历史数据无状态/时间,默认健康+未知);
-// - 新格式({ id, status, joinedAt })→ 校验 status,非法值回退健康;
+// 解析 active_group_ids 字段(JSON 字符串)→ 规范化数组 [{ id, status, joinedAt, speakCount }]:
+// - 旧格式(纯字符串数组 ["-1001", ...])→ 元素转 { id, status: '健康', joinedAt: 0, speakCount: 0 }
+//   (历史数据无状态/时间/计数,默认健康+未知+零次发言);
+// - 新格式({ id, status, joinedAt, speakCount })→ 校验 status,非法值回退健康;
 //   joinedAt 为"最近一次入群时间戳(秒级)",缺失 / 非数字 / 负数 / 非整数 → 归一化为 0(未知);
+//   speakCount 为"该用户在该群的发言次数(非负整数)",缺失 / 非法 / 负数 / 小数 / 字符串 → 归一化为 0;
 // - 非法 JSON / 非数组 / 元素结构异常 → 返回空数组(上层重建,不抛错)。
+// ⚠️ 不变量:本函数是 active_group_ids 的唯一解析入口,凡"读数组 → 改部分字段 → 整数组写回"的路径
+//    (dbSetUserGroupStatus / dbBackfillUserGroupJoinedAt / recordUserActivity)都复用本函数结果,
+//    因此新增字段必须在此保留,否则写回时会把该字段清零(speakCount 即依赖此不变量)。
 function parseActiveGroups(rawStr) {
 	if (!rawStr) return [];
 	let parsed;
@@ -256,14 +261,17 @@ function parseActiveGroups(rawStr) {
 		if (typeof item === 'string') {
 			const id = item.trim();
 			if (id === '') continue;
-			groups.push({ id, status: GROUP_MEMBER_STATUS.HEALTHY, joinedAt: 0 });
+			groups.push({ id, status: GROUP_MEMBER_STATUS.HEALTHY, joinedAt: 0, speakCount: 0 });
 		} else if (item && typeof item === 'object' && (typeof item.id === 'string' || typeof item.id === 'number')) {
 			const id = String(item.id);
 			if (id === '') continue;
 			// joinedAt 归一化:仅正整数保留,其余(缺失/字符串/负数/小数/NaN/Infinity/0)一律 0
 			const rawJoinedAt = item.joinedAt;
 			const joinedAt = Number.isInteger(rawJoinedAt) && rawJoinedAt > 0 ? rawJoinedAt : 0;
-			groups.push({ id, status: normalizeGroupStatus(item.status), joinedAt });
+			// speakCount 归一化:仅非负整数保留,其余(缺失/字符串/负数/小数/NaN/Infinity)一律 0
+			const rawSpeakCount = item.speakCount;
+			const speakCount = Number.isInteger(rawSpeakCount) && rawSpeakCount > 0 ? rawSpeakCount : 0;
+			groups.push({ id, status: normalizeGroupStatus(item.status), joinedAt, speakCount });
 		}
 	}
 	return groups;
@@ -338,8 +346,10 @@ async function dbSetUserGroupStatus(env, tgid, chatId, status, joinedAt) {
 			existing.status = normalizedStatus;
 			// 仅在显式传入有效 joinedAt 时更新,避免把既有入群时间误清零
 			if (hasJoinedAt) existing.joinedAt = Math.floor(joinedAt);
+			// speakCount 原样保留(由 parseActiveGroups 归一化带回,本函数不改计数)
 		} else {
-			groups.push({ id: chatIdStr, status: normalizedStatus, joinedAt: hasJoinedAt ? Math.floor(joinedAt) : 0 });
+			// 新建元素:joinedAt 缺省 0(未知);speakCount 从 0 起算(本函数只改状态,不产生发言)
+			groups.push({ id: chatIdStr, status: normalizedStatus, joinedAt: hasJoinedAt ? Math.floor(joinedAt) : 0, speakCount: 0 });
 		}
 		await env.DB.prepare(
 			`INSERT INTO users (tgid, active_group_ids, created_at)
@@ -381,6 +391,25 @@ async function dbGetUserGroupJoinedAt(env, tgid, chatId) {
 	} catch (error) {
 		console.error('[DB] 读取入群时间失败:', error.message);
 		return 0;
+	}
+}
+
+// 读取用户在某群的"发言次数"(active_group_ids 元素的 speakCount,只读)。
+// 返回非负整数;!hasDb / 用户不存在 / 无该群记录 / 字段异常(缺失/负数/小数) → 返回 null,
+// 以便上层区分"无数据"(null,不展示)与"0 次"(用户在该群尚未发言,展示 0 次)。
+// 注意:parseActiveGroups 已把非法 speakCount 归一化为 0,故此处只需再校验非负整数即可。
+async function dbGetUserGroupSpeakCount(env, tgid, chatId) {
+	if (!hasDb(env)) return null;
+	try {
+		const row = await env.DB.prepare('SELECT active_group_ids FROM users WHERE tgid = ?').bind(String(tgid)).first();
+		if (!row || !row.active_group_ids) return null;
+		const groups = parseActiveGroups(row.active_group_ids);
+		const found = groups.find((g) => g.id === String(chatId));
+		if (!found) return null;
+		return Number.isInteger(found.speakCount) && found.speakCount >= 0 ? found.speakCount : 0;
+	} catch (error) {
+		console.error('[DB] 读取发言次数失败:', error.message);
+		return null;
 	}
 }
 
@@ -702,20 +731,28 @@ async function migrateFromKV(env) {
 
 // 记录用户活动:tgid 唯一标识,每次收到消息时更新资料快照 / 最后对话时间 / 活跃群组 / 消息计数。
 // 群聊(chat.type 为 group/supergroup)才把 chat.id 并入活跃群组数组;私聊只更新档案与时间。
+// 2026-10 新增"按群发言次数"(active_group_ids 元素 speakCount):
+//   - 群聊:本条消息即一次发言 → 本群元素 speakCount = (已有值||0) + 1;新元素 speakCount 从 1 起算
+//     (joinedAt 仍置 0:发言 ≠ 入群,严禁在发言路径写入 now);
+//   - 私聊:不触碰 active_group_ids,speakCount 不涉及;
+//   - ⚠️ 计数与"资料快照/消息计数"共用同一次 UPSERT(INSERT ... ON CONFLICT DO UPDATE),
+//     绝不为计数额外增加一次写库;
+//   - 返回 { speakCount, isGroupChat }:群聊返回"本群自增后的发言次数"(以实际写库值为准,写库失败返回 0),
+//     私聊/无 DB/异常一律返回 { speakCount: 0, isGroupChat: false }。契约:永不向上抛错。
 async function recordUserActivity(message, env) {
-	if (!isDbReady(env)) return;
+	if (!isDbReady(env)) return { speakCount: 0, isGroupChat: false };
 	const from = message?.from;
-	if (!from || from.id === undefined || from.id === null) return;
+	if (!from || from.id === undefined || from.id === null) return { speakCount: 0, isGroupChat: false };
 	const chat = message?.chat;
 	const tgid = String(from.id);
 	const now = Math.floor(Date.now() / 1000);
 	const isGroupChat = chat?.type === 'group' || chat?.type === 'supergroup';
 
 	if (isGroupChat && chat?.id !== undefined && chat.id !== null) {
-		// 群聊:先读活跃群组数组(元素 {id, status}),合并当前群后写回。
+		// 群聊:先读活跃群组数组(元素 {id, status, joinedAt, speakCount}),合并当前群后写回。
 		// 收到消息说明该用户当前在本群可发言 → 刷新本群状态为"健康"
 		// (曾被禁言/封禁的用户若恢复发言,再次发言时状态自动回正)。
-		// 已知竞态:同一用户并发在多个群发言时,读-改-写可能丢失一个群 ID
+		// 已知竞态:同一用户并发在多个群发言时,读-改-写可能丢失一个群 ID / 丢失若干次计数
 		// (概率极低:单用户消息经 Webhook 串行到达,且群数量有限;如需严格可改规范化子表)。
 		const chatIdStr = String(chat.id);
 		let groupIds = [];
@@ -740,11 +777,17 @@ async function recordUserActivity(message, env) {
 		if (isAdmin) {
 			await dbClearBlacklistStatus(env, tgid);
 		}
+		// 本群发言计数自增:已有元素 → 已有值(经 parseActiveGroups 归一化) + 1;新元素 → 1
+		const prevSpeakCount = existingGroup && Number.isInteger(existingGroup.speakCount) && existingGroup.speakCount > 0
+			? existingGroup.speakCount
+			: 0;
+		const nextSpeakCount = prevSpeakCount + 1;
 		if (existingGroup) {
 			existingGroup.status = refreshedStatus;
+			existingGroup.speakCount = nextSpeakCount;
 		} else {
-			// 新群组元素:joinedAt 置 0(未知);发言 ≠ 入群,严禁在此写入 now。
-			groupIds.push({ id: chatIdStr, status: refreshedStatus, joinedAt: 0 });
+			// 新群组元素:joinedAt 置 0(未知);发言 ≠ 入群,严禁在此写入 now。speakCount 从 1 起算。
+			groupIds.push({ id: chatIdStr, status: refreshedStatus, joinedAt: 0, speakCount: nextSpeakCount });
 		}
 
 		try {
@@ -762,7 +805,9 @@ async function recordUserActivity(message, env) {
 			).bind(tgid, from.first_name || '', from.last_name || '', from.username || '', from.is_bot ? 1 : 0, now, JSON.stringify(groupIds), now).run();
 		} catch (error) {
 			console.error('[DB] 记录用户活动失败(群聊):', error.message);
+			return { speakCount: 0, isGroupChat: true };
 		}
+		return { speakCount: nextSpeakCount, isGroupChat: true };
 	} else {
 		// 私聊/其他:仅更新档案与时间,不触碰 active_group_ids(避免覆盖既有群记录)
 		try {
@@ -780,6 +825,7 @@ async function recordUserActivity(message, env) {
 		} catch (error) {
 			console.error('[DB] 记录用户活动失败(私聊):', error.message);
 		}
+		return { speakCount: 0, isGroupChat: false };
 	}
 }
 
@@ -1579,6 +1625,10 @@ export default {
 		const url = new URL(request.url);
 		AD_VOTE_THRESHOLD = parseInt(env.AD_VOTE_THRESHOLD) || AD_VOTE_THRESHOLD;
 		AD_GROUP_RULES = String(env.AD_GROUP_RULES || '').trim() || AD_GROUP_RULES;
+		// 新人入群关键词拦截(仅主群):env 覆盖 → 编译正则;空配置用默认规则,
+		// 编译失败回退默认规则再试,仍失败则置 null(本功能禁用),全程不抛错。
+		JOIN_BAN_KEYWORD_PATTERN = String(env.JOIN_BAN_KEYWORD_PATTERN || '').trim() || JOIN_BAN_KEYWORD_DEFAULT_PATTERN;
+		joinBanKeywordRegex = resolveJoinBanKeywordRegex(JOIN_BAN_KEYWORD_PATTERN);
 		AD_AI_MODELS = resolveAdAiModels(env.AD_AI_MODEL); // 整体替换模型列表(逗号分隔/JSON 数组/单模型;空回退内置默认)
 		AD_AI_TIMEOUT_MS = parseInt(env.AD_AI_TIMEOUT_MS) || AD_AI_TIMEOUT_MS;
 		TG_API_ID = env.TG_API_ID || TG_API_ID, TG_API_HASH = env.TG_API_HASH || TG_API_HASH;
@@ -1633,9 +1683,11 @@ export default {
 
 				// 处理消息
 				if (update.message) {
-					// 数据库版:对所有收到消息的 tgid 记录活动(资料快照/最后对话时间/活跃群组/消息计数)
-					await recordUserActivity(update.message, env);
-					await handleMessage(update.message, env, ctx);
+					// 数据库版:对所有收到消息的 tgid 记录活动(资料快照/最后对话时间/活跃群组/消息计数)。
+					// 返回值 { speakCount, isGroupChat }:群聊时为"本群自增后的发言次数"(新人关键词拦截依赖它),
+					// 私聊/无 DB/异常时为 { speakCount: 0, isGroupChat: false };该函数永不抛错。
+					const activityInfo = await recordUserActivity(update.message, env);
+					await handleMessage(update.message, env, ctx, activityInfo);
 				} else if (update.callback_query) {
 					// 优先处理联网查杀按钮回调(cmk: 前缀),未被消费再交给 /ad 投票回调
 					const consumed = await handleNetworkKillCallbackQuery(update.callback_query, env);
@@ -2006,6 +2058,46 @@ async function markUserGroupStatus(env, userId, status, chatId) {
 		await dbSetUserGroupStatus(env, userId, chatId, status);
 	} catch (error) {
 		console.error('[DB] 标记群状态失败:', error.message);
+	}
+}
+
+// ---- 新人入群关键词拦截(仅主群,2026-10 新增) ----
+// 语义:新人在主群"入群后的前 2 条消息"里说出风险关键词(默认:单字数字 / 打招呼话术 / 典型广告模板)→ 自动禁言,
+// 并提示用户私聊发送完整解封口令(自助解封链路既有,不在此重复实现)。
+// 默认关键词正则:env.JOIN_BAN_KEYWORD_PATTERN 可覆盖(与 AD_GROUP_RULES 的覆盖方式一致);
+// 配置为空/全空白 → 用默认;正则编译失败 → 回退默认再试;再失败 → 禁用本功能并 console.error(绝不抛错)。
+const JOIN_BAN_KEYWORD_DEFAULT_PATTERN = '^(1|2|3|4|5|6|7|8|9|0|在吗|大家好|嗨|hello|大家好呀|哈喽|.*十年资深程序员.*)$';
+// 入群时间守卫:仅"入群不超过该秒数"的用户参与判定(默认 7 天)。
+// 原因:升级后存量老用户的 speakCount 一律从 0 起算,若只判断"发言次数 <= 2",老用户说一句"在吗"就会被误封;
+//       加入"入群时间在本窗口内"的守卫后,本功能只对新人生效(joinedAt === 0 未知 → 不触发,宁放不误)。
+const JOIN_BAN_KEYWORD_MAX_JOIN_AGE_SECONDS = 7 * 24 * 60 * 60;
+// 实际生效的关键词正则字符串(fetch 阶段按 env 覆盖;保留字符串便于日志排查)
+let JOIN_BAN_KEYWORD_PATTERN = JOIN_BAN_KEYWORD_DEFAULT_PATTERN;
+// 编译后的正则(无 /g 标志,test 无状态);null = 未编译或编译失败,本功能禁用
+let joinBanKeywordRegex = null;
+// 命中处罚的群内提示文案(reply 到触发的那条消息)。
+// ⚠️ 解封路径必须写"完整自助解封口令":私聊发 /unban 只会回欢迎词(提示用户输入口令),
+// 真正的解封动作要求文本同时包含 `我不是广告狗` + `我是误封的` + `希望可以解封`(见 handleMessage 的 else-if 分支),
+// 故文案直接给出整句口令,让用户一步到位,避免"发 /unban 还要再发一次口令"的额外步骤与不实承诺。
+const JOIN_BAN_KEYWORD_NOTICE = '🚫 <b>疑似广告账号，已自动禁言</b>\n\n检测到该账号在入群后的前 2 条消息中命中风控关键词。\n如系误判，请私聊我发送：<code>我不是广告狗，我是误封的，希望可以解封。</code>';
+
+// 编译入群关键词正则(纯逻辑,无 IO,可单测):
+// - 入参先 String()+trim;空 → 用默认规则;
+// - 编译失败 → console.error 后回退默认规则重试;
+// - 默认规则仍失败(理论上不可能)→ 返回 null 表示本功能禁用,调用方按"不触发"处理。永不抛错。
+function resolveJoinBanKeywordRegex(pattern) {
+	const raw = String(pattern == null ? '' : pattern).trim();
+	const source = raw || JOIN_BAN_KEYWORD_DEFAULT_PATTERN;
+	try {
+		return new RegExp(source);
+	} catch (error) {
+		console.error(`[入群关键词] 正则编译失败，回退默认规则: pattern=${source}, error=${error && error.message}`);
+	}
+	try {
+		return new RegExp(JOIN_BAN_KEYWORD_DEFAULT_PATTERN);
+	} catch (error) {
+		console.error(`[入群关键词] 默认正则编译失败，本功能已禁用: error=${error && error.message}`);
+		return null;
 	}
 }
 
@@ -3629,7 +3721,7 @@ async function dbBackfillUserGroupJoinedAt(env, tgid, chatId, joinedAt) {
 		const idx = groups.findIndex((g) => g.id === chatIdStr);
 		if (idx < 0) return false; // 元素不存在 → 不建档
 		if (Number.isInteger(groups[idx].joinedAt) && groups[idx].joinedAt > 0) return false; // 只增不改
-		groups[idx].joinedAt = ts; // status 原样保留
+		groups[idx].joinedAt = ts; // status / speakCount 原样保留(仅改 joinedAt)
 		await env.DB.prepare(
 			`INSERT INTO users (tgid, active_group_ids, created_at)
 			 VALUES (?, ?, ?)
@@ -3775,6 +3867,17 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 			// [MTProto] 存在但 joinedAt<=0 且通道可用 → 占位行(与入群时间行同位置;后台完成后 editMessageText
 			// 逐字替换本行, 行数恒为 1, 不增删行、不改 ├/└ 前缀, 树形结构稳定)。
 			statusDetailLines.push(MTPROTO_QUERYING_LINE);
+		}
+		// 本群发言次数(2026-10 新增):仅当本群元素存在且能读到 speakCount(返回非 null)时展示该行,
+		// 无记录/未找到/字段非法 → 整行不输出(不做"本群发言: 未知"兜底)。
+		// 位置 = 入群时间行(或 MTProto 占位行)之后、本地记录行之前,不改动既有 ├/└ 树形逻辑。
+		// 行内容全部由代码生成(非负整数 + 固定中文),无用户可控文本,故无需 escapeHtml;
+		// 格式:💬<b>本群发言</b>: N 次 —— 加粗在 label、冒号半角+空格,与入群时间行风格一致。
+		if (options.env) {
+			const speakCount = await dbGetUserGroupSpeakCount(options.env, tgidToCheck, currentChatId);
+			if (speakCount !== null) {
+				statusDetailLines.push(`💬<b>本群发言</b>: ${speakCount} 次`);
+			}
 		}
 		if (statusNote) {
 			statusDetailLines.push(statusNote);
@@ -4119,7 +4222,127 @@ async function handleNewChatMemberBots(message, env) {
 	return true;
 }
 
-async function handleMessage(message, env, ctx) {
+// 新人入群关键词拦截(仅主群,2026-10 新增):判断当前消息是否需要"按可疑广告账号自动禁言"。
+// 触发条件(必须全部满足):
+//   a) 群聊(group/supergroup)且为本机器人管理的主群(isMainGroup);
+//   b) 本群发言次数 speakCount ∈ [1, 2](入群后前 2 条消息,由 recordUserActivity 返回值提供);
+//   c) 文本取 message.text,为空取 message.caption;命中 JOIN_BAN_KEYWORD_PATTERN 编译出的正则;
+//   d) 发送者不是本主群管理员(checkIfUserIsAdminInMainGroup 为 false);
+//   e) 本群记录状态不是 白名单 / 禁言 / 封禁(避免重复处罚 + 白名单豁免);无记录(null)视为可处理;
+//   f) 入群时间守卫:joinedAt > 0 且 now - joinedAt <= JOIN_BAN_KEYWORD_MAX_JOIN_AGE_SECONDS;
+//      joinedAt === 0(未知)或已超窗口 → 不触发(防"存量老用户计数从 0 起算"被误封)。
+// 处罚动作(muteChatMember → 写"禁言"状态 → reply 提示)按顺序执行,try/catch 包住,失败只记日志不抛错。
+// 返回 true 表示"本函数已消费该消息"(命中并处理 / 命中但处罚分支已给出结论),调用方应 return 终止后续流程;
+// 返回 false 表示未命中,继续走既有流程。
+async function handleJoinBanKeyword(message, env, activityInfo) {
+	const chat = message?.chat;
+	const from = message?.from;
+	if (!chat || !from) return false;
+	// a) 群聊 + 本群是主群
+	if (chat.type !== 'group' && chat.type !== 'supergroup') return false;
+	const chatId = chat.id;
+	const userId = from.id;
+	if (chatId === undefined || chatId === null) return false;
+	if (userId === undefined || userId === null) return false;
+	if (!isMainGroup(chatId)) return false;
+	// b) 发言次数守卫:仅入群后前 2 条消息(1 或 2 次)
+	const speakCount = Number.isInteger(activityInfo?.speakCount) && activityInfo.speakCount > 0
+		? activityInfo.speakCount
+		: 0;
+	if (speakCount < 1 || speakCount > 2) return false;
+	// 正则未编译成功(配置非法且默认规则也失败)→ 功能禁用,不触发
+	const regex = joinBanKeywordRegex;
+	if (!regex) return false;
+	// c) 文本命中:优先 text,caption 兜底(纯图/视频消息的说明文字同样参与判定)
+	const rawText = (typeof message.text === 'string' && message.text !== '')
+		? message.text
+		: (typeof message.caption === 'string' ? message.caption : '');
+	if (!rawText || rawText.trim() === '') return false;
+	let hit = false;
+	try {
+		hit = regex.test(rawText);
+	} catch (error) {
+		console.error(`[入群关键词] 正则匹配异常(已忽略): chatId=${chatId}, tgid=${userId}, error=${error && error.message}`);
+		return false;
+	}
+	if (!hit) return false;
+	// d) 管理员豁免(查询失败按"非管理员"处理,但随后仍受 e/f 守卫约束)
+	try {
+		if (await checkIfUserIsAdminInMainGroup(userId, chatId)) {
+			console.log(`[入群关键词] 跳过:发送者为本群管理员 tgid=${userId}, chatId=${chatId}, speakCount=${speakCount}`);
+			return false;
+		}
+	} catch (error) {
+		console.error(`[入群关键词] 管理员判定失败(按非管理员继续): tgid=${userId}, chatId=${chatId}, error=${error && error.message}`);
+	}
+	// e) 本群状态守卫:白名单/禁言/封禁 → 已处罚或已豁免,不重复处理;无记录(null)视为可处理
+	let recordedStatus = null;
+	try {
+		recordedStatus = await dbGetUserGroupStatus(env, userId, chatId);
+	} catch (error) {
+		console.error(`[入群关键词] 读取本群状态失败(按无记录继续): tgid=${userId}, chatId=${chatId}, error=${error && error.message}`);
+	}
+	if (recordedStatus === GROUP_MEMBER_STATUS.WHITELISTED
+		|| recordedStatus === GROUP_MEMBER_STATUS.MUTED
+		|| recordedStatus === GROUP_MEMBER_STATUS.BANNED) {
+		console.log(`[入群关键词] 跳过:本群状态为「${recordedStatus}」,不重复处罚 tgid=${userId}, chatId=${chatId}`);
+		return false;
+	}
+	// f) 入群时间守卫:仅"最近入群且在窗口内"的用户参与判定;未知(0)或超窗口 → 不触发
+	let joinedAt = 0;
+	try {
+		joinedAt = await dbGetUserGroupJoinedAt(env, userId, chatId);
+	} catch (error) {
+		console.error(`[入群关键词] 读取入群时间失败(按未知处理): tgid=${userId}, chatId=${chatId}, error=${error && error.message}`);
+	}
+	const nowSec = Math.floor(Date.now() / 1000);
+	if (!(joinedAt > 0) || (nowSec - joinedAt) > JOIN_BAN_KEYWORD_MAX_JOIN_AGE_SECONDS) {
+		return false;
+	}
+
+	// ---- 处罚:1) 群内禁言 ----
+	try {
+		await muteChatMember(chatId, userId);
+	} catch (error) {
+		// 禁言预检发现目标已被封禁:不降级封禁状态,如实记录"封禁"并简短提示
+		if (error && error.code === 'TARGET_ALREADY_BANNED') {
+			try {
+				await dbSetUserGroupStatus(env, userId, chatId, GROUP_MEMBER_STATUS.BANNED);
+				await sendTelegramMessage(chatId, 'ℹ️ 该用户已被封禁，无需禁言', undefined, message.message_id);
+			} catch (innerError) {
+				console.error(`[入群关键词] 封禁状态写入/提示失败: tgid=${userId}, chatId=${chatId}, error=${innerError && innerError.message}`);
+			}
+			console.log(`[入群关键词] 目标已被封禁(未降级禁言): tgid=${userId}, chatId=${chatId}, speakCount=${speakCount}`);
+			return true;
+		}
+		// 用户不在群内(已退群/被踢):不写状态、静默
+		if (String(error && error.message).includes('PARTICIPANT_ID_INVALID')) {
+			console.log(`[入群关键词] 目标不在群内，静默跳过: tgid=${userId}, chatId=${chatId}, speakCount=${speakCount}`);
+			return true;
+		}
+		// 其它真正未预期的禁言失败:记 error 日志 + 简短提示(不做状态写入,避免与实际不一致);
+		// 返回 false 让主流程继续(处罚未生效,后续"联网黑名单自动查杀"等既有机制仍可兜底处置)。
+		console.error(`[入群关键词] 禁言失败: tgid=${userId}, chatId=${chatId}, speakCount=${speakCount}, error=${error && error.message}`);
+		try {
+			await sendTelegramMessage(chatId, '⚠️ 检测到疑似广告账号，但自动禁言失败，请管理员手动处理', undefined, message.message_id);
+		} catch (innerError) {
+			console.error(`[入群关键词] 失败提示发送失败: chatId=${chatId}, error=${innerError && innerError.message}`);
+		}
+		return false;
+	}
+
+	// ---- 处罚:2) 写本群状态"禁言" + 3) 回复被处罚的那条消息 ----
+	try {
+		await dbSetUserGroupStatus(env, userId, chatId, GROUP_MEMBER_STATUS.MUTED);
+		await sendTelegramMessage(chatId, JOIN_BAN_KEYWORD_NOTICE, undefined, message.message_id);
+		console.log(`[入群关键词] 命中并已禁言: tgid=${userId}, chatId=${chatId}, speakCount=${speakCount}, joinedAt=${joinedAt}, 状态=MUTED`);
+	} catch (error) {
+		console.error(`[入群关键词] 禁言后处理失败(禁言已生效): tgid=${userId}, chatId=${chatId}, error=${error && error.message}`);
+	}
+	return true;
+}
+
+async function handleMessage(message, env, ctx, activityInfo) {
 	if (await handleNewChatMemberBots(message, env)) {
 		return;
 	}
@@ -4133,6 +4356,21 @@ async function handleMessage(message, env, ctx) {
 	const userId = message.from.id;
 	const text = message.text;
 	const username = message.from.username || message.from.first_name || '用户';
+
+	// 新人入群关键词拦截(仅主群,2026-10 新增):命中即在群内禁言 + 私聊自助解封提示。
+	// 位置说明:
+	//   - 在 handleNewChatMemberBots 提前 return 之后(入群服务消息的 from 是"拉人者",不参与本判定);
+	//   - 在 !message.from 守卫之后(本逻辑需要发送者身份);
+	//   - 在联网查杀之前(命中者直接按"广告账号"处置,无需再走查杀;且禁言后状态为"禁言",查杀也会跳过);
+	//   - 命令消息(/check 等)不匹配关键词正则,不会被误判(且"发言次数"守卫只覆盖前 2 条)。
+	// activityInfo 为 recordUserActivity 的返回值(第 4 参):缺省时 speakCount 按 0 处理 → 本功能不触发(向后兼容)。
+	try {
+		if (await handleJoinBanKeyword(message, env, activityInfo)) {
+			return;
+		}
+	} catch (error) {
+		console.error('[入群关键词] 处理异常(已忽略):', error && error.message);
+	}
 
 	// 联网黑名单自动查杀(消息路径):真人发送的每条消息(任意聊天,含任一主群与其他群/私聊)
 	// 都过一遍查杀;是否真正触发由函数内部守卫决定(群聊类型 + 绑定 D1 + bot 是群管理员)。

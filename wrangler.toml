@@ -23,6 +23,10 @@ binding = "AI"								#Workers AI 绑定(用于 /ad 举报内容 AI 威胁评级
 [triggers]
 crons = ["*/3 * * * *"]			# 每 3 分钟触发:清扫到期的群内通知自动删除(发出后 3~6 分钟内删除)
 
+# 可选环境变量(不写也按默认值运行,可在 Cloudflare 控制台 Variables 覆盖):
+# JOIN_BAN_KEYWORD_PATTERN	# 新人入群关键词正则(仅主群生效)。默认 ^(1|2|3|4|5|6|7|8|9|0|在吗|大家好|嗨|hello|大家好呀|哈喽|.*十年资深程序员.*)$
+#                         	# 命中条件:入群未满 7 天 + 本群发言次数为 1~2 + 非本群管理员 + 本群状态非白名单/禁言/封禁
+
 [observability]
 enabled = false			# 顶层 Observability 配置。当前配置不通过顶层开关一次性启用，下面单独开启 logs、关闭 traces。
 head_sampling_rate = 1	# 顶层采样率，范围 0~1；1 表示 100% 采样，0.1 表示 10% 采样。
